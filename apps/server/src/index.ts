@@ -1,4 +1,7 @@
 import { serve } from "@hono/node-server";
+import { serveStatic } from "@hono/node-server/serve-static";
+import fs from "node:fs";
+import path from "node:path";
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
@@ -713,6 +716,29 @@ app.post("/api/chat/action", async (c) => {
 
   return c.json({ action, message: updatedMsg });
 });
+
+/* ------------------------------------------------------------------ */
+/* Production static frontend serving                                 */
+/* ------------------------------------------------------------------ */
+
+const distCandidates = [
+  path.resolve(process.cwd(), "apps/web/dist"),
+  path.resolve(process.cwd(), "../web/dist"),
+  path.resolve(process.cwd(), "dist"),
+];
+const clientDist = distCandidates.find((p) => fs.existsSync(p));
+
+if (clientDist) {
+  const relRoot = path.relative(process.cwd(), clientDist);
+  app.use("/*", serveStatic({ root: relRoot }));
+  app.get("*", (c) => {
+    const indexPath = path.join(clientDist, "index.html");
+    if (fs.existsSync(indexPath)) {
+      return c.html(fs.readFileSync(indexPath, "utf8"));
+    }
+    return c.text("Not found", 404);
+  });
+}
 
 /* ------------------------------------------------------------------ */
 /* Start server + background poller                                    */
