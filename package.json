@@ -17,7 +17,7 @@
     "test": "npm run test --workspaces --if-present",
     "probe": "npm run probe -w @myclass/server"
   },
-  "devDependencies": {
+  "dependencies": {
     "concurrently": "^9.1.0",
     "typescript": "^5.7.2"
   },
