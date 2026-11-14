@@ -1,0 +1,26 @@
+{
+  "name": "myclass",
+  "private": true,
+  "version": "0.1.0",
+  "description": "myClass – a personal assistant for Open eClass (Greek universities)",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c magenta,cyan \"npm:dev -w @myclass/server\" \"npm:dev -w @myclass/web\"",
+    "dev:server": "npm run dev -w @myclass/server",
+    "dev:web": "npm run dev -w @myclass/web",
+    "build": "npm run build -w @myclass/web && npm run build -w @myclass/server",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "probe": "npm run probe -w @myclass/server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

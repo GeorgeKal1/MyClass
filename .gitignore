@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+*.tsbuildinfo
+# local runtime data (users, encrypted credentials, snapshots)
+.data/
+apps/server/.data/
+apps/server/fixtures/live/
+.DS_Store
