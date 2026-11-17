@@ -1,8 +1,8 @@
 {
   "id": "/",
-  "name": "myClass — eClass Assistant",
+  "name": "myClass",
   "short_name": "myClass",
-  "description": "Personal assistant for Open eClass across Greek universities",
+  "description": "Your eClass assistant",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

@@ -3,15 +3,18 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import fs from "node:fs";
 import path from "node:path";
 import { Hono, type Context } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { stream, streamSSE } from "hono/streaming";
 import archiver from "archiver";
 import { PassThrough } from "node:stream";
+import { ZodError } from "zod";
 import {
   ActionDecision,
   ChatRequest,
   CourseMetaPatch,
+  DocumentSummaryRequest,
   LoginRequest,
   SettingsPatch,
   type ChatMessage,
@@ -22,9 +25,11 @@ import {
   executeConfirmedAction,
   handleGoogleOAuthCallback,
   runAssistantTurn,
+  summarizeCourseDocument,
 } from "./ai.js";
 import { encrypt, randomId, sha256 } from "./crypto.js";
 import {
+  forgetUserSession,
   getConnectorForUser,
   performEclassLogin,
   setTransientCredentials,
@@ -37,7 +42,7 @@ import {
   UNIPI_DEPARTMENTS,
 } from "./eclass/unipi-curriculum.js";
 import { getUniversity, UNIVERSITIES } from "./eclass/universities.js";
-import { env } from "./env.js";
+import { env, publicUrl } from "./env.js";
 import {
   emitNotification,
   pollUserNow,
@@ -55,18 +60,40 @@ type Variables = {
 
 const app = new Hono<{ Variables: Variables }>();
 
-// Security headers for all API responses
-app.use("/api/*", async (c, next) => {
+// Content Security Policy: scripts only from this origin, so injected HTML cannot run code.
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src 'self' https://fonts.gstatic.com data:",
+  "img-src 'self' data: https:",
+  "connect-src 'self'",
+  "worker-src 'self'",
+  "manifest-src 'self'",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join("; ");
+
+// Security headers for every response (API and web app)
+app.use("*", async (c, next) => {
   await next();
   c.header("X-Content-Type-Options", "nosniff");
   c.header("X-Frame-Options", "DENY");
   c.header("Referrer-Policy", "no-referrer");
+  c.header("Content-Security-Policy", CONTENT_SECURITY_POLICY);
+  if (env.secureCookies) {
+    c.header("Strict-Transport-Security", "max-age=15552000; includeSubDomains");
+  }
 });
 
+// Only the app's own web origin may make credentialed cross-origin requests.
+const allowedOrigins = new Set([env.webOrigin, publicUrl]);
 app.use(
   "/api/*",
   cors({
-    origin: (origin) => origin || env.webOrigin,
+    origin: (origin) => (allowedOrigins.has(origin) ? origin : null),
     credentials: true,
   }),
 );
@@ -135,6 +162,12 @@ app.onError((err, c) => {
   if (err instanceof HttpError) {
     return c.json({ error: err.message }, err.status as 400);
   }
+  if (err instanceof ZodError) {
+    return c.json({ error: "Invalid request" }, 400);
+  }
+  if (err instanceof SyntaxError) {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
   console.error("[api error]", err);
   return c.json({ error: err.message || "Internal server error" }, 500);
 });
@@ -156,14 +189,18 @@ app.post("/api/auth/login", async (c) => {
     throw new HttpError(429, "Too many failed login attempts. Please wait 5 minutes and try again.");
   }
 
-  console.log(`[login attempt] username=${body.username} universityId=${body.universityId}`);
   const resolvedUniId =
     !body.universityId || body.universityId === "auto"
       ? detectUniversityFromUsername(body.username)
       : body.universityId;
-  const uni = getUniversity(resolvedUniId) ?? getUniversity("unipi");
-  console.log(`[login attempt] resolved to uni=${uni?.id}`);
-  if (!uni) throw new HttpError(400, "Unknown university");
+  const uni = resolvedUniId ? getUniversity(resolvedUniId) : undefined;
+  if (!uni) {
+    throw new HttpError(
+      400,
+      resolvedUniId ? "Unknown university" : "Please choose your university",
+    );
+  }
+  console.log(`[login attempt] university=${uni.id}`);
 
   const userId = sha256(`${uni.id}:${body.username.trim().toLowerCase()}`).slice(0, 24);
   const existing = users.get(userId) ?? newUser(userId, uni.id, body.username.trim());
@@ -174,7 +211,7 @@ app.post("/api/auth/login", async (c) => {
   try {
     const { http, displayName } = await performEclassLogin(uni, existing.username, body.password);
     failedLoginMap.delete(rateKey);
-    console.log(`[login success] username=${existing.username} displayName=${displayName}`);
+    console.log(`[login success] university=${uni.id}`);
     existing.displayName = displayName || existing.username;
     const serialized = http.serialize();
     setTransientCredentials(userId, body.password, serialized);
@@ -200,7 +237,7 @@ app.post("/api/auth/login", async (c) => {
   setCookie(c, SESSION_COOKIE, sid, {
     httpOnly: true,
     sameSite: "Lax",
-    secure: env.isProd,
+    secure: env.secureCookies,
     path: "/",
     maxAge: 60 * 60 * 24 * 30,
   });
@@ -220,6 +257,7 @@ app.post("/api/auth/logout", (c) => {
 
 app.delete("/api/auth/account", (c) => {
   const u = requireUser(c);
+  forgetUserSession(u.id);
   users.delete(u.id);
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
   return c.json({ ok: true });
@@ -325,13 +363,13 @@ app.post("/api/ai/google/disconnect", (c) => {
 app.get("/api/courses", async (c) => {
   const u = requireUser(c);
   const connector = getConnectorForUser(u);
-  const list = await connector.listCourses();
+  const { courses: list, warnings } = await connector.listCoursesDetailed();
   const enriched = list.map((course) => ({
     ...course,
-    semester: u.courseMeta[course.code]?.semester ?? course.semester ?? "Ε' Εξάμηνο",
+    semester: u.courseMeta[course.code]?.semester ?? course.semester,
     archived: u.courseMeta[course.code]?.archived ?? false,
   }));
-  return c.json({ courses: enriched });
+  return c.json({ courses: enriched, warnings });
 });
 
 app.patch("/api/courses/:code/meta", async (c) => {
@@ -349,9 +387,8 @@ app.get("/api/catalog", async (c) => {
   const q = c.req.query("q") || undefined;
   const department = c.req.query("department") || undefined;
   const connector = getConnectorForUser(u);
-  const departments = connector.listDepartments();
-  const autoDept = u.universityId === "unipi" ? detectUniPiDepartmentFromUsername(u.username) : departments[0]?.id || "default";
-  const activeDepartment = department || autoDept;
+  const departments = await connector.listDepartments();
+  const activeDepartment = department || connector.defaultDepartmentId();
   const catalog = await connector.listCatalog(q, activeDepartment);
   return c.json({ catalog, departments, activeDepartment });
 });
@@ -404,9 +441,89 @@ app.get("/api/assignments", async (c) => {
   return c.json({ assignments });
 });
 
+app.get("/api/courses/:code/tools", async (c) => {
+  const u = requireUser(c);
+  const tools = await getConnectorForUser(u).getCourseTools(c.req.param("code"));
+  return c.json({ tools });
+});
+
+app.get("/api/assignments/:code/:id", async (c) => {
+  const u = requireUser(c);
+  const detail = await getConnectorForUser(u).getAssignmentDetail(c.req.param("code"), c.req.param("id"));
+  return c.json({ assignment: detail });
+});
+
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
+app.post(
+  "/api/assignments/:code/:id/submit",
+  bodyLimit({
+    maxSize: MAX_UPLOAD_BYTES + 1024 * 1024,
+    onError: (c) => c.json({ error: "The files are too large (max 50 MB in total)." }, 413),
+  }),
+  async (c) => {
+    const u = requireUser(c);
+    const body = await c.req.parseBody({ all: true });
+    const rawFiles = ([] as unknown[]).concat(body["files"] ?? []);
+    const files: Array<{ name: string; type: string; data: Buffer }> = [];
+    let total = 0;
+    for (const f of rawFiles) {
+      if (typeof f === "string" || !f || typeof (f as File).arrayBuffer !== "function") continue;
+      const file = f as File;
+      const data = Buffer.from(await file.arrayBuffer());
+      total += data.length;
+      files.push({ name: file.name || "file", type: file.type, data });
+    }
+    if (total > MAX_UPLOAD_BYTES) throw new HttpError(413, "The files are too large (max 50 MB in total).");
+    const text = typeof body["text"] === "string" ? body["text"].slice(0, 100_000) : undefined;
+    const comments = typeof body["comments"] === "string" ? body["comments"].slice(0, 5000) : undefined;
+    const result = await getConnectorForUser(u).submitAssignment(c.req.param("code"), c.req.param("id"), {
+      files,
+      text,
+      comments,
+    });
+    if (!result.ok) throw new HttpError(422, result.message);
+    void pollUserNow(u);
+    return c.json({ result });
+  },
+);
+
+/** Streams a file from the course's own eClass portal (assignment attachments, etc.). */
+app.get("/api/courses/:code/proxy", async (c) => {
+  const u = requireUser(c);
+  const url = c.req.query("url") || "";
+  const file = await getConnectorForUser(u)
+    .downloadPortalUrl(c.req.param("code"), url)
+    .catch((err: Error) => {
+      throw new HttpError(400, err.message);
+    });
+  c.header("Content-Type", file.contentType);
+  c.header("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(file.filename)}`);
+  return c.body(new Uint8Array(file.body));
+});
+
 /* ------------------------------------------------------------------ */
 /* Documents & Bulk ZIP Downloads                                      */
 /* ------------------------------------------------------------------ */
+
+app.post("/api/courses/:code/documents/summary", async (c) => {
+  const u = requireUser(c);
+  const { path: docPath, refresh } = DocumentSummaryRequest.parse(await c.req.json());
+  try {
+    const res = await summarizeCourseDocument(u, c.req.param("code"), docPath, { refresh });
+    return c.json({
+      summary: {
+        path: docPath,
+        name: res.name,
+        summary: res.summary,
+        createdAt: new Date().toISOString(),
+        cached: res.cached,
+      },
+    });
+  } catch (err) {
+    throw new HttpError(422, (err as Error).message);
+  }
+});
 
 app.get("/api/courses/:code/documents", async (c) => {
   const u = requireUser(c);
@@ -720,6 +837,9 @@ app.post("/api/chat/action", async (c) => {
 /* ------------------------------------------------------------------ */
 /* Production static frontend serving                                 */
 /* ------------------------------------------------------------------ */
+
+// Unknown API routes are JSON 404s (not the web app's index.html)
+app.all("/api/*", (c) => c.json({ error: "Not found" }, 404));
 
 const distCandidates = [
   path.resolve(process.cwd(), "apps/web/dist"),

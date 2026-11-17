@@ -1,8 +1,10 @@
 import type { CatalogCourse, ChatMessage, ChatStreamEvent, PendingAction } from "@myclass/shared";
 import { decrypt, encrypt, randomId } from "./crypto.js";
 import { getConnectorForUser } from "./eclass/connector.js";
+import { getUniversity } from "./eclass/universities.js";
 import { getCurrentAcademicYearBounds, hasPastAcademicYearTag, SEMESTERS } from "./eclass/unipi-curriculum.js";
-import { env, publicUrl } from "./env.js";
+import { prepareDocumentForAi } from "./doctext.js";
+import { env } from "./env.js";
 import { oauthStates, users, type UserRecord } from "./store.js";
 
 /* ------------------------------------------------------------------ */
@@ -15,7 +17,7 @@ export function buildGoogleOAuthUrl(userId: string): string | null {
   oauthStates.put(state, userId);
   const params = new URLSearchParams({
     client_id: env.google.clientId,
-    redirect_uri: `${publicUrl}/api/ai/google/callback`,
+    redirect_uri: env.google.redirectUri,
     response_type: "code",
     access_type: "offline",
     prompt: "consent",
@@ -36,7 +38,7 @@ export async function handleGoogleOAuthCallback(code: string, state: string): Pr
       code,
       client_id: env.google.clientId,
       client_secret: env.google.clientSecret,
-      redirect_uri: `${publicUrl}/api/ai/google/callback`,
+      redirect_uri: env.google.redirectUri,
       grant_type: "authorization_code",
     }),
   });
@@ -184,6 +186,48 @@ const TOOLS = [
   },
   {
     type: "function",
+    name: "read_document",
+    description:
+      "Reads one file from a course's Documents (PDF, slides, Word, text, code) and returns its relevant content. Use it to answer questions about what a lecture, exercise sheet or project brief says. Get the path from list_documents first.",
+    parameters: {
+      type: "object",
+      properties: {
+        courseCode: { type: "string", description: "Course code" },
+        path: { type: "string", description: "The file's `path` exactly as returned by list_documents" },
+        question: {
+          type: "string",
+          description: "What the student wants to know about the file (used to focus the reading)",
+        },
+      },
+      required: ["courseCode", "path"],
+    },
+  },
+  {
+    type: "function",
+    name: "get_assignment_details",
+    description:
+      "Gets the full description, attached files, submission status and whether submission is open for ONE assignment. Use the assignment `id` from get_deadlines.",
+    parameters: {
+      type: "object",
+      properties: {
+        courseCode: { type: "string", description: "Course code" },
+        assignmentId: { type: "string", description: "Assignment id from get_deadlines (e.g. TMC106:12)" },
+      },
+      required: ["courseCode", "assignmentId"],
+    },
+  },
+  {
+    type: "function",
+    name: "read_message",
+    description: "Reads the full body of one inbox message (id from get_messages).",
+    parameters: {
+      type: "object",
+      properties: { id: { type: "string", description: "Message id" } },
+      required: ["id"],
+    },
+  },
+  {
+    type: "function",
     name: "enroll_course",
     description:
       "Registers/joins a new course on eClass. Requires student confirmation before executing.",
@@ -294,12 +338,67 @@ async function runReadOnlyTool(
     }
     case "get_messages": {
       const list = await connector.getMessages();
-      return list.slice(0, 15);
+      return list.slice(0, 20).map((m) => ({
+        id: m.id,
+        subject: m.subject,
+        sender: m.sender,
+        date: m.date,
+        course: m.courseTitle,
+        read: m.read,
+      }));
+    }
+    case "read_message": {
+      const msg = await connector.getMessage(String(args.id ?? ""));
+      if (!msg) return { error: "Message not found" };
+      return {
+        subject: msg.subject,
+        sender: msg.sender,
+        date: msg.date,
+        course: msg.courseTitle,
+        body: stripTags(msg.bodyHtml ?? "").slice(0, 6000),
+        attachments: msg.attachments?.map((a) => a.name),
+      };
     }
     case "get_deadlines": {
-      return connector.getAssignments(
+      const list = await connector.getAssignments(
         typeof args.courseCode === "string" && args.courseCode ? args.courseCode : undefined,
       );
+      const now = Date.now();
+      return list
+        .map((a) => ({
+          id: a.id,
+          courseCode: a.courseCode,
+          course: a.courseTitle,
+          title: a.title,
+          deadline: a.deadline ? formatAthens(a.deadline) : "no deadline",
+          daysLeft: a.deadline ? Math.ceil((new Date(a.deadline).getTime() - now) / 86_400_000) : null,
+          submitted: a.submitted,
+          grade: a.grade,
+        }))
+        .sort((x, y) => (x.daysLeft ?? 9999) - (y.daysLeft ?? 9999));
+    }
+    case "get_assignment_details": {
+      const d = await connector.getAssignmentDetail(String(args.courseCode ?? ""), String(args.assignmentId ?? ""));
+      return {
+        title: d.title,
+        description: stripTags(d.descriptionHtml).slice(0, 6000),
+        deadline: d.deadline ? formatAthens(d.deadline) : undefined,
+        submitted: d.submitted,
+        grade: d.grade,
+        submissionOpen: d.canSubmit,
+        submissionType: d.submissionType,
+        maxFiles: d.maxFiles,
+        attachedFiles: d.attachments.map((a) => a.name),
+        existingSubmission: d.existingSubmission,
+      };
+    }
+    case "read_document": {
+      const courseCode = String(args.courseCode ?? "");
+      const path = String(args.path ?? "");
+      if (!courseCode || !path) return { error: "courseCode and path are required" };
+      const question = typeof args.question === "string" ? args.question : undefined;
+      const res = await summarizeCourseDocument(user, courseCode, path, { question });
+      return { file: res.name, content: res.summary };
     }
     default:
       return { error: `Unknown tool: ${name}` };
@@ -328,7 +427,10 @@ export async function executeConfirmedAction(
   }
 
   if (action.tool === "archive_semester") {
-    const sem = String(action.args.semester ?? "").toLowerCase();
+    const sem = String(action.args.semester ?? "").trim().toLowerCase();
+    if (sem.length < 2) {
+      throw new Error(lang === "el" ? "Δεν δόθηκε έγκυρο εξάμηνο." : "No valid semester was given.");
+    }
     const unreg = Boolean(action.args.unenrollFromEclass);
     const all = await connector.listCourses();
     const matched = all.filter((c) => {
@@ -400,6 +502,7 @@ async function callGeminiInteractions(
   model: string,
   history: unknown[],
   systemInstruction: string,
+  withTools = true,
 ): Promise<InteractionResponse> {
   const res = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
     method: "POST",
@@ -412,7 +515,7 @@ async function callGeminiInteractions(
       store: false,
       system_instruction: systemInstruction,
       input: history,
-      tools: TOOLS,
+      ...(withTools ? { tools: TOOLS } : {}),
     }),
   });
 
@@ -434,6 +537,200 @@ function extractTextFromSteps(resp: InteractionResponse): string {
     }
   }
   return parts.join("\n").trim();
+}
+
+/* ------------------------------------------------------------------ */
+/* Small helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+function stripTags(html: string): string {
+  return html
+    .replace(/<(br|\/p|\/div|\/li|\/h\d)\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n+/g, "\n")
+    .trim();
+}
+
+function formatAthens(iso: string | Date, lang: "el" | "en" = "el"): string {
+  const d = typeof iso === "string" ? new Date(iso) : iso;
+  return d.toLocaleString(lang === "el" ? "el-GR" : "en-GB", {
+    timeZone: "Europe/Athens",
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function truncateJson(value: unknown, max = 24_000): string {
+  const json = JSON.stringify(value);
+  if (json.length <= max) return json;
+  return `${json.slice(0, max)}… [truncated ${json.length - max} chars – ask a narrower question or pass a courseCode]`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Document summaries (Gemini generateContent, multimodal)             */
+/* ------------------------------------------------------------------ */
+
+const summaryCache = new Map<string, { at: number; summary: string; name: string }>();
+const SUMMARY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+async function callGeminiGenerate(
+  auth: { headers: Record<string, string>; model: string },
+  parts: unknown[],
+  systemInstruction: string,
+): Promise<string> {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(auth.model)}:generateContent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...auth.headers },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemInstruction }] },
+        contents: [{ role: "user", parts }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+      }),
+    },
+  );
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Gemini API (${res.status}): ${errText.slice(0, 240)}`);
+  }
+  const data = (await res.json()) as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  };
+  const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("").trim();
+  if (!text) throw new Error("Gemini returned an empty answer");
+  return text;
+}
+
+/**
+ * Summarizes (or answers `question` about) one document of a course. Used by the
+ * "AI summary" button in Documents and by the assistant's `read_document` tool.
+ */
+export async function summarizeCourseDocument(
+  user: UserRecord,
+  courseCode: string,
+  path: string,
+  opts: { question?: string; refresh?: boolean } = {},
+): Promise<{ name: string; summary: string; cached: boolean }> {
+  const lang = user.settings.language;
+  const cacheKey = `${user.id}|${courseCode}|${path}|${lang}`;
+  if (!opts.question && !opts.refresh) {
+    const hit = summaryCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < SUMMARY_TTL_MS) return { name: hit.name, summary: hit.summary, cached: true };
+  }
+
+  const auth = await resolveGeminiAuth(user);
+  if (!auth) {
+    throw new Error(
+      lang === "el"
+        ? "Η σύνοψη με AI χρειάζεται σύνδεση με Gemini (Ρυθμίσεις → Βοηθός AI)."
+        : "AI summaries need a Gemini connection (Settings → AI assistant).",
+    );
+  }
+
+  const connector = getConnectorForUser(user);
+  const file = await connector.downloadFile(courseCode, path);
+  const data = Buffer.isBuffer(file.body) ? file.body : Buffer.from(await streamToBuffer(file.body));
+  const prepared = prepareDocumentForAi(file.filename, file.contentType, data);
+  if (prepared.kind === "unsupported") throw new Error(prepared.reason);
+
+  const languageName = lang === "el" ? "Greek" : "English";
+  const system = opts.question
+    ? `You read university course material for a student and answer their question using ONLY the document. ` +
+      `Quote exact numbers, dates, requirements and formulas from the document. If the document does not contain the answer, say so. ` +
+      `Answer in ${languageName}, plain text, "• " bullets, **bold** only for key terms. No headings, no LaTeX.`
+    : `You summarize university course material for a busy student. Write in ${languageName}. ` +
+      `Structure: one sentence on what the document is; then "• " bullets with the key ideas/definitions/results ` +
+      `(max 8, each one line); then, if present, a line starting with "${lang === "el" ? "Παραδοτέα & προθεσμίες" : "Deliverables & deadlines"}:" listing ` +
+      `requirements, deadlines, submission format and grading weight exactly as written. Keep formulas readable in plain text (no LaTeX). ` +
+      `No headings, no preamble, no closing remarks. Max ~250 words.`;
+
+  const instruction = opts.question
+    ? `Document: "${file.filename}". Question: ${opts.question}`
+    : `Summarize the document "${file.filename}".`;
+
+  const parts =
+    prepared.kind === "inline"
+      ? [{ inlineData: { mimeType: prepared.mimeType, data: prepared.data.toString("base64") } }, { text: instruction }]
+      : [{ text: `${instruction}\n\n----- DOCUMENT TEXT -----\n${prepared.text || "(the file contains no extractable text)"}` }];
+
+  const summary = cleanReadableAssistantText(await callGeminiGenerate(auth, parts, system));
+  if (!opts.question) summaryCache.set(cacheKey, { at: Date.now(), summary, name: file.filename });
+  return { name: file.filename, summary, cached: false };
+}
+
+async function streamToBuffer(stream: AsyncIterable<Uint8Array> | NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream as AsyncIterable<Uint8Array>) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+/* ------------------------------------------------------------------ */
+/* System prompt                                                       */
+/* ------------------------------------------------------------------ */
+
+async function buildSystemInstruction(user: UserRecord): Promise<string> {
+  const acadYear = getCurrentAcademicYearBounds();
+  const uni = getUniversity(user.universityId);
+  const uniName = uni ? `${uni.nameEn} (${uni.name})` : "a Greek university";
+  const now = formatAthens(new Date(), "en");
+
+  let courseLines = "(could not load the course list – call list_courses)";
+  try {
+    const courses = await Promise.race([
+      getConnectorForUser(user).listCourses(),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 8000)),
+    ]);
+    const active = courses.filter((c) => !user.courseMeta[c.code]?.archived);
+    courseLines = active.length
+      ? active
+          .map(
+            (c) =>
+              `- ${c.code}${c.publicCode && c.publicCode !== c.code ? ` / ${c.publicCode}` : ""} — ${c.title}` +
+              `${c.professor ? ` — ${c.professor}` : ""}${user.courseMeta[c.code]?.semester ?? c.semester ? ` — ${user.courseMeta[c.code]?.semester ?? c.semester}` : ""}`,
+          )
+          .join("\n")
+      : "(none found on eClass – if the student says they have courses, suggest Refresh, or signing out and in again)";
+  } catch {
+    /* keep the fallback text */
+  }
+
+  return [
+    `You are myClass, the study assistant inside an app that brings a student's Open eClass at ${uniName} into one place.`,
+    "",
+    "CONTEXT",
+    `- Now: ${now} (Europe/Athens). Academic year ${acadYear.label}.`,
+    `- Student: ${user.displayName} (username ${user.username}).`,
+    "- Enrolled courses (code — title — professor — semester):",
+    courseLines,
+    "- The app has: Home (calendar with all deadlines), Courses (documents with an 'AI summary' button, announcements, assignments with file upload/submission, every other eClass tool), Messages, Assistant (you), Settings.",
+    "",
+    "HOW TO WORK",
+    "- Get facts with tools. Never invent courses, dates, grades, files, rooms or professors. If a tool returns nothing or fails, say so in one sentence and suggest the next step.",
+    "- Match course names loosely: Greek or English, with/without accents, abbreviations and nicknames (e.g. 'ΒΔ' = Βάσεις Δεδομένων, 'OOP' = Αντικειμενοστρεφής Προγραμματισμός). Prefer the enrolled list above; use search_catalog only for courses not in it.",
+    "- Deadlines / 'what do I have this week': call get_deadlines (optionally with courseCode). Show upcoming, unsubmitted items first, sorted by date, with days left. Mention overdue or already-submitted items only if relevant.",
+    "- Questions about what a file, lecture, exercise sheet or project brief says: call list_documents for the course (open sub-folders if needed), pick the best-matching file, then call read_document with the student's question. Answer from that content and name the file you used.",
+    "- Assignment questions ('what does project 2 ask', 'can I still submit'): get_deadlines, then get_assignment_details.",
+    "- Joining/leaving a course or archiving a semester: call enroll_course / unenroll_course / archive_semester directly; the app shows the student a confirmation card, so don't ask 'are you sure?' yourself.",
+    "- Uploading/submitting work is done in the app (Courses → course → Assignments → Submit); you cannot attach files yourself, but you can check requirements and status.",
+    "- If a request is ambiguous (e.g. two courses or files match), ask ONE short question that lists the options. If it's clear, act without asking.",
+    "- Only use items from the current academic year unless the student explicitly asks about older ones.",
+    "- For general study help (explain a concept, make a study plan, quiz me), answer directly from your knowledge; use course files when the student refers to their course material.",
+    "",
+    "STYLE",
+    "- Reply in the student's language (Greek or English) and match their tone. Be concise: answer first, details after. No filler, no repeating the question.",
+    "- Plain text, short paragraphs, '• ' bullets. Use **bold** only for key names, dates and numbers. No headings, tables, LaTeX or code blocks (unless the student asks for code).",
+    "- Dates like 'Παρ 21 Νοε, 23:59' in Greek or 'Fri 21 Nov, 23:59' in English. Times are Europe/Athens.",
+  ].join("\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -464,36 +761,30 @@ export async function runAssistantTurn(
 
   if (auth) {
     try {
-      const acadYear = getCurrentAcademicYearBounds();
-      const systemInstruction =
-        "You are myClass Assistant, a smart, concise university study assistant for Open eClass at the University of Piraeus (federating both thales.cs.unipi.gr and eclass.unipi.gr). " +
-        `The student's name is "${user.displayName}" (${user.username}). ` +
-        `The current academic year is ${acadYear.label}. NEVER show, cite, or mention projects, assignments, files, or announcements from previous academic years (such as 2024-2025 or 2025-2026) or expired exam periods. ` +
-        "Always reply in the same language the student uses (Greek or English). " +
-        "Format your answers in clean, natural, easy-to-read plain text with simple bullet points (•). NEVER use LaTeX syntax ($...$, \\textbf, \\frac, etc.), raw markdown headers (###), underscores (_..._), or code backticks (`...`). " +
-        "When the student asks about a project or assignment (e.g. '1st project', '1η εργασία'), check `get_deadlines`, `get_announcements`, and `list_documents` for the relevant course(s) and present ONLY the current academic year (" +
-        acadYear.label +
-        ") project details, deadline, and current-year PDF files. " +
-        "Use `search_catalog` to inspect all university subjects across semesters 1–8 (Α' Εξάμηνο – Η' Εξάμηνο), their course codes, and their professors. " +
-        "Use `list_documents` to inspect the uploaded files and folders of ANY subject (enrolled or not). " +
-        "Use `list_courses`, `get_announcements`, `get_messages`, and `get_deadlines` for the student's active courses. " +
-        "When the student asks to join/enroll in a course, leave/unenroll from a course, or clean up a past semester, call the matching tool (enroll_course, unenroll_course, archive_semester).";
+      const systemInstruction = await buildSystemInstruction(user);
 
-      const history = [
-        ...user.chat.history.slice(-16),
-        {
-          type: "user_input",
-          content: [{ type: "text", text: userMessageText }],
-        },
+      // Persisted history holds ONLY plain text turns. Tool calls/results stay inside one turn:
+      // replaying a function_result whose function_call was cut off by the history window made
+      // Gemini reject the request, which silently dropped the chat to the keyword-only fallback.
+      const priorTurns = (user.chat.history as Array<{ type?: string }>)
+        .filter((s) => s && (s.type === "user_input" || s.type === "model_output"))
+        .slice(-20);
+      while (priorTurns.length && priorTurns[0].type !== "user_input") priorTurns.shift();
+
+      const history: unknown[] = [
+        ...priorTurns,
+        { type: "user_input", content: [{ type: "text", text: userMessageText }] },
       ];
 
-      for (let round = 0; round < 4; round++) {
-        const resp = await callGeminiInteractions(auth.headers, auth.model, history, systemInstruction);
+      const MAX_ROUNDS = 6;
+      for (let round = 0; round < MAX_ROUNDS; round++) {
+        const lastRound = round === MAX_ROUNDS - 1;
+        const resp = await callGeminiInteractions(auth.headers, auth.model, history, systemInstruction, !lastRound);
         const steps = resp.steps ?? [];
         history.push(...steps);
 
         const fcSteps = steps.filter((s) => s.type === "function_call" && s.name);
-        if (fcSteps.length === 0) {
+        if (fcSteps.length === 0 || lastRound) {
           finalText = extractTextFromSteps(resp);
           break;
         }
@@ -524,12 +815,18 @@ export async function runAssistantTurn(
             break;
           }
 
-          const toolResult = await runReadOnlyTool(user, toolName, args);
+          let toolResult: unknown;
+          try {
+            toolResult = await runReadOnlyTool(user, toolName, args);
+          } catch (toolErr) {
+            // Let the model explain the failure instead of aborting the whole answer
+            toolResult = { error: (toolErr as Error).message || "Tool failed" };
+          }
           history.push({
             type: "function_result",
             name: toolName,
             call_id: fc.id,
-            result: [{ type: "text", text: JSON.stringify(toolResult) }],
+            result: [{ type: "text", text: truncateJson(toolResult) }],
           });
         }
 
@@ -543,12 +840,28 @@ export async function runAssistantTurn(
         }
       }
 
+      if (!finalText.trim() && !pendingAction) {
+        finalText =
+          lang === "el"
+            ? "Δεν κατάφερα να ολοκληρώσω την απάντηση. Μπορείς να το ρωτήσεις λίγο πιο συγκεκριμένα (π.χ. με το όνομα του μαθήματος);"
+            : "I couldn't complete that answer. Could you ask a bit more specifically (e.g. with the course name)?";
+      }
+
       users.update(user.id, (u) => {
-        u.chat.history = history.slice(-24);
+        u.chat.history = [
+          ...priorTurns,
+          { type: "user_input", content: [{ type: "text", text: userMessageText }] },
+          { type: "model_output", content: [{ type: "text", text: finalText }] },
+        ].slice(-20);
       });
     } catch (err) {
+      console.warn("[assistant] Gemini failed, using offline assistant:", (err as Error).message);
       const fallback = await runLocalSmartAssistant(user, userMessageText, toolsUsed, emit);
-      finalText = fallback.text;
+      const note =
+        lang === "el"
+          ? "(Το Gemini δεν απάντησε αυτή τη φορά, οπότε απαντώ με τον απλό βοηθό χωρίς AI.)\n\n"
+          : "(Gemini didn't respond this time, so this answer comes from the basic offline assistant.)\n\n";
+      finalText = note + fallback.text;
       pendingAction = fallback.action;
     }
   } else {
@@ -1142,26 +1455,32 @@ async function runLocalSmartAssistant(
     connector.getAnnouncements(),
   ]);
 
+  const sample = courses[0]?.title ?? (lang === "el" ? "Βάσεις Δεδομένων" : "Databases");
+  const sample2 = courses[1]?.title ?? sample;
   return {
     text:
       lang === "el"
-        ? `Γεια σου **${user.displayName}**! Είσαι εγγεγραμμένος σε **${courses.length} μαθήματα** (${courses
-            .map((c) => `${c.title} [${c.code}]`)
-            .join(", ")}) και έχω ζωντανή πρόσβαση σε **όλα τα ${catalog.length} μαθήματα του Πανεπιστημίου (Α' – Η' Εξάμηνο)**.\n\n` +
-          `• **Τελευταία ανακοίνωση:** ${announcements[0]?.title ?? "—"} _(${announcements[0]?.courseTitle ?? ""})_\n\n` +
-          `Μπορείς να με ρωτήσεις για οποιοδήποτε μάθημα, εξάμηνο, καθηγητή ή αρχείο, π.χ.:\n` +
-          `- _«Ποια είναι τα μαθήματα του Α' εξαμήνου;»_\n` +
-          `- _«Ποια μαθήματα υπάρχουν στο Ε' εξάμηνο και ποιοι τα διδάσκουν;»_\n` +
-          `- _«Τι αρχεία υπάρχουν στην Κρυπτογραφία (TMC106);»_\n` +
-          `- _«Τι αρχεία έχουν ανέβει στην Ανάλυση Ι (TMA117);»_\n` +
-          `- _«Γράψε με στο μάθημα Ασφάλεια Δικτύων (TMA102)»_`
-        : `Hi **${user.displayName}**! You are enrolled in **${courses.length} courses** and I have live access to **all ${catalog.length} university subjects across Semesters 1–8 (Α' – Η' Εξάμηνο)**.\n\n` +
-          `• **Latest announcement:** ${announcements[0]?.title ?? "—"} _(${announcements[0]?.courseTitle ?? ""})_\n\n` +
-          `Try asking me:\n` +
-          `- _"What subjects are in the 1st semester (Α' Εξάμηνο)?"_\n` +
-          `- _"Show me all 5th semester subjects and their professors"_\n` +
-          `- _"What files are uploaded in Cryptography (TMC106)?"_\n` +
-          `- _"What files are in Analysis I (TMA117)?"_\n` +
-          `- _"Join Network Security (TMA102)"_`,
+        ? `Γεια σου **${user.displayName}**! Βλέπω **${courses.length} μαθήματα** στο eClass σου` +
+          (catalog.length ? ` και **${catalog.length}** στον κατάλογο του τμήματος.` : ".") +
+          (announcements[0] ? `
+
+• Τελευταία ανακοίνωση: **${announcements[0].title}** (${announcements[0].courseTitle ?? ""})` : "") +
+          `
+
+Ρώτα με για παράδειγμα:
+• «Τι προθεσμίες έχω αυτή την εβδομάδα;»
+• «Τι αρχεία έχει το ${sample};»
+• «Τι νέα ανακοίνωση έχει το ${sample2};»`
+        : `Hi **${user.displayName}**! I can see **${courses.length} courses** on your eClass` +
+          (catalog.length ? ` and **${catalog.length}** in your department's catalog.` : ".") +
+          (announcements[0] ? `
+
+• Latest announcement: **${announcements[0].title}** (${announcements[0].courseTitle ?? ""})` : "") +
+          `
+
+Try asking:
+• "What deadlines do I have this week?"
+• "What files does ${sample} have?"
+• "Any new announcements in ${sample2}?"`,
   };
 }

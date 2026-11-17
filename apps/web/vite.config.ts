@@ -9,7 +9,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: "http://localhost:8787",
+        // Override to run a second copy side by side (e.g. API_PROXY_TARGET=http://localhost:8788)
+        target: process.env.API_PROXY_TARGET ?? "http://localhost:8787",
         changeOrigin: true,
       },
     },

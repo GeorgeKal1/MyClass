@@ -1,3 +1,4 @@
+import { detectUniversityId } from "@myclass/shared";
 import type { Announcement, Assignment, DepartmentInfo, DocNode } from "@myclass/shared";
 
 export const THALES_BASE_URL = "https://thales.cs.unipi.gr";
@@ -254,6 +255,12 @@ export interface UniPiDepartmentSpec extends DepartmentInfo {
   }>;
 }
 
+/**
+ * University of Piraeus departments. `fc` values are the department ROOT faculties on
+ * eclass.unipi.gr (verified against the public faculty tree, Nov 2026); the catalog crawler
+ * walks their sub-folders (undergraduate / postgraduate / other) automatically, and falls back
+ * to the student's own faculty page if an id ever stops returning courses.
+ */
 export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
   {
     id: "cs-ug",
@@ -300,63 +307,63 @@ export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
     name: "Τμήμα Ψηφιακών Συστημάτων",
     nameEn: "Department of Digital Systems",
     portalLabel: "eclass.unipi.gr",
-    sources: [{ portal: "central", fc: 44 }],
+    sources: [{ portal: "central", fc: 13 }],
   },
   {
     id: "ode",
     name: "Τμήμα Οργάνωσης και Διοίκησης Επιχειρήσεων",
     nameEn: "Department of Business Administration",
     portalLabel: "eclass.unipi.gr",
-    sources: [{ portal: "central", fc: 23 }],
+    sources: [{ portal: "central", fc: 7 }],
   },
   {
     id: "econ",
     name: "Τμήμα Οικονομικής Επιστήμης",
     nameEn: "Department of Economics",
     portalLabel: "eclass.unipi.gr",
-    sources: [{ portal: "central", fc: 26 }],
+    sources: [{ portal: "central", fc: 6 }],
   },
   {
     id: "fin",
     name: "Τμήμα Χρηματοοικονομικής και Τραπεζικής Διοικητικής",
     nameEn: "Department of Banking and Financial Management",
     portalLabel: "eclass.unipi.gr",
-    sources: [{ portal: "central", fc: 64 }],
+    sources: [{ portal: "central", fc: 9 }],
   },
   {
     id: "stat",
     name: "Τμήμα Στατιστικής και Ασφαλιστικής Επιστήμης",
     nameEn: "Department of Statistics and Insurance Science",
     portalLabel: "eclass.unipi.gr",
-    sources: [{ portal: "central", fc: 29 }],
+    sources: [{ portal: "central", fc: 8 }],
   },
   {
     id: "bdt",
     name: "Τμήμα Βιομηχανικής Διοίκησης και Τεχνολογίας",
     nameEn: "Department of Industrial Management and Technology",
     portalLabel: "eclass.unipi.gr",
-    sources: [{ portal: "central", fc: 35 }],
+    sources: [{ portal: "central", fc: 10 }],
   },
   {
     id: "nas",
     name: "Τμήμα Ναυτιλιακών Σπουδών",
     nameEn: "Department of Maritime Studies",
     portalLabel: "eclass.unipi.gr",
-    sources: [{ portal: "central", fc: 38 }],
+    sources: [{ portal: "central", fc: 11 }],
   },
   {
     id: "des",
     name: "Τμήμα Διεθνών και Ευρωπαϊκών Σπουδών",
     nameEn: "Department of International and European Studies",
     portalLabel: "eclass.unipi.gr",
-    sources: [{ portal: "central", fc: 47 }],
+    sources: [{ portal: "central", fc: 14 }],
   },
   {
     id: "tou",
     name: "Τμήμα Τουριστικών Σπουδών",
     nameEn: "Department of Tourism Studies",
     portalLabel: "eclass.unipi.gr",
-    sources: [{ portal: "central", fc: 74 }],
+    sources: [{ portal: "central", fc: 58 }],
   },
 ];
 
@@ -440,28 +447,11 @@ export function resolveUniPiPortalForCourse(courseCode: string): "thales" | "cen
 /* ------------------------------------------------------------------ */
 
 /**
- * Automatically detects the university ID from a student's CAS username or email.
+ * Detects the university ID from a student's CAS username or e-mail.
+ * Returns `null` when it is ambiguous (the user must then pick a university).
  */
-export function detectUniversityFromUsername(rawUsername: string): string {
-  const u = rawUsername.trim().toLowerCase();
-  if (u.includes("@")) {
-    const domain = u.split("@")[1] || "";
-    if (domain.includes("unipi.gr")) return "unipi";
-    if (domain.includes("uniwa.gr")) return "uniwa";
-    if (domain.includes("uoa.gr")) return "uoa";
-    if (domain.includes("ntua.gr")) return "ntua";
-    if (domain.includes("aueb.gr")) return "aueb";
-    if (domain.includes("auth.gr")) return "auth";
-    if (domain.includes("uom.edu.gr") || domain.includes("uom.gr")) return "uom";
-    if (domain.includes("upatras.gr") || domain.includes("upnet.gr")) return "upatras";
-  }
-  // Prefix patterns used by Greek universities
-  if (/^(ice|eee|cs|bme|civ|mech)\d{4,}/i.test(u)) return "uniwa";
-  if (/^sdi\d{5,}/i.test(u)) return "uoa";
-  if (/^(el|mc|cv|ch|ar|ge|na|mm)\d{4,}/i.test(u)) return "ntua";
-  if (/^(iis|icsd|mai|dai)\d{3,}/i.test(u)) return "uom";
-  // University of Piraeus student IDs: p24xxx (Informatics), e24xxx (Digital Systems), m24xxx (ODE), etc.
-  return "unipi";
+export function detectUniversityFromUsername(rawUsername: string): string | null {
+  return detectUniversityId(rawUsername);
 }
 
 /**

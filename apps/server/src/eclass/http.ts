@@ -1,4 +1,28 @@
+import fs from "node:fs";
+import tls from "node:tls";
 import { CookieJar } from "tough-cookie";
+import { Agent, FormData as UndiciFormData, fetch as undiciFetch } from "undici";
+import { EXTRA_INTERMEDIATE_CAS } from "./extra-ca.js";
+
+/**
+ * Strict TLS for every eClass/CAS request: Node's root store, plus intermediates that some
+ * eClass servers forget to send (see extra-ca.ts), plus NODE_EXTRA_CA_CERTS if configured.
+ * Certificate verification is never disabled.
+ */
+function trustedCas(): string[] {
+  const cas = [...tls.rootCertificates, ...EXTRA_INTERMEDIATE_CAS];
+  const extraFile = process.env.NODE_EXTRA_CA_CERTS;
+  if (extraFile) {
+    try {
+      cas.push(fs.readFileSync(extraFile, "utf8"));
+    } catch {
+      console.warn(`[tls] could not read NODE_EXTRA_CA_CERTS file ${extraFile}`);
+    }
+  }
+  return cas;
+}
+
+const dispatcher = new Agent({ connect: { ca: trustedCas() } });
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36 myClass/0.1";
@@ -18,6 +42,8 @@ export interface HttpResponse {
 export interface RequestOptions {
   method?: "GET" | "POST";
   form?: Record<string, string | string[]>;
+  /** multipart/form-data body (file uploads, e.g. assignment submissions). */
+  multipart?: UndiciFormData;
   headers?: Record<string, string>;
   maxRedirects?: number;
   signal?: AbortSignal;
@@ -29,21 +55,33 @@ export interface RequestOptions {
  * redirects to a non-HTTP scheme (`eclass-token:`), which fetch can't follow.
  */
 export class EclassHttp {
+  /** Mobile-API tokens per portal base URL (Open eClass `mlogin.php` / `mtoken.php` session ids). */
+  public tokens: Record<string, string> = {};
+
   constructor(public jar: CookieJar = new CookieJar()) {}
 
   static fromSerialized(json: string): EclassHttp {
-    return new EclassHttp(CookieJar.deserializeSync(json));
+    const parsed = JSON.parse(json) as { jar?: unknown; tokens?: Record<string, string> } & Record<string, unknown>;
+    // v2 format: { jar, tokens }; v1 format: the bare tough-cookie jar
+    if (parsed && typeof parsed === "object" && "jar" in parsed && parsed.jar) {
+      const http = new EclassHttp(CookieJar.deserializeSync(parsed.jar as never));
+      http.tokens = parsed.tokens ?? {};
+      return http;
+    }
+    return new EclassHttp(CookieJar.deserializeSync(parsed as never));
   }
 
   serialize(): string {
-    return JSON.stringify(this.jar.serializeSync());
+    return JSON.stringify({ jar: this.jar.serializeSync(), tokens: this.tokens });
   }
 
   async request(inputUrl: string, opts: RequestOptions = {}): Promise<HttpResponse> {
     let url = inputUrl;
     let method = opts.method ?? "GET";
-    let body: string | undefined;
-    if (opts.form) {
+    let body: string | UndiciFormData | undefined;
+    if (opts.multipart) {
+      body = opts.multipart;
+    } else if (opts.form) {
       const p = new URLSearchParams();
       for (const [k, v] of Object.entries(opts.form)) {
         if (Array.isArray(v)) v.forEach((x) => p.append(k, x));
@@ -62,9 +100,16 @@ export class EclassHttp {
         ...(opts.headers ?? {}),
       };
       if (cookie) headers.Cookie = cookie;
-      if (body !== undefined) headers["Content-Type"] = "application/x-www-form-urlencoded";
+      if (typeof body === "string") headers["Content-Type"] = "application/x-www-form-urlencoded";
 
-      const res = await fetch(url, { method, headers, body, redirect: "manual", signal: opts.signal });
+      const res = (await undiciFetch(url, {
+        method,
+        headers,
+        body: body as never,
+        redirect: "manual",
+        signal: opts.signal,
+        dispatcher,
+      })) as unknown as Response;
 
       for (const sc of res.headers.getSetCookie()) {
         try {

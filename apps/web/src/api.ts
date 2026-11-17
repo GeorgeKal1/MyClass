@@ -1,6 +1,11 @@
 import type {
   Announcement,
   Assignment,
+  AssignmentDetail,
+  CourseTool,
+  DocumentSummary,
+  PortalWarning,
+  SubmissionResult,
   CatalogCourse,
   ChatMessage,
   ChatStreamEvent,
@@ -16,24 +21,39 @@ import type {
   University,
 } from "@myclass/shared";
 
+/** The API server could not be reached (offline, restarting, or the dev proxy has no backend). */
+export class ServerUnavailableError extends Error {
+  constructor() {
+    super("Server unavailable");
+  }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
-    ...init,
-  });
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      credentials: "include",
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...(init?.headers ?? {}),
+      },
+    });
+  } catch {
+    throw new ServerUnavailableError();
+  }
   if (!res.ok) {
-    let errMsg = `HTTP ${res.status}`;
+    let errMsg: string | undefined;
     try {
       const body = (await res.json()) as { error?: string };
-      if (body.error) errMsg = body.error;
+      errMsg = body.error;
     } catch {
-      /* ignore */
+      /* not a JSON error from our API */
     }
-    throw new Error(errMsg);
+    // A 5xx without our JSON error body means the request never reached the API
+    // (e.g. Vite's proxy answers 500 when the backend is down).
+    if (!errMsg && res.status >= 500) throw new ServerUnavailableError();
+    throw new Error(errMsg ?? `HTTP ${res.status}`);
   }
   return (await res.json()) as T;
 }
@@ -59,7 +79,41 @@ export const api = {
     }),
   disconnectGoogle: () => req<{ me: Me }>("/api/ai/google/disconnect", { method: "POST" }),
 
-  courses: () => req<{ courses: Course[] }>("/api/courses"),
+  courses: () => req<{ courses: Course[]; warnings?: PortalWarning[] }>("/api/courses"),
+  courseTools: (code: string) =>
+    req<{ tools: CourseTool[] }>(`/api/courses/${encodeURIComponent(code)}/tools`),
+  assignmentDetail: (code: string, id: string) =>
+    req<{ assignment: AssignmentDetail }>(
+      `/api/assignments/${encodeURIComponent(code)}/${encodeURIComponent(id.split(":").pop() ?? id)}`,
+    ),
+  /** Multipart upload – must not go through `req`, which forces a JSON Content-Type. */
+  async submitAssignment(
+    code: string,
+    id: string,
+    payload: { files: File[]; text?: string; comments?: string },
+  ): Promise<SubmissionResult> {
+    const fd = new FormData();
+    for (const f of payload.files) fd.append("files", f, f.name);
+    if (payload.text) fd.append("text", payload.text);
+    if (payload.comments) fd.append("comments", payload.comments);
+    let res: Response;
+    try {
+      res = await fetch(
+        `/api/assignments/${encodeURIComponent(code)}/${encodeURIComponent(id.split(":").pop() ?? id)}/submit`,
+        { method: "POST", credentials: "include", body: fd },
+      );
+    } catch {
+      throw new ServerUnavailableError();
+    }
+    const body = (await res.json().catch(() => ({}))) as { result?: SubmissionResult; error?: string };
+    if (!res.ok || !body.result) throw new Error(body.error ?? `HTTP ${res.status}`);
+    return body.result;
+  },
+  summarizeDocument: (code: string, path: string, refresh = false) =>
+    req<{ summary: DocumentSummary }>(`/api/courses/${encodeURIComponent(code)}/documents/summary`, {
+      method: "POST",
+      body: JSON.stringify({ path, refresh }),
+    }),
   patchCourseMeta: (code: string, patch: { semester?: string; archived?: boolean }) =>
     req<{ ok: boolean }>(`/api/courses/${encodeURIComponent(code)}/meta`, {
       method: "PATCH",

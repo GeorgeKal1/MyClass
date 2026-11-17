@@ -1,30 +1,46 @@
 @import "tailwindcss";
 
+/* Readability: slightly larger small text (most secondary text in the app uses text-xs/text-sm) */
+@theme {
+  --text-xs: 0.8125rem;
+  --text-xs--line-height: 1.25rem;
+  --text-sm: 0.9375rem;
+  --text-sm--line-height: 1.45rem;
+}
+
 :root {
-  --bg: #fafafb;
+  --bg: #f7f7f9;
   --surface: #ffffff;
-  --surface-2: #f3f1f9;
-  --border: #e6e3f0;
-  --text: #16141f;
-  --muted: #6c6782;
-  --accent: #7c3aed;
-  --accent-hover: #6d28d9;
-  --accent-soft: #ede9fe;
-  --accent-text: #5b21b6;
+  --surface-2: #f1f1f5;
+  --border: #e3e3ea;
+  --text: #15161b;
+  --muted: #5d606c;
+  --accent: #6d4fe0;
+  --accent-hover: #5b3dd0;
+  --accent-soft: #eeeafd;
+  --accent-text: #4a2fb8;
+  --ok: #15803d;
+  --warn: #b45309;
+  --danger: #b91c1c;
   color-scheme: light;
 }
 
+/* Dark: neutral graphite surfaces (no purple tint) + one soft lavender accent.
+   Muted text keeps >= 7:1 contrast on surfaces for long reading sessions. */
 html.dark {
-  --bg: #08070d;
-  --surface: #120f1d;
-  --surface-2: #1b162b;
-  --border: #2a2242;
-  --text: #f1eff8;
-  --muted: #9b94b6;
-  --accent: #a78bfa;
-  --accent-hover: #c4b5fd;
-  --accent-soft: #2b1d4e;
-  --accent-text: #ddd6fe;
+  --bg: #0e0f12;
+  --surface: #15171b;
+  --surface-2: #1c1e24;
+  --border: #2a2d35;
+  --text: #eceef2;
+  --muted: #a3a8b4;
+  --accent: #ab9ff6;
+  --accent-hover: #c3baf9;
+  --accent-soft: #25223a;
+  --accent-text: #dcd6ff;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --danger: #f87171;
   color-scheme: dark;
 }
 
@@ -33,6 +49,9 @@ body {
   background-color: var(--bg);
   color: var(--text);
   margin: 0;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   -webkit-tap-highlight-color: transparent;
   overscroll-behavior-x: none;
 }
@@ -79,4 +98,38 @@ body {
 ::-webkit-scrollbar-thumb {
   background: var(--border);
   border-radius: 9999px;
+}
+
+/* Rendered eClass HTML (announcements, assignment descriptions) */
+.rich-text {
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.rich-text p,
+.rich-text ul,
+.rich-text ol {
+  margin: 0.4rem 0;
+}
+.rich-text ul,
+.rich-text ol {
+  padding-left: 1.25rem;
+}
+.rich-text ul {
+  list-style: disc;
+}
+.rich-text ol {
+  list-style: decimal;
+}
+.rich-text a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.rich-text img {
+  max-width: 100%;
+  height: auto;
+}
+.rich-text table {
+  display: block;
+  overflow-x: auto;
 }

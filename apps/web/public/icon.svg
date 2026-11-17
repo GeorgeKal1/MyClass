@@ -5,34 +5,15 @@
       <stop offset="100%" stop-color="#0A0910" />
     </linearGradient>
     <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#C4B5FD" />
-      <stop offset="100%" stop-color="#7C3AED" />
+      <stop offset="0%" stop-color="#DDD6FE" />
+      <stop offset="100%" stop-color="#8B5CF6" />
     </linearGradient>
   </defs>
-
-  <!-- Minimalist Dark Purple Squircle Background -->
   <rect width="512" height="512" rx="116" fill="url(#bg)" />
   <rect x="10" y="10" width="492" height="492" rx="106" fill="none" stroke="#8B5CF6" stroke-opacity="0.22" stroke-width="4" />
-
-  <!-- Minimalist Graduation Cap Top (Mortarboard) -->
-  <path
-    d="M256 124L96 198L256 272L416 198L256 124Z"
-    fill="url(#accent)"
-  />
-
-  <!-- Cap Skullcap / Book Curve -->
-  <path
-    d="M156 244V322C156 354 202 380 256 380C310 380 356 354 356 322V244L256 290L156 244Z"
-    fill="#A78BFA"
-    fill-opacity="0.88"
-  />
-
-  <!-- Minimalist Tassel -->
-  <path
-    d="M396 207V298"
-    stroke="#DDD6FE"
-    stroke-width="18"
-    stroke-linecap="round"
-  />
-  <circle cx="396" cy="312" r="14" fill="#DDD6FE" />
+  <!-- "m" monogram + spark (same geometry as src/Logo.tsx) -->
+  <g transform="translate(256 256) scale(1.15) translate(-277 -251)">
+    <path d="M150 362V246a52 52 0 0 1 104 0v116M254 246a52 52 0 0 1 104 0v116" fill="none" stroke="url(#accent)" stroke-width="56" stroke-linecap="round" stroke-linejoin="round" />
+    <path d="M394 112c5 24 14 33 38 38-24 5-33 14-38 38-5-24-14-33-38-38 24-5 33-14 38-38z" fill="#DDD6FE" />
+  </g>
 </svg>

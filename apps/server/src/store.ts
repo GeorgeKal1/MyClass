@@ -107,9 +107,27 @@ export function persist() {
   }, 250);
 }
 
-process.on("exit", () => {
-  if (writeTimer) flushNow();
-});
+function flushPending() {
+  if (!writeTimer) return;
+  clearTimeout(writeTimer);
+  writeTimer = null;
+  flushNow();
+}
+
+process.on("exit", flushPending);
+
+// Hosts stop the process with SIGTERM on redeploy; Ctrl+C sends SIGINT. Neither runs
+// the "exit" handler by default, so flush pending writes before exiting.
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.once(signal, () => {
+    try {
+      flushPending();
+    } catch (e) {
+      console.error("[store] failed to persist on shutdown", e);
+    }
+    process.exit(0);
+  });
+}
 
 /* ---------------------------- users ---------------------------- */
 

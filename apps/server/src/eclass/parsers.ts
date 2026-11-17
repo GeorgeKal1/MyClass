@@ -135,6 +135,36 @@ export function parseFileSize(raw?: string | null): number | undefined {
 export interface CasFormSpec {
   actionUrl: string;
   fields: Record<string, string>;
+  /** Name of the username input (`username`, `j_username`, `uname`, …). */
+  userField?: string;
+  /** Name of the password input; undefined when the form has no password field. */
+  passField?: string;
+}
+
+/**
+ * Detects an auto-submitting SSO hand-off form (SAML `SAMLResponse`/`RelayState`, Shibboleth
+ * "proceed" pages, `<body onload="document.forms[0].submit()">`), which browsers post via JavaScript.
+ */
+export function parseAutoPostForm(html: string, pageUrl: string): CasFormSpec | null {
+  const $ = cheerio.load(html);
+  let found: CasFormSpec | null = null;
+  $("form").each((_, el) => {
+    if (found) return;
+    const form = $(el);
+    if (form.find("input[type='password']").length) return;
+    const fields: Record<string, string> = {};
+    form.find("input").each((__, inp) => {
+      const name = $(inp).attr("name");
+      const type = ($(inp).attr("type") || "text").toLowerCase();
+      if (name && (type === "hidden" || type === "submit")) fields[name] = $(inp).attr("value") ?? "";
+    });
+    const isSaml = "SAMLResponse" in fields || "SAMLRequest" in fields || "RelayState" in fields;
+    const autoSubmits = /\.submit\(\)/.test(html) || /onload=["'][^"']*submit/i.test(html);
+    if (!isSaml && !(autoSubmits && Object.keys(fields).length > 0)) return;
+    const actionUrl = absUrl(pageUrl, form.attr("action") || pageUrl) ?? pageUrl;
+    found = { actionUrl, fields };
+  });
+  return found;
 }
 
 /**
@@ -150,6 +180,8 @@ export function parseCasLoginForm(html: string, pageUrl: string): CasFormSpec | 
   const actionUrl = absUrl(pageUrl, actionAttr) ?? pageUrl;
 
   const fields: Record<string, string> = {};
+  let userField: string | undefined;
+  let passField: string | undefined;
   form.find("input").each((_, el) => {
     const inp = $(el);
     const name = inp.attr("name");
@@ -157,10 +189,14 @@ export function parseCasLoginForm(html: string, pageUrl: string): CasFormSpec | 
     if (!name) return;
     if (type === "hidden" || type === "submit") {
       fields[name] = inp.attr("value") ?? "";
+    } else if (type === "password" && !passField) {
+      passField = name;
+    } else if ((type === "text" || type === "email") && !userField) {
+      userField = name;
     }
   });
   if (!("_eventId" in fields)) fields._eventId = "submit";
-  return { actionUrl, fields };
+  return { actionUrl, fields, userField, passField };
 }
 
 /* ------------------------------------------------------------------ */
@@ -554,9 +590,20 @@ export function parseAssignmentsHtml(
 /* Course catalog (`/modules/auth/courses.php`)                        */
 /* ------------------------------------------------------------------ */
 
+export interface FacultyLink {
+  fc: number;
+  name: string;
+}
+
 export interface ParsedCatalogPage {
   courses: CatalogCourse[];
   facultyIds: number[];
+  /** Sub-faculties listed on this page (departments, programmes, semesters, ...). */
+  childFaculties: FacultyLink[];
+  /** Breadcrumb ancestors of the current faculty (root first). */
+  ancestorFaculties: FacultyLink[];
+  /** Name of the faculty this page shows (last breadcrumb element), if any. */
+  currentFacultyName?: string;
   csrfToken?: string;
 }
 
@@ -584,13 +631,46 @@ export function parseCatalogHtml(html: string): ParsedCatalogPage {
     }
   }
 
+  const childFaculties: FacultyLink[] = [];
+  const ancestorFaculties: FacultyLink[] = [];
+  let currentFacultyName: string | undefined;
+  const fcOf = (href?: string) => {
+    const m = (href || "").match(/courses\.php\?(?:[^"'#]*&)?fc=(\d+)/);
+    return m ? Number(m[1]) : undefined;
+  };
+
   $("a[href*='courses.php?fc=']").each((_, a) => {
-    const m = ($(a).attr("href") || "").match(/[?&]fc=(\d+)/);
-    if (m) facultyIds.add(Number(m[1]));
+    const fc = fcOf($(a).attr("href"));
+    if (fc !== undefined) facultyIds.add(fc);
   });
+
+  // Breadcrumb: `<li class="list-group-item-action"><a fc=53>Uni</a> » <a fc=57>School</a> » Current</li>`
+  const crumb = $("li.list-group-item-action, ol.breadcrumb, .breadcrumb")
+    .filter((_, el) => $(el).find("a[href*='courses.php?fc=']").length > 0 && $(el).text().includes("»"))
+    .first();
+  if (crumb.length) {
+    crumb.find("a[href*='courses.php?fc=']").each((_, a) => {
+      const fc = fcOf($(a).attr("href"));
+      const name = $(a).text().replace(/\s+/g, " ").trim();
+      if (fc !== undefined && name) ancestorFaculties.push({ fc, name });
+    });
+    const tail = crumb.text().split("»").pop()?.replace(/\s+/g, " ").trim();
+    if (tail && !ancestorFaculties.some((f) => f.name === tail)) currentFacultyName = tail;
+  }
+  const ancestorIds = new Set(ancestorFaculties.map((f) => f.fc));
 
   $("li.list-group-item.element").each((_, li) => {
     const item = $(li);
+    // Sub-faculty rows look like course rows but link to `courses.php?fc=N`
+    const facultyLink = item.find("a[href*='courses.php?fc=']").first();
+    if (facultyLink.length && item.find("input[name='selectCourse[]'], a[href*='/courses/']").length === 0) {
+      const fc = fcOf(facultyLink.attr("href"));
+      const name = facultyLink.text().replace(/\s+/g, " ").trim();
+      if (fc !== undefined && name && !ancestorIds.has(fc) && !childFaculties.some((f) => f.fc === fc)) {
+        childFaculties.push({ fc, name });
+      }
+      return;
+    }
     const cb = item.find("input[name='selectCourse[]']");
     const change = item.find("input[name='changeCourse[]']");
     const spanIdMatch = item.find("span[id^='cid']").attr("id")?.match(/^cid(\d+)$/);
@@ -643,7 +723,25 @@ export function parseCatalogHtml(html: string): ParsedCatalogPage {
     });
   });
 
-  return { courses, facultyIds: [...facultyIds], csrfToken };
+  // Older themes list sub-faculties as plain links outside `.element` rows
+  if (childFaculties.length === 0) {
+    $("#main a[href*='courses.php?fc='], .main-container a[href*='courses.php?fc=']").each((_, a) => {
+      if (crumb.length && $(a).closest(crumb).length) return;
+      const fc = fcOf($(a).attr("href"));
+      const name = $(a).text().replace(/\s+/g, " ").trim();
+      if (fc === undefined || !name || ancestorIds.has(fc) || childFaculties.some((f) => f.fc === fc)) return;
+      childFaculties.push({ fc, name });
+    });
+  }
+
+  return {
+    courses,
+    facultyIds: [...facultyIds],
+    childFaculties,
+    ancestorFaculties,
+    currentFacultyName,
+    csrfToken,
+  };
 }
 
 /** Extracts user display name from a logged-in eClass page header/profile. */
@@ -661,5 +759,179 @@ export function parseUserDisplayName(html: string): string | undefined {
     if (/^(το προφίλ μου|my profile|προφίλ|profile|αποσύνδεση|logout)$/i.test(clean)) continue;
     return clean;
   }
+  return undefined;
+}
+
+/* ------------------------------------------------------------------ */
+/* Session state detection                                             */
+/* ------------------------------------------------------------------ */
+
+/** True when an eClass response is the login page / SSO form instead of the requested content. */
+export function isLoggedOutPage(url: string, html: string): boolean {
+  if (/login_form\.php|\/cas\/login|:\/\/sso\.|\/idp\/|\/Shibboleth\.sso/i.test(url)) return true;
+  if (html.includes("jumbotron-login")) return true;
+  if (/name=["']uname["']/.test(html) && /name=["']pass["']/.test(html)) return true;
+  // Mobile API answers for an expired/absent session
+  const trimmed = html.trim();
+  if (trimmed === "EXPIRED" || trimmed === "FAILED") return true;
+  return false;
+}
+
+/** True when a university web application firewall blocked the request. */
+export function isFirewallBlock(status: number, html: string): boolean {
+  return (
+    (status === 403 || status === 406 || status === 429) &&
+    /web application firewall|request rejected|access denied|transfer is blocked/i.test(html)
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Course home: available tools / modules                              */
+/* ------------------------------------------------------------------ */
+
+export interface CourseToolLink {
+  /** Module id from the URL, e.g. "document", "work", "forum", "exercise", "gradebook". */
+  id: string;
+  name: string;
+  url: string;
+}
+
+const SKIPPED_TOOL_IDS =
+  /^(course_info|course_tools|usage|admin|course_home|create_course|user|course_metadata|course_description_edit|contact|help|auth|search|abuse_report|notifications|mobile)$/;
+
+/** Extracts the course's enabled tools (left menu of `/courses/CODE/`). */
+export function parseCourseTools(html: string, pageUrl: string, courseCode: string): CourseToolLink[] {
+  const $ = cheerio.load(html);
+  const out = new Map<string, CourseToolLink>();
+  const enc = encodeURIComponent(courseCode);
+  $("a[href*='/modules/']").each((_, a) => {
+    const href = ($(a).attr("href") || "").replace(/&amp;/g, "&");
+    if (!href.includes(`course=${courseCode}`) && !href.includes(`course=${enc}`)) return;
+    const m = href.match(/\/modules\/([a-z_]+)\//i);
+    if (!m) return;
+    const id = m[1].toLowerCase();
+    if (SKIPPED_TOOL_IDS.test(id)) return;
+    // Per-item links (a single announcement, a folder, …) are not tool entry points
+    if (/[?&](id|edit|delete|choice|an_id|mid|openDir|download|showQuota|eid|topic|forum)=/.test(href)) return;
+    const name = ($(a).text().replace(/\s+/g, " ").trim() || $(a).attr("title")?.trim() || id).slice(0, 60);
+    if (!name || out.has(id)) return;
+    const url = absUrl(pageUrl, href);
+    if (url) out.set(id, { id, name, url });
+  });
+  return [...out.values()];
+}
+
+/* ------------------------------------------------------------------ */
+/* Assignment detail & submission                                      */
+/* ------------------------------------------------------------------ */
+
+export interface ParsedAssignmentDetail {
+  title?: string;
+  descriptionHtml: string;
+  attachments: { name: string; url: string }[];
+  canSubmit: boolean;
+  submissionType: "file" | "text" | "none";
+  maxFiles: number;
+  formAction?: string;
+  hiddenFields: Record<string, string>;
+  /** Text describing the student's existing submission (file name, date, grade), if any. */
+  existingSubmission?: string;
+  /** Flash message rendered on the page (e.g. after a submission). */
+  flashMessage?: { kind: "success" | "error" | "info"; text: string };
+}
+
+export function parseAssignmentDetailHtml(html: string, pageUrl: string): ParsedAssignmentDetail {
+  const $ = cheerio.load(html);
+  const form = $("form#submit_assignment_form, form[enctype='multipart/form-data']:has(input[name='work_submit'])").first();
+  const hiddenFields: Record<string, string> = {};
+  form.find("input[type='hidden']").each((_, el) => {
+    const name = $(el).attr("name");
+    // `on_behalf_of` is teacher-only; `work_submit` is added explicitly on submit
+    if (name && name !== "on_behalf_of" && name !== "work_submit") hiddenFields[name] = $(el).attr("value") ?? "";
+  });
+
+  const formHtml = form.html() ?? "";
+  const hasTextEditor = form.find("textarea[name='submission_text'], #submission_text").length > 0;
+  const hasFile = form.find("#uppy, input[type='file']").length > 0 || /userfile/.test(formHtml);
+  const limitMatch = form.find("label[for='userfile']").text().match(/(\d+)\s*$/);
+  const maxFiles = limitMatch ? Number(limitMatch[1]) : form.find("input[type='file'][multiple]").length ? 5 : 1;
+
+  // Assignment description + teacher-provided files live in cards of the main column
+  const main = $("#main, .main-container").first();
+  const scope = main.length ? main : $("body");
+  const descParts: string[] = [];
+  scope.find(".card").each((_, card) => {
+    const c = $(card);
+    if (c.closest("form").length || c.find("form").length) return;
+    if (c.parents(".card").length) return;
+    const body = c.find(".card-body").first();
+    const part = (body.length ? body : c).html()?.trim();
+    if (part && stripHtml(part).length > 0) descParts.push(part);
+  });
+
+  const attachments: { name: string; url: string }[] = [];
+  scope.find("a[href*='get=1'], a[href*='download='], a[href*='file.php'], a[href*='get_file']").each((_, a) => {
+    if ($(a).closest("form").length) return;
+    const url = absUrl(pageUrl, $(a).attr("href"));
+    const name = $(a).text().replace(/\s+/g, " ").trim();
+    if (url && name && !attachments.some((x) => x.url === url)) attachments.push({ name, url });
+  });
+
+  let existingSubmission: string | undefined;
+  scope.find(".card, table").each((_, el) => {
+    if (existingSubmission) return;
+    const text = $(el).text().replace(/\s+/g, " ").trim();
+    if (/(έχετε ήδη υποβάλει|Υποβλήθηκε|Ημερομηνία αποστολής|Your submission|already submitted|Date of submission)/i.test(text)) {
+      existingSubmission = text.slice(0, 400);
+    }
+  });
+
+  const alertEl = scope.find(".alert-success, .alert-danger, .alert-warning, .alert-info").first();
+  const flashText = alertEl.text().replace(/\s+/g, " ").trim();
+  const flashMessage = flashText
+    ? {
+        kind: alertEl.hasClass("alert-success")
+          ? ("success" as const)
+          : alertEl.hasClass("alert-danger") || alertEl.hasClass("alert-warning")
+            ? ("error" as const)
+            : ("info" as const),
+        text: flashText.slice(0, 400),
+      }
+    : undefined;
+
+  return {
+    title: $("h1, .action-bar-title, .page-title").first().text().replace(/\s+/g, " ").trim() || undefined,
+    descriptionHtml: descParts.slice(0, 3).join("<hr/>"),
+    attachments: attachments.slice(0, 20),
+    canSubmit: form.length > 0,
+    submissionType: form.length === 0 ? "none" : hasTextEditor && !hasFile ? "text" : "file",
+    maxFiles: Math.max(1, Math.min(20, maxFiles || 1)),
+    formAction: form.length ? absUrl(pageUrl, form.attr("action") || pageUrl) : undefined,
+    hiddenFields,
+    existingSubmission,
+    flashMessage,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Semester inference from free text (faculty names, course titles)    */
+/* ------------------------------------------------------------------ */
+
+const GREEK_SEMESTER_LETTERS: Record<string, number> = {
+  α: 1, β: 2, γ: 3, δ: 4, ε: 5, στ: 6, ζ: 7, η: 8, θ: 9, ι: 10,
+};
+
+/** Returns 1..10 when text clearly names a semester ("Α' Εξάμηνο", "5ο εξάμηνο", "Semester 3"). */
+export function semesterFromText(text: string): number | undefined {
+  const s = text.toLowerCase();
+  const num =
+    s.match(/(\d{1,2})\s*(?:ο|o|ου|th|st|nd|rd)?\s*(?:εξάμηνο|εξαμηνο|εξ\.|semester)/i) ||
+    s.match(/semester\s*(\d{1,2})/i);
+  if (num) {
+    const n = Number(num[1]);
+    if (n >= 1 && n <= 10) return n;
+  }
+  const letter = s.match(/(?:^|[\s(])(στ|[αβγδεζηθι])\s*['΄’]?\s*(?:εξάμηνο|εξαμηνο)/i);
+  if (letter) return GREEK_SEMESTER_LETTERS[letter[1].toLowerCase()];
   return undefined;
 }

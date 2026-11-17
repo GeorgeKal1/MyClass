@@ -111,14 +111,15 @@ npm install
 ```
 
 ### 2. Environment Configuration (Optional)
-Copy `.env.example` to `apps/server/.env` if you want to pin custom keys (otherwise development keys for `MASTER_KEY` and `VAPID` are generated automatically in `apps/server/.data/` with `0600` permissions):
+Copy `apps/server/.env.example` to `apps/server/.env` if you want to pin custom keys. In development, `ENCRYPTION_KEY` and the VAPID keys are generated automatically in `apps/server/.data/` when they are not set:
 
 ```env
 PORT=8787
 WEB_ORIGIN=http://localhost:5173
 
-# 32-byte key (base64 or 64 hex chars) for AES-256-GCM credential encryption
-MASTER_KEY=
+# 32-byte key, base64-encoded, for AES-256-GCM credential encryption
+# (generate with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))")
+ENCRYPTION_KEY=
 
 # Optional default server-side Gemini API key (users can also add their own in Settings)
 GEMINI_API_KEY=
@@ -126,7 +127,8 @@ GEMINI_API_KEY=
 # Optional Google OAuth credentials (if using full OAuth redirect flow)
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
-GOOGLE_REDIRECT_URI=http://localhost:8787/api/ai/google/callback
+# Defaults to ${PUBLIC_URL}/api/ai/google/callback
+GOOGLE_REDIRECT_URI=
 ```
 
 ### 3. Run in Development Mode
@@ -142,6 +144,19 @@ npm run typecheck
 npm test
 npm run build
 ```
+
+### 5. Deploying to Production
+`npm run build` builds the web app; `npm start` then serves both the API and the built web app from one Node process on `PORT`.
+
+Set these environment variables on the host (the server prints a warning at startup for each one that is missing when `NODE_ENV=production`):
+
+| Variable | Why it matters |
+| --- | --- |
+| `NODE_ENV=production` | Enables production defaults (Secure session cookies, `WEB_ORIGIN` defaults to `PUBLIC_URL`). |
+| `PUBLIC_URL` | The public `https://` address of the app. Used for the Google OAuth redirect and as the web origin. |
+| `DATA_DIR` | Folder for `db.json` (users, sessions, encrypted credentials). Point it at a **persistent disk/volume** — on hosts with an ephemeral filesystem everything is lost on each redeploy otherwise. |
+| `ENCRYPTION_KEY` | Keeps the encryption key out of `DATA_DIR`, so a copy of the data alone cannot be decrypted. Must stay the same across deploys or stored credentials become unreadable. |
+| `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | Keep Web Push subscriptions valid across deploys (`npx web-push generate-vapid-keys`). |
 
 ---
 
