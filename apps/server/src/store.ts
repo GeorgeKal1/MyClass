@@ -80,7 +80,14 @@ export interface UserRecord {
     encApiKey?: string;
   };
   courseMeta: Record<string, CourseMeta>;
-  seen: { announcements: string[]; messages: string[]; assignments: string[]; initialized: boolean };
+  seen: {
+    announcements: string[];
+    messages: string[];
+    assignments: string[];
+    initialized: boolean;
+    /** Assignment ids have been seeded from the calendar feed (first pass notifies nothing). */
+    deadlineFeed?: boolean;
+  };
   lastPollAt?: string;
   lastPollError?: string;
   /** What myClass' own automatic requests added to eClass' usage log (see eclass/hit-ledger.ts). */

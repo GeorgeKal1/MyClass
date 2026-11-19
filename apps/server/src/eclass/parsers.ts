@@ -587,6 +587,58 @@ export function parseAssignmentsHtml(
 }
 
 /* ------------------------------------------------------------------ */
+/* Assignment deadlines from the personal calendar (`/main/calendar_data.php`) */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The JSON the personal calendar loads (`main/calendar_data.php?from=<ms>&to=<ms>`, Open eClass
+ * 4.2.1 to 4.4.3, `Calendar_Events::bootstrap_events`). Assignment deadlines of every enrolled
+ * course come as `event_type: "assignment"` with the assignment id, the course code, the deadline
+ * in epoch ms and the title "<course title>: <assignment title>" (HTML-escaped).
+ *
+ * The page has no course context, so eClass writes no usage hit for it: this is how myClass
+ * learns about deadlines without "visiting" every course. It carries no submission state.
+ */
+export function parseCalendarDeadlines(
+  json: string,
+  pageUrl: string,
+  courseTitles: Record<string, string[]>,
+): Assignment[] {
+  let data: { result?: Array<Record<string, unknown>> };
+  try {
+    data = JSON.parse(json) as typeof data;
+  } catch {
+    return [];
+  }
+  const decode = (s: string) => cheerio.load(`<div>${s}</div>`)("div").text().replace(/\s+/g, " ").trim();
+  const out: Assignment[] = [];
+  for (const ev of data.result ?? []) {
+    if (ev.event_type !== "assignment") continue;
+    const id = String(ev.id ?? "").trim();
+    const courseCode = typeof ev.course === "string" ? decode(ev.course) : "";
+    const start = Number(ev.start);
+    if (!id || !courseCode || !Number.isFinite(start)) continue;
+    const full = decode(String(ev.title ?? ""));
+    // Take the course title off the front; a course title may itself contain ": "
+    const known = courseTitles[courseCode.toUpperCase()] ?? [];
+    const prefix = known.find((t) => t && full.startsWith(`${t}: `));
+    const title = prefix ? full.slice(prefix.length + 2) : full.includes(": ") ? full.slice(full.indexOf(": ") + 2) : full;
+    out.push({
+      id: `${courseCode}:${id}`,
+      courseCode,
+      // Last entry is the title myClass shows (the first may be eClass' raw one)
+      courseTitle: known[known.length - 1],
+      title: title || full,
+      deadline: new Date(start).toISOString(),
+      // Unknown here; callers keep the last state seen on the course's own assignment page
+      submitted: false,
+      url: absUrl(pageUrl, typeof ev.url === "string" ? ev.url : `/modules/work/index.php?course=${encodeURIComponent(courseCode)}&id=${id}`),
+    });
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
 /* Course catalog (`/modules/auth/courses.php`)                        */
 /* ------------------------------------------------------------------ */
 

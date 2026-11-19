@@ -37,6 +37,16 @@ export function rememberDeadlines(user: UserRecord, assignments: Assignment[], c
   });
 }
 
+/**
+ * Deadlines from the calendar feed carry no submission state. A hand-in is known only from the
+ * course's own assignment page (opened by the student) or from an upload through myClass, so
+ * keep whatever was last seen for each assignment.
+ */
+export function withKnownSubmission(user: UserRecord, list: Assignment[]): Assignment[] {
+  const known = new Map((user.deadlines ?? []).map((d) => [d.id, d.submitted]));
+  return list.map((a) => (known.get(a.id) ? { ...a, submitted: true } : a));
+}
+
 export function markDeadlineSubmitted(user: UserRecord, courseCode: string, assignmentId: string): void {
   users.update(user.id, (u) => {
     for (const d of u.deadlines ?? []) {

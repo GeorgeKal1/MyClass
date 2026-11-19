@@ -1621,20 +1621,32 @@ function HomeView({
                 <button
                   key={a.id}
                   onClick={() => onOpenCourse(a.courseCode, "announcements")}
-                  className="w-full text-left p-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50 transition-colors cursor-pointer"
+                  className="w-full text-left px-4 py-3 rounded-2xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50 transition-colors cursor-pointer"
                 >
-                  <div className="flex items-center justify-between gap-2 text-xs text-[var(--muted)] mb-1">
-                    <span className="font-medium text-[var(--accent)] truncate">{a.courseTitle ?? a.courseCode}</span>
-                    <span className="shrink-0">
+                  {/* Home stays a glance: the title, then one line. The full text is a tap away. */}
+                  <div className="flex items-baseline justify-between gap-3">
+                    <div className="text-sm font-semibold leading-snug truncate">{a.title}</div>
+                    <span className="shrink-0 text-xs text-[var(--muted)] tabular-nums">
                       {new Date(a.date).toLocaleDateString(lang === "el" ? "el-GR" : "en-US", {
                         day: "numeric",
                         month: "short",
                       })}
                     </span>
                   </div>
-                  <div className="text-sm font-semibold leading-snug">{a.title}</div>
-                  <TriageTag lang={lang} triage={triage[a.id]} />
-                  <p className="text-sm text-[var(--muted)] mt-1 line-clamp-2 leading-relaxed">{a.contentText}</p>
+                  {triage[a.id]?.label === "action" ? (
+                    <p className="mt-0.5 flex items-center gap-1.5 text-xs font-medium text-[var(--warn)] min-w-0">
+                      <CircleAlert className="w-3.5 h-3.5 shrink-0" />
+                      <span className="truncate">
+                        {triage[a.id]?.reason ?? (lang === "el" ? "Χρειάζεται ενέργεια" : "Action needed")}
+                        <span className="font-normal text-[var(--muted)]"> · {a.courseTitle ?? a.courseCode}</span>
+                      </span>
+                    </p>
+                  ) : (
+                    <p className="mt-0.5 text-xs text-[var(--muted)] truncate">
+                      <span className="font-medium text-[var(--accent-text)]">{a.courseTitle ?? a.courseCode}</span>
+                      {a.contentText ? ` · ${a.contentText}` : ""}
+                    </p>
+                  )}
                 </button>
               ))
             )}
@@ -1667,7 +1679,7 @@ function HomeView({
 /* Courses View — Minimalist Semester Dropdowns & Default Subscribed   */
 /* ================================================================== */
 
-/** Course groups in display order: semesters, electives, postgraduate, then everything else last. */
+/** Course groups in display order: latest semester first (Η' down to Α'), electives, postgraduate, then everything else. */
 const SEMESTER_META: Array<{
   index: number;
   folder: string;
@@ -1677,14 +1689,14 @@ const SEMESTER_META: Array<{
   shortEl: string;
   shortEn: string;
 }> = [
-  { index: 1, folder: "Α_εξάμηνο", labelEl: "Α' Εξάμηνο", labelEn: "1st Semester", shortEl: "Α'", shortEn: "1st" },
-  { index: 2, folder: "Β_εξάμηνο", labelEl: "Β' Εξάμηνο", labelEn: "2nd Semester", shortEl: "Β'", shortEn: "2nd" },
-  { index: 3, folder: "Γ_εξάμηνο", labelEl: "Γ' Εξάμηνο", labelEn: "3rd Semester", shortEl: "Γ'", shortEn: "3rd" },
-  { index: 4, folder: "Δ_Εξάμηνο", labelEl: "Δ' Εξάμηνο", labelEn: "4th Semester", shortEl: "Δ'", shortEn: "4th" },
-  { index: 5, folder: "Ε_Εξάμηνο", labelEl: "Ε' Εξάμηνο", labelEn: "5th Semester", shortEl: "Ε'", shortEn: "5th" },
-  { index: 6, folder: "ΣΤ_Εξάμηνο", labelEl: "ΣΤ' Εξάμηνο", labelEn: "6th Semester", shortEl: "ΣΤ'", shortEn: "6th" },
-  { index: 7, folder: "Ζ_Εξάμηνο", labelEl: "Ζ' Εξάμηνο", labelEn: "7th Semester", shortEl: "Ζ'", shortEn: "7th" },
   { index: 8, folder: "Η_Εξάμηνο", labelEl: "Η' Εξάμηνο", labelEn: "8th Semester", shortEl: "Η'", shortEn: "8th" },
+  { index: 7, folder: "Ζ_Εξάμηνο", labelEl: "Ζ' Εξάμηνο", labelEn: "7th Semester", shortEl: "Ζ'", shortEn: "7th" },
+  { index: 6, folder: "ΣΤ_Εξάμηνο", labelEl: "ΣΤ' Εξάμηνο", labelEn: "6th Semester", shortEl: "ΣΤ'", shortEn: "6th" },
+  { index: 5, folder: "Ε_Εξάμηνο", labelEl: "Ε' Εξάμηνο", labelEn: "5th Semester", shortEl: "Ε'", shortEn: "5th" },
+  { index: 4, folder: "Δ_Εξάμηνο", labelEl: "Δ' Εξάμηνο", labelEn: "4th Semester", shortEl: "Δ'", shortEn: "4th" },
+  { index: 3, folder: "Γ_εξάμηνο", labelEl: "Γ' Εξάμηνο", labelEn: "3rd Semester", shortEl: "Γ'", shortEn: "3rd" },
+  { index: 2, folder: "Β_εξάμηνο", labelEl: "Β' Εξάμηνο", labelEn: "2nd Semester", shortEl: "Β'", shortEn: "2nd" },
+  { index: 1, folder: "Α_εξάμηνο", labelEl: "Α' Εξάμηνο", labelEn: "1st Semester", shortEl: "Α'", shortEn: "1st" },
   { index: 10, folder: "Επιλογής", labelEl: "Μαθήματα επιλογής", labelEn: "Electives", shortEl: "Επιλογής", shortEn: "Electives" },
   { index: 11, folder: "Μεταπτυχιακά", labelEl: "Μεταπτυχιακά", labelEn: "Postgraduate", shortEl: "Μεταπτυχιακά", shortEn: "Postgraduate" },
   { index: 9, folder: "Πτυχιακές_Γενικά", labelEl: "Γενικά & λοιπά", labelEn: "General & other", shortEl: "Λοιπά", shortEn: "Other" },
@@ -2507,20 +2519,33 @@ function CourseDetailView({
     if (focusAssignmentId) setOpenAssignmentId(focusAssignmentId);
   }, [focusAssignmentId]);
 
-  // Assignments of courses outside the global feed (e.g. opened from the catalog) are fetched on demand
+  // Until the tab is opened, show what Home already knows (from eClass' calendar feed)
   useEffect(() => {
-    if (assignments.length > 0) {
-      setCourseAssignments(assignments);
-      return;
-    }
+    if (assignments.length > 0) setCourseAssignments(assignments);
+  }, [assignments]);
+
+  // Opening the Assignments tab reads the course's own assignment page: the one place eClass says
+  // what was handed in and graded. It is the student's own visit, so eClass logging it is right.
+  useEffect(() => {
     if (subTab !== "assignments") return;
+    let cancelled = false;
     setAsgLoading(true);
     void api
       .assignments(course.code)
-      .then((r) => setCourseAssignments(r.assignments))
-      .catch(() => setCourseAssignments([]))
-      .finally(() => setAsgLoading(false));
-  }, [course.code, subTab, assignments]);
+      .then((r) => {
+        if (!cancelled) setCourseAssignments(r.assignments);
+      })
+      .catch(() => {
+        if (!cancelled && assignments.length === 0) setCourseAssignments([]);
+      })
+      .finally(() => {
+        if (!cancelled) setAsgLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [course.code, subTab]);
 
   // Fetch live documents for any subject (enrolled or open in catalog)
   useEffect(() => {
@@ -2957,25 +2982,53 @@ function shortDate(iso: string, lang: Lang): string {
     : d.toLocaleDateString(locale, { day: "numeric", month: "short" });
 }
 
+/** A section heading; with `open` + `onToggle` the whole title folds its section open and shut. */
 function SectionTitle({
   icon,
   title,
   count,
   action,
+  open,
+  onToggle,
+  controls,
 }: {
   icon: React.ReactNode;
   title: string;
   count?: number;
   action?: React.ReactNode;
+  open?: boolean;
+  onToggle?: () => void;
+  /** id of the region the toggle shows and hides */
+  controls?: string;
 }) {
+  const label = (
+    <>
+      <span className="text-[var(--muted)]">{icon}</span>
+      <span>{title}</span>
+      {!!count && <span className="text-xs font-normal text-[var(--muted)] tabular-nums">{count}</span>}
+    </>
+  );
   return (
-    <div className="flex items-center justify-between gap-2 mb-2 shrink-0">
-      <h2 className="text-sm font-semibold flex items-center gap-2">
-        <span className="text-[var(--muted)]">{icon}</span>
-        <span>{title}</span>
-        {!!count && <span className="text-xs font-normal text-[var(--muted)] tabular-nums">{count}</span>}
+    <div className={`flex items-center justify-between gap-2 shrink-0 ${open === false ? "" : "mb-2"}`}>
+      <h2 className="text-sm font-semibold min-w-0">
+        {onToggle ? (
+          <button
+            type="button"
+            onClick={onToggle}
+            aria-expanded={open}
+            aria-controls={controls}
+            className="flex items-center gap-2 -ml-1 px-1 py-1 rounded-lg hover:bg-[var(--surface-2)] cursor-pointer"
+          >
+            <ChevronRight
+              className={`w-4 h-4 text-[var(--muted)] shrink-0 transition-transform duration-200 ${open ? "rotate-90" : ""}`}
+            />
+            {label}
+          </button>
+        ) : (
+          <span className="flex items-center gap-2">{label}</span>
+        )}
       </h2>
-      {action}
+      {open !== false && action}
     </div>
   );
 }
@@ -3033,6 +3086,9 @@ function InboxView({
   const unreadMsgs = messages.filter((m) => !m.read).length;
   const [feedFilter, setFeedFilter] = useState<"all" | "announcements" | "action">("all");
   const [feedLimit, setFeedLimit] = useState(FEED_PAGE);
+  // Both sections start open; either one folds away to give the other the page
+  const [feedOpen, setFeedOpen] = useState(true);
+  const [messagesOpen, setMessagesOpen] = useState(true);
 
   /*
    * Announcements and notifications in one list, newest first. A notification about an
@@ -3094,6 +3150,7 @@ function InboxView({
   const openNotif = (n: NotificationItem) => {
     void dismiss(n.id);
     if (n.kind === "message") {
+      setMessagesOpen(true);
       messagesRef.current?.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
     } else {
       onOpenNotification(n);
@@ -3105,11 +3162,16 @@ function InboxView({
   return (
     <div className="flex-1 flex flex-col gap-6 md:gap-5 md:h-[calc(100dvh-2.5rem)] md:min-h-0">
       {/* Notifications and announcements in one feed, capped so messages always keep room below */}
-      <section className="flex flex-col min-h-0 shrink-0 md:max-h-[45%]">
+      <section
+        className={`flex flex-col min-h-0 shrink-0 ${feedOpen && messagesOpen ? "md:max-h-[45%]" : feedOpen ? "md:flex-1" : ""}`}
+      >
         <SectionTitle
           icon={<Bell className="w-4 h-4" />}
           title={el ? "Ειδοποιήσεις και ανακοινώσεις" : "Notifications and announcements"}
           count={unreadNotifs}
+          open={feedOpen}
+          onToggle={() => setFeedOpen((o) => !o)}
+          controls="inbox-feed"
           action={
             notifications.some((n) => !n.read) && (
               <button
@@ -3124,6 +3186,7 @@ function InboxView({
             )
           }
         />
+        <div id="inbox-feed" hidden={!feedOpen} className="contents">
         {feed.length > 0 && (
           <div className="mb-2 shrink-0 overflow-x-auto">
             <Segmented
@@ -3223,12 +3286,23 @@ function InboxView({
             </button>
           )}
         </div>
+        </div>
       </section>
 
       {/* Messages: list + reader side by side on wide screens, one at a time on phones */}
-      <section ref={messagesRef} className="flex-1 flex flex-col min-h-0 scroll-mt-16 md:scroll-mt-0">
-        <SectionTitle icon={<Mail className="w-4 h-4" />} title={tr("messagesSection")} count={unreadMsgs} />
-        <div className="flex-1 min-h-0 grid grid-cols-1 md:grid-rows-[minmax(0,1fr)] lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-4">
+      <section
+        ref={messagesRef}
+        className={`flex flex-col min-h-0 scroll-mt-16 md:scroll-mt-0 ${messagesOpen ? "flex-1" : "shrink-0"}`}
+      >
+        <SectionTitle
+          icon={<Mail className="w-4 h-4" />}
+          title={tr("messagesSection")}
+          count={unreadMsgs}
+          open={messagesOpen}
+          onToggle={() => setMessagesOpen((o) => !o)}
+          controls="inbox-messages"
+        />
+        <div id="inbox-messages" hidden={!messagesOpen} className="flex-1 min-h-0 grid grid-cols-1 md:grid-rows-[minmax(0,1fr)] lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-4">
           <div
             className={`${panel} min-h-0 overflow-y-auto divide-y divide-[var(--border)] ${
               readerOpen ? "hidden lg:block" : ""
@@ -3964,6 +4038,8 @@ function HomeScreenCalendarSettings({
   const ua = navigator.userAgent;
   const isWindows = /Windows/.test(ua);
   const isApple = /iPhone|iPad|iPod|Macintosh/.test(ua);
+  const isIos = /iPhone|iPad|iPod/.test(ua);
+  const isAndroid = /Android/.test(ua);
   const feed = me.calendarFeedUrl;
   const webcal = feed?.replace(/^https?:\/\//, "webcal://");
   const googleAdd = webcal ? `https://calendar.google.com/calendar/r?cid=${encodeURIComponent(webcal)}` : undefined;
@@ -3984,17 +4060,31 @@ function HomeScreenCalendarSettings({
 
   return (
     <SettingsGroup title={el ? "Προθεσμίες στην αρχική οθόνη" : "Deadlines on your home screen"}>
-      {!installed && canInstall && (
+      {!installed && (canInstall || isIos || isAndroid) && (
         <SettingsRow
           label={el ? "Εγκατάσταση εφαρμογής" : "Install the app"}
-          hint={el ? "Το myClass ως εφαρμογή, με εικονίδιο και συντομεύσεις." : "myClass as an app, with an icon and shortcuts."}
+          hint={
+            canInstall
+              ? el
+                ? "Το myClass ως εφαρμογή, με εικονίδιο και συντομεύσεις."
+                : "myClass as an app, with an icon and shortcuts."
+              : isIos
+                ? el
+                  ? "Πάτα Κοινοποίηση → «Προσθήκη στην οθόνη Αφετηρίας». Στο iPhone οι ειδοποιήσεις δουλεύουν μόνο έτσι."
+                  : "Tap Share → “Add to Home Screen”. On iPhone, alerts only work this way."
+                : el
+                  ? "Από το μενού του browser διάλεξε «Εγκατάσταση εφαρμογής» ή «Προσθήκη στην αρχική οθόνη»."
+                  : "From the browser menu choose “Install app” or “Add to Home screen”."
+          }
         >
-          <button
-            onClick={() => void promptInstall()}
-            className="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent)] text-[var(--on-accent)] cursor-pointer"
-          >
-            {el ? "Εγκατάσταση" : "Install"}
-          </button>
+          {canInstall && (
+            <button
+              onClick={() => void promptInstall()}
+              className="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent)] text-[var(--on-accent)] cursor-pointer"
+            >
+              {el ? "Εγκατάσταση" : "Install"}
+            </button>
+          )}
         </SettingsRow>
       )}
 

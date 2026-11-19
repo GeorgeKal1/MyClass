@@ -12,6 +12,7 @@ import type {
 } from "@myclass/shared";
 import crypto from "node:crypto";
 import { decrypt, randomId, sha256 } from "./crypto.js";
+import { withKnownSubmission } from "./deadlines.js";
 import { getConnectorForUser, userDepartmentId } from "./eclass/connector.js";
 import { getCurrentAcademicYearBounds, UNIPI_DEPARTMENTS } from "./eclass/unipi-curriculum.js";
 import { prepareDocumentForAi } from "./doctext.js";
@@ -247,9 +248,10 @@ async function runReadOnlyTool(
     }
     case "get_announcements": {
       if (!(typeof args.courseCode === "string" && args.courseCode)) await enrolledOrThrow();
-      const list = await connector.getAnnouncements(
-        typeof args.courseCode === "string" && args.courseCode ? args.courseCode : undefined,
-      );
+      // Always the account-wide "my announcements" list, filtered here: a course's own announcements
+      // page would count as a visit to that course in the student's eClass stats
+      const wanted = typeof args.courseCode === "string" && args.courseCode ? args.courseCode.toUpperCase() : undefined;
+      const list = (await connector.getAnnouncements()).filter((a) => !wanted || a.courseCode.toUpperCase() === wanted);
       return list.slice(0, 15).map((a) => ({
         courseCode: a.courseCode,
         courseTitle: a.courseTitle,
@@ -283,8 +285,10 @@ async function runReadOnlyTool(
     }
     case "get_deadlines": {
       if (!(typeof args.courseCode === "string" && args.courseCode)) await enrolledOrThrow();
-      const list = await connector.getAssignments(
-        typeof args.courseCode === "string" && args.courseCode ? args.courseCode : undefined,
+      // The calendar feed: deadlines of every course without eClass logging a visit to any of them
+      const wanted = typeof args.courseCode === "string" && args.courseCode ? args.courseCode.toUpperCase() : undefined;
+      const list = withKnownSubmission(user, await connector.getDeadlines()).filter(
+        (a) => !wanted || a.courseCode.toUpperCase() === wanted,
       );
       const now = Date.now();
       return list

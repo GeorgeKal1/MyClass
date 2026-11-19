@@ -1,3 +1,4 @@
+import "./tz.js"; // must stay the first import: Greek local time for every date below
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import fs from "node:fs";
@@ -31,7 +32,7 @@ import {
   triageAnnouncements,
   checkServerGeminiKey,
 } from "./ai.js";
-import { buildDeadlinesIcs, markDeadlineSubmitted, rememberDeadlines, widgetData } from "./deadlines.js";
+import { buildDeadlinesIcs, markDeadlineSubmitted, rememberDeadlines, widgetData, withKnownSubmission } from "./deadlines.js";
 import { AiQuotaError, quotaFor } from "./quota.js";
 import { encrypt, randomId, sha256 } from "./crypto.js";
 import {
@@ -419,8 +420,16 @@ app.get("/api/assignments", async (c) => {
   const u = requireUser(c);
   const courseCode = c.req.query("course") || undefined;
   const connector = getConnectorForUser(u);
-  const assignments = await connector.getAssignments(courseCode);
-  rememberDeadlines(u, assignments, courseCode);
+  if (courseCode) {
+    // The student opened this course's assignments: its own page (one visit, theirs) also says what was handed in
+    const assignments = await connector.getAssignments(courseCode);
+    rememberDeadlines(u, assignments, courseCode);
+    return c.json({ assignments });
+  }
+  // Home, calendar, widget: every course at once, from the calendar feed, which eClass does not count
+  // as a visit to any course (opening each course's assignment page would log a visit per course)
+  const assignments = withKnownSubmission(u, await connector.getDeadlines());
+  rememberDeadlines(u, assignments);
   return c.json({ assignments });
 });
 

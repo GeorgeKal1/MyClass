@@ -3,6 +3,7 @@ import tls from "node:tls";
 import { CookieJar } from "tough-cookie";
 import { Agent, FormData as UndiciFormData, fetch as undiciFetch } from "undici";
 import { EXTRA_INTERMEDIATE_CAS } from "./extra-ca.js";
+import { currentOrigin, eclassHitFor } from "./request-origin.js";
 
 /**
  * Strict TLS for every eClass/CAS request: Node's root store, plus intermediates that some
@@ -95,6 +96,8 @@ export class EclassHttp {
     const hops: string[] = [];
 
     for (let hop = 0; hop <= max; hop++) {
+      // Automated work never opens a page eClass counts as a course visit, not even via a redirect
+      assertNotCountedVisit(url);
       hops.push(url);
       const cookie = await this.jar.getCookieString(url);
       const headers: Record<string, string> = {
@@ -147,6 +150,23 @@ export class EclassHttp {
     const r = await this.request(url, opts);
     return { url: r.url, html: await r.text(), status: r.status, hops: r.hops };
   }
+}
+
+/** Thrown instead of sending an automated request that eClass would log as a course visit. */
+export class CountedVisitBlockedError extends Error {
+  constructor(readonly url: string) {
+    super("myClass does not open course pages in the background (eClass would count it as a visit)");
+    this.name = "CountedVisitBlockedError";
+  }
+}
+
+/**
+ * The student's eClass usage log must only ever show what the student did. Requests started by
+ * the background poller (origin "background") may not touch a page that writes a hit into
+ * eClass' `actions_daily` (see `eclassHitFor`): the request is refused before it leaves.
+ */
+function assertNotCountedVisit(url: string) {
+  if (currentOrigin() === "background" && eclassHitFor(url)) throw new CountedVisitBlockedError(url);
 }
 
 function wrap(res: Response, url: string, hops: string[], unfollowedLocation?: string): HttpResponse {

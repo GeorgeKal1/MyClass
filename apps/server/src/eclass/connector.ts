@@ -28,6 +28,7 @@ import {
   parseAssignmentsHtml,
   parseAutoPostForm,
   parseCasLoginForm,
+  parseCalendarDeadlines,
   parseCatalogHtml,
   parseCourseTools,
   parseDocumentsHtml,
@@ -87,6 +88,11 @@ export interface EclassConnector {
   /** Like listCourses, plus per-portal warnings so the UI can explain an empty list. */
   listCoursesDetailed(): Promise<{ courses: Course[]; warnings: PortalWarning[] }>;
   getAnnouncements(courseCode?: string): Promise<Announcement[]>;
+  /**
+   * Assignment deadlines of every enrolled course from eClass' personal calendar feed. No course
+   * page is opened, so nothing shows up in the student's eClass usage. No submission state.
+   */
+  getDeadlines(): Promise<Assignment[]>;
   getMessages(): Promise<Message[]>;
   getMessage(id: string): Promise<Message | null>;
   listDocuments(courseCode: string, dir?: string): Promise<DocNode[]>;
@@ -1139,6 +1145,42 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
         );
       }
       return filterCurrentAcademicYearAssignments(results.flat());
+    },
+    async getDeadlines(): Promise<Assignment[]> {
+      const courses = await listCourses().catch(() => [] as Course[]);
+      // The feed writes "<eClass course title>: <assignment>"; offer both the raw and the shown title
+      const titles: Record<string, string[]> = {};
+      for (const c of courses) {
+        const raw = c.portal ? user.eclassHits?.portals[c.portal]?.titles?.[c.code.toUpperCase()] : undefined;
+        titles[c.code.toUpperCase()] = [raw, c.title].filter((t): t is string => Boolean(t));
+      }
+      const from = Date.now() - 120 * 86_400_000;
+      const to = Date.now() + 365 * 86_400_000;
+      const lists = await Promise.all(
+        portals.map(async (portalBase) => {
+          try {
+            const res = await withSession(portalBase, (http) =>
+              http.getText(`${portalBase}/main/calendar_data.php?from=${from}&to=${to}`),
+            );
+            if (!res.html.trim().startsWith("{")) {
+              console.warn(`[deadlines] ${hostOf(portalBase)}: calendar feed did not answer with JSON`);
+              return [];
+            }
+            return parseCalendarDeadlines(res.html, res.url, titles);
+          } catch (err) {
+            console.warn(`[deadlines] ${hostOf(portalBase)}: ${(err as Error).message}`);
+            return [];
+          }
+        }),
+      );
+      const enrolled = new Set(courses.map((c) => c.code.toUpperCase()));
+      const byId = new Map<string, Assignment>();
+      for (const a of lists.flat()) {
+        // The feed also lists courses the account teaches or has left; keep the student's own
+        if (enrolled.size && !enrolled.has(a.courseCode.toUpperCase())) continue;
+        if (!byId.has(a.id)) byId.set(a.id, a);
+      }
+      return filterCurrentAcademicYearAssignments([...byId.values()]);
     },
     async getAssignmentDetail(courseCode: string, assignmentId: string): Promise<AssignmentDetail> {
       const id = numericAssignmentId(assignmentId);
