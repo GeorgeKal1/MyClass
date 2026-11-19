@@ -8,6 +8,8 @@
   A web and mobile app (PWA) for the <b>University of Piraeus</b> Open eClass. Sign in with your UniPi account (CAS), with an assistant built on <b>Google Gemini</b>
 </p>
 
+> **A personal project.** myClass is built by one student in their own time. It is not made, run or endorsed by the University of Piraeus or the Open eClass team, and it uses only what a signed-in student can already see on eClass.
+
 ---
 
 ## Overview
@@ -161,6 +163,7 @@ Set these environment variables on the host (the server prints a warning at star
 | `DATA_DIR` | Folder for `db.json` (users, sessions, encrypted credentials). Point it at a **persistent disk/volume** — on hosts with an ephemeral filesystem everything is lost on each redeploy otherwise. |
 | `ENCRYPTION_KEY` | Keeps the encryption key out of `DATA_DIR`, so a copy of the data alone cannot be decrypted. Must stay the same across deploys or stored credentials become unreadable. |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | Keep Web Push subscriptions valid across deploys (`npx web-push generate-vapid-keys`). |
+| `GEMINI_API_KEY` | The shared key behind the assistant, summaries and study material. `.env` is not deployed, so set it on the host too; without it AI only works for students who add their own key. The server logs `[ai] shared Gemini key OK` at startup when it works. |
 
 ---
 
@@ -176,4 +179,4 @@ Set these environment variables on the host (the server prints a warning at star
 
 ## License
 
-MIT
+MIT. This is a personal, non-commercial project with no official connection to the University of Piraeus.

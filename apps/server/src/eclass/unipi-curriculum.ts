@@ -88,6 +88,22 @@ export const SEMESTERS: Record<number, SemesterMeta> = {
     labelEn: "Thesis & Department Announcements",
     folder: "Πτυχιακές_Γενικά",
   },
+  // Departments whose study guide puts electives in a winter/spring pool instead of a semester
+  10: {
+    index: 10,
+    label: "Μαθήματα Επιλογής",
+    shortLabel: "Επιλογής",
+    labelEn: "Electives",
+    folder: "Επιλογής",
+  },
+  // Courses of the department's postgraduate programmes (catalog folders "ΠΜΣ …", "MSc …")
+  11: {
+    index: 11,
+    label: "Μεταπτυχιακά Προγράμματα",
+    shortLabel: "Μεταπτυχιακά",
+    labelEn: "Postgraduate",
+    folder: "Μεταπτυχιακά",
+  },
 };
 
 /**

@@ -63,6 +63,8 @@ export interface KnownDeadline {
 
 export interface UserRecord {
   id: string;
+  /** Set once the account moved to the "reduce motion on" default. */
+  reduceMotionDefaultOn?: boolean;
   universityId: string;
   username: string;
   displayName: string;
@@ -201,6 +203,11 @@ export const users = {
         notify: { ...defaults.notify, ...u.settings?.notify },
         accessibility: { ...defaults.accessibility, ...u.settings?.accessibility },
       };
+      // "Reduce motion" became on by default (2026-11-19); accounts still on the old default follow once
+      if (!u.reduceMotionDefaultOn) {
+        if (u.settings.accessibility.reduceMotion === "system") u.settings.accessibility.reduceMotion = "on";
+        u.reduceMotionDefaultOn = true;
+      }
       // Older records: removed "google" AI mode and the old hard-coded model name
       const ai = u.settings.ai ?? DEFAULT_SETTINGS.ai;
       u.settings.ai = {

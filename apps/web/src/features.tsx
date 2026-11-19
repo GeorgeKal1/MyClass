@@ -118,7 +118,13 @@ export function DeadlineCalendar({
   const now = Date.now();
   const agenda: Assignment[] = selected
     ? (byDay.get(selected) ?? [])
-    : withDeadline.filter((a) => new Date(a.deadline!).getTime() >= now - 86_400_000 && !a.submitted).slice(0, 6);
+    : // Every deadline still ahead, handed-in ones too (marked "submitted"), so none silently disappears
+      withDeadline
+        .filter((a) => {
+          const t = new Date(a.deadline!).getTime();
+          return a.submitted ? t >= now : t >= now - 86_400_000;
+        })
+        .slice(0, 6);
   const undated = assignments.filter((a) => !a.deadline && !a.submitted);
 
   const monthLabel = month.toLocaleDateString(locale(lang), { month: "long", year: "numeric" });
@@ -238,8 +244,8 @@ export function DeadlineCalendar({
                   ? "Καμία προθεσμία αυτή την ημέρα."
                   : "No deadlines on this day."
                 : lang === "el"
-                  ? "Δεν έχεις εκκρεμείς προθεσμίες."
-                  : "No pending deadlines."}
+                  ? "Δεν έχεις προθεσμίες μπροστά σου."
+                  : "No deadlines coming up."}
           </p>
         ) : (
           agenda.map((a) => <AgendaRow key={a.id} a={a} lang={lang} onClick={() => onOpenAssignment(a)} />)

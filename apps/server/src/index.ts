@@ -29,11 +29,13 @@ import {
   runAssistantTurn,
   summarizeCourseDocument,
   triageAnnouncements,
+  checkServerGeminiKey,
 } from "./ai.js";
 import { buildDeadlinesIcs, markDeadlineSubmitted, rememberDeadlines, widgetData } from "./deadlines.js";
 import { AiQuotaError, quotaFor } from "./quota.js";
 import { encrypt, randomId, sha256 } from "./crypto.js";
 import {
+  CoursePasswordError,
   forgetUserSession,
   getConnectorForUser,
   performEclassLogin,
@@ -155,6 +157,10 @@ class HttpError extends Error {
 app.onError((err, c) => {
   if (err instanceof HttpError) {
     return c.json({ error: err.message }, err.status as 400);
+  }
+  if (err instanceof CoursePasswordError) {
+    // The app asks for the course's registration code and tries again
+    return c.json({ error: err.message, code: `password_${err.reason}` }, 409);
   }
   if (err instanceof AiQuotaError) {
     return c.json({ error: err.message, resetAt: err.resetAt }, 429);
@@ -359,9 +365,9 @@ app.get("/api/catalog", async (c) => {
 
 app.post("/api/courses/enroll", async (c) => {
   const u = requireUser(c);
-  const { course } = (await c.req.json()) as { course: string };
+  const { course, password } = (await c.req.json()) as { course: string; password?: string };
   const connector = getConnectorForUser(u);
-  const enrolled = await connector.enrollCourse(course);
+  const enrolled = await connector.enrollCourse(course, typeof password === "string" ? password.slice(0, 200) : undefined);
   return c.json({ course: enrolled });
 });
 
@@ -891,4 +897,5 @@ startBackgroundPoller();
 
 serve({ fetch: app.fetch, port: env.port }, (info) => {
   console.log(`myClass server listening on http://localhost:${info.port}`);
+  void checkServerGeminiKey();
 });

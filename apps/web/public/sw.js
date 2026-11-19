@@ -51,16 +51,18 @@ self.addEventListener("notificationclick", (event) => {
 });
 
 function openApp(route) {
+  // `open=1` tells the app this page was asked for (otherwise a fresh start opens Home)
+  const target = route + (route.includes("?") ? "&" : "?") + "open=1";
   return self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((windowClients) => {
     for (const client of windowClients) {
       if ("focus" in client) {
         if ("navigate" in client) {
-          client.navigate(route);
+          client.navigate(target);
         }
         return client.focus();
       }
     }
-    return self.clients.openWindow(route);
+    return self.clients.openWindow(target);
   });
 }
 

@@ -481,6 +481,23 @@ async function modelsFor(auth: GeminiAuth, override?: string): Promise<string[]>
   return preferred ? [preferred, ...entry.models.filter((m) => m !== preferred)] : entry.models;
 }
 
+/**
+ * Logs at startup whether the shared key works, so a missing or rejected GEMINI_API_KEY shows
+ * in the host's logs instead of only as "AI isn't available" for students.
+ */
+export async function checkServerGeminiKey(): Promise<void> {
+  if (!env.gemini.apiKey) {
+    console.warn("[ai] GEMINI_API_KEY is not set: AI only works for students who add their own key");
+    return;
+  }
+  try {
+    const models = await modelsFor({ source: "server", key: env.gemini.apiKey });
+    console.log(`[ai] shared Gemini key OK (first model: ${models[0] ?? "none"})`);
+  } catch (err) {
+    console.warn(`[ai] shared Gemini key does not work: ${(err as Error).message}`);
+  }
+}
+
 function dropModel(auth: GeminiAuth, model: string) {
   const entry = modelCache.get(keyId(auth));
   if (entry) entry.models = entry.models.filter((m) => m !== model);
@@ -594,16 +611,19 @@ function textOf(resp: GeminiResponse): string {
 function aiUnavailableText(lang: "el" | "en", reason: GeminiFailure, detail?: string): string {
   const el: Record<GeminiFailure, string> = {
     "no-key":
-      "Ο βοηθός AI δεν έχει ρυθμιστεί ακόμα σε αυτόν τον server. Πρόσθεσε το δικό σου κλειδί Gemini στις Ρυθμίσεις ή ζήτα από τον διαχειριστή να ορίσει GEMINI_API_KEY.",
-    "bad-key": "Η Google δεν δέχτηκε το κλειδί Gemini. Έλεγξε το κλειδί στις Ρυθμίσεις.",
+      "Το AI δεν είναι διαθέσιμο αυτή τη στιγμή. Μπορείς να βάλεις το δικό σου δωρεάν κλειδί Gemini στις Ρυθμίσεις.",
+    "bad-key": /server/.test(detail ?? "")
+      ? "Το AI δεν είναι διαθέσιμο αυτή τη στιγμή. Μπορείς να βάλεις το δικό σου δωρεάν κλειδί Gemini στις Ρυθμίσεις."
+      : "Η Google δεν δέχτηκε το κλειδί Gemini. Έλεγξε το κλειδί στις Ρυθμίσεις.",
     quota: "Το όριο χρήσης του Gemini εξαντλήθηκε προσωρινά. Δοκίμασε ξανά σε λίγο.",
     empty: "Το Gemini δεν έδωσε απάντηση. Δοκίμασε να το διατυπώσεις λίγο διαφορετικά.",
     error: "Ο βοηθός AI δεν απάντησε αυτή τη φορά. Δοκίμασε ξανά σε λίγο.",
   };
   const en: Record<GeminiFailure, string> = {
-    "no-key":
-      "The AI assistant is not set up on this server yet. Add your own Gemini key in Settings, or ask the admin to set GEMINI_API_KEY.",
-    "bad-key": "Google did not accept the Gemini key. Check the key in Settings.",
+    "no-key": "AI isn't available right now. You can add your own free Gemini key in Settings.",
+    "bad-key": /server/.test(detail ?? "")
+      ? "AI isn't available right now. You can add your own free Gemini key in Settings."
+      : "Google did not accept the Gemini key. Check the key in Settings.",
     quota: "The Gemini usage limit was reached for now. Try again in a little while.",
     empty: "Gemini returned no answer. Try rephrasing the question.",
     error: "The AI assistant didn't answer this time. Try again shortly.",
@@ -761,7 +781,7 @@ function documentErrorText(lang: "el" | "en", err: GeminiError): string {
       ? "Το AI δεν μπόρεσε να διαβάσει αυτό το αρχείο (ίσως είναι κατεστραμμένο ή προστατευμένο)."
       : "The AI couldn't read this file (it may be damaged or protected).";
   }
-  return aiUnavailableText(lang, err.reason);
+  return aiUnavailableText(lang, err.reason, err.message);
 }
 
 /**

@@ -20,6 +20,7 @@ import {
   FolderOpen,
   FolderUp,
   House as HomeIcon,
+  KeyRound,
   LogOut,
   Mail,
   Megaphone,
@@ -54,7 +55,7 @@ import type {
   ThemePref,
   UserSettings,
 } from "@myclass/shared";
-import { api, ensureServiceWorker, isIosNeedsHomeScreen, registerWebPush, ServerUnavailableError } from "./api";
+import { api, ApiError, ensureServiceWorker, isIosNeedsHomeScreen, registerWebPush, ServerUnavailableError } from "./api";
 import { Logo } from "./Logo";
 import { safeHref, sanitizeHtml } from "./sanitize";
 import { t, type DictKey } from "./i18n";
@@ -67,6 +68,7 @@ import {
 } from "./features";
 import { StatsView } from "./stats";
 import { StudyButton, StudyPanel } from "./study";
+import { InstallAppPrompt, isInstalledApp, promptInstall, useCanInstall } from "./install";
 
 type Tab = "home" | "courses" | "inbox" | "assistant" | "stats" | "settings";
 const TAB_ORDER: Tab[] = ["home", "courses", "inbox", "assistant", "stats", "settings"];
@@ -101,17 +103,118 @@ function cachedAccessibility(): Accessibility {
   try {
     const raw = JSON.parse(localStorage.getItem(A11Y_KEY) ?? "null") as Partial<Accessibility> | null;
     if (raw && typeof raw.fontScale === "number") {
-      return { fontScale: raw.fontScale, reduceMotion: raw.reduceMotion ?? "system" };
+      return { fontScale: raw.fontScale, reduceMotion: raw.reduceMotion ?? "on" };
     }
   } catch {
     /* storage unavailable */
   }
-  return { fontScale: 1, reduceMotion: "system" };
+  // Less motion is the default; Settings > Accessibility turns movement back on
+  return { fontScale: 1, reduceMotion: "on" };
 }
 
 /** True when movement should be skipped (Settings > Accessibility, or the device setting). */
 export function reducedMotion(): boolean {
   return document.documentElement.classList.contains("reduce-motion");
+}
+
+/** Where and when the student last tapped or pressed a key: theme and text-size changes animate from there. */
+let lastInput = { x: 0, y: 0, at: 0 };
+if (typeof window !== "undefined") {
+  window.addEventListener(
+    "pointerdown",
+    (e) => {
+      lastInput = { x: e.clientX, y: e.clientY, at: Date.now() };
+    },
+    { capture: true, passive: true },
+  );
+  window.addEventListener(
+    "keydown",
+    () => {
+      const el = document.activeElement?.getBoundingClientRect();
+      lastInput = el
+        ? { x: el.left + el.width / 2, y: el.top + el.height / 2, at: Date.now() }
+        : { x: window.innerWidth / 2, y: 0, at: Date.now() };
+    },
+    { capture: true },
+  );
+}
+
+/**
+ * Applies a page-wide visual change (theme, text size) inside a View Transition: the new theme
+ * spreads out in a circle from the control that was pressed, a new text size settles in from 97%.
+ * Changes nobody just asked for (settings arriving on start-up) and reduced motion swap instantly.
+ * Transitions are off while the change lands, so the "after" snapshot has its final colours.
+ */
+let swapToken = 0;
+function animatedSwap(kind: "theme" | "text-size", apply: () => void) {
+  const root = document.documentElement;
+  const token = ++swapToken;
+  let applied = false;
+  const flip = () => {
+    if (applied) return;
+    applied = true;
+    root.classList.add("theme-switching");
+    apply();
+    const on = () => root.classList.remove("theme-switching");
+    requestAnimationFrame(() => requestAnimationFrame(on));
+    window.setTimeout(on, 300);
+  };
+  const userAsked = Date.now() - lastInput.at < 3000;
+  if (!("startViewTransition" in document) || reducedMotion() || !userAsked || document.visibilityState !== "visible") {
+    flip();
+    return;
+  }
+  const x = lastInput.x || window.innerWidth / 2;
+  const y = lastInput.y;
+  const radius = Math.hypot(Math.max(x, window.innerWidth - x), Math.max(y, window.innerHeight - y));
+  root.style.setProperty("--vt-x", `${x}px`);
+  root.style.setProperty("--vt-y", `${y}px`);
+  root.style.setProperty("--vt-r", `${Math.ceil(radius)}px`);
+  root.dataset.vt = kind;
+  const vt = document.startViewTransition(flip);
+  // `ready` rejects when a transition is skipped; that is expected here, not an error
+  vt.ready.catch(() => {});
+  // A browser that stops painting mid-way (background tab, low-power mode) never runs the update;
+  // the setting must still land, so apply it directly and drop the animation
+  const fallback = window.setTimeout(() => {
+    if (applied) return;
+    vt.skipTransition();
+    flip();
+  }, 400);
+  void vt.finished.finally(() => {
+    window.clearTimeout(fallback);
+    // A newer swap may already be running with its own kind
+    if (token === swapToken) delete root.dataset.vt;
+  });
+}
+
+const LAST_SEEN_KEY = "myclass.lastSeen";
+/** Back within this long (a reload, a quick app switch) and the app stays on the page it was on. */
+const RESUME_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * Where a page load starts. Mobile browsers and installed apps reopen the last URL, so a plain
+ * reopen after a while starts on Home. A course link, or `?open=1` from a notification or an app
+ * shortcut, still opens what it points to.
+ */
+function launchRoute(): Route {
+  const route = routeFromLocation();
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("open") === "1") {
+    params.delete("open");
+    const qs = params.toString();
+    window.history.replaceState(null, "", window.location.pathname + (qs ? `?${qs}` : ""));
+    return route;
+  }
+  let lastSeen = 0;
+  try {
+    lastSeen = Number(localStorage.getItem(LAST_SEEN_KEY) ?? 0);
+  } catch {
+    /* storage unavailable: treat as a new visit */
+  }
+  if (route.tab === "home" || route.course || Date.now() - lastSeen < RESUME_WINDOW_MS) return route;
+  window.history.replaceState(null, "", "/");
+  return { tab: "home", course: null, sub: "documents" };
 }
 
 function pathForRoute(r: Route): string {
@@ -135,7 +238,13 @@ export function App() {
   // Text size and reduced motion on <html> (remembered on this device for the next start)
   useEffect(() => {
     const root = document.documentElement;
-    root.style.setProperty("--font-scale", String(access.fontScale));
+    const scale = String(access.fontScale);
+    const current = root.style.getPropertyValue("--font-scale");
+    if (current && current !== scale) {
+      animatedSwap("text-size", () => root.style.setProperty("--font-scale", scale));
+    } else {
+      root.style.setProperty("--font-scale", scale);
+    }
     const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
     const apply = () =>
       root.classList.toggle("reduce-motion", access.reduceMotion === "on" || (access.reduceMotion === "system" && mq.matches));
@@ -154,15 +263,10 @@ export function App() {
     const root = document.documentElement;
     const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
     const isDark = theme === "dark" || (theme === "system" && prefersDark);
+    // Browser chrome (status bar, installed app's title bar) follows the page background
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", isDark ? "#111216" : "#f6f6f8");
     if (root.classList.contains("dark") === isDark) return;
-    // Turn transitions off while every color flips, then back on after the next paint
-    root.classList.add("theme-switching");
-    root.classList.toggle("dark", isDark);
-    const id = requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove("theme-switching")));
-    return () => {
-      cancelAnimationFrame(id);
-      root.classList.remove("theme-switching");
-    };
+    animatedSwap("theme", () => root.classList.toggle("dark", isDark));
   }, [theme]);
 
   useEffect(() => {
@@ -199,29 +303,42 @@ export function App() {
     );
   }
 
+  // The "install the app" card stays mounted across sign-in, so it doesn't flash away and back
+  const installPrompt = <InstallAppPrompt lang={lang} signedIn={!!me} />;
+
   if (!me) {
     return (
-      <LoginScreen
-        lang={lang}
-        theme={theme}
-        onToggleLang={() => setGuestLang((l) => (l === "el" ? "en" : "el"))}
-        onToggleTheme={() => setGuestTheme((th) => (th === "dark" ? "light" : "dark"))}
-        onLoggedIn={(loggedInMe) => setMe(loggedInMe)}
-      />
+      <>
+        <LoginScreen
+          lang={lang}
+          theme={theme}
+          onToggleLang={() => setGuestLang((l) => (l === "el" ? "en" : "el"))}
+          onToggleTheme={() => setGuestTheme((th) => (th === "dark" ? "light" : "dark"))}
+          onLoggedIn={(loggedInMe) => {
+            // Signing in lands on Home, unless the sign-in interrupted a link to a course
+            if (!routeFromLocation().course) window.history.replaceState(null, "", "/");
+            setMe(loggedInMe);
+          }}
+        />
+        {installPrompt}
+      </>
     );
   }
 
   // Keyed by user id: signing in as someone else starts from a clean slate (courses, catalog, chat…)
   return (
-    <Workspace
-      key={me.id}
-      me={me}
-      setMe={setMe}
-      onLoggedOut={() => {
-        window.history.replaceState(null, "", "/");
-        setMe(null);
-      }}
-    />
+    <>
+      <Workspace
+        key={me.id}
+        me={me}
+        setMe={setMe}
+        onLoggedOut={() => {
+          window.history.replaceState(null, "", "/");
+          setMe(null);
+        }}
+      />
+      {installPrompt}
+    </>
   );
 }
 
@@ -238,8 +355,31 @@ function Workspace({
   setMe: (m: Me) => void;
   onLoggedOut: () => void;
 }) {
-  const initialRoute = useMemo(routeFromLocation, []);
+  const initialRoute = useMemo(launchRoute, []);
   const [tab, setTab] = useState<Tab>(initialRoute.tab);
+
+  // Remember when the app was last in use, so the next start knows whether to resume or open Home
+  useEffect(() => {
+    const mark = () => {
+      try {
+        localStorage.setItem(LAST_SEEN_KEY, String(Date.now()));
+      } catch {
+        /* storage unavailable */
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") mark();
+    };
+    mark();
+    const id = window.setInterval(mark, 60_000);
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", mark);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", mark);
+    };
+  }, []);
   const [selectedCourseCode, setSelectedCourseCode] = useState<string | null>(initialRoute.course);
   const [coursesInitialViewMode, setCoursesInitialViewMode] = useState<"enrolled" | "all">("enrolled");
   const [courseSubTab, setCourseSubTab] = useState<CourseSubTab>(initialRoute.sub);
@@ -461,6 +601,7 @@ function Workspace({
         url: catalogMatch.url,
         portal: catalogMatch.portal,
         enrolled: catalogMatch.enrolled,
+        needsPassword: catalogMatch.needsPassword,
       };
     }
     return null;
@@ -1349,10 +1490,11 @@ function HomeView({
   const tr = (k: DictKey) => t(lang, k);
   const activeCourses = courses.filter((c) => !c.archived);
   const now = Date.now();
+  // Deadlines in the next 7 days; handed-in ones count too, and the chip says how many are still open
   const dueThisWeek = assignments.filter(
-    (a) =>
-      !a.submitted && a.deadline && new Date(a.deadline).getTime() >= now && new Date(a.deadline).getTime() - now < 7 * 86_400_000,
+    (a) => a.deadline && new Date(a.deadline).getTime() >= now && new Date(a.deadline).getTime() - now < 7 * 86_400_000,
   );
+  const openThisWeek = dueThisWeek.filter((a) => !a.submitted).length;
   const unreadMessages = messages.filter((m) => !m.read);
   const [annFilter, setAnnFilter] = useState<"all" | "action" | "fyi">("all");
   const actionCount = announcements.filter((a) => triage[a.id]?.label === "action").length;
@@ -1381,7 +1523,13 @@ function HomeView({
         </button>
         <span className={chip.replace("hover:border-[var(--accent)] cursor-pointer", "")}>
           <Clock className="w-3.5 h-3.5 text-[var(--warn)]" />
-          {dueThisWeek.length} {lang === "el" ? "προθεσμίες αυτή την εβδομάδα" : "due this week"}
+          {dueThisWeek.length} {lang === "el" ? (dueThisWeek.length === 1 ? "προθεσμία αυτή την εβδομάδα" : "προθεσμίες αυτή την εβδομάδα") : "due this week"}
+          {openThisWeek < dueThisWeek.length && (
+            <span className="ml-1 text-[var(--muted)] font-normal">
+              · {dueThisWeek.length - openThisWeek}{" "}
+              {lang === "el" ? (dueThisWeek.length - openThisWeek === 1 ? "παραδόθηκε" : "παραδόθηκαν") : "handed in"}
+            </span>
+          )}
         </span>
         {unreadMessages.length > 0 && (
           <button onClick={onOpenInbox} className={chip}>
@@ -1519,22 +1667,201 @@ function HomeView({
 /* Courses View — Minimalist Semester Dropdowns & Default Subscribed   */
 /* ================================================================== */
 
+/** Course groups in display order: semesters, electives, postgraduate, then everything else last. */
 const SEMESTER_META: Array<{
   index: number;
   folder: string;
   labelEl: string;
   labelEn: string;
+  /** Chip label in the phone's semester filter */
+  shortEl: string;
+  shortEn: string;
 }> = [
-  { index: 1, folder: "Α_εξάμηνο", labelEl: "Α' Εξάμηνο", labelEn: "1st Semester" },
-  { index: 2, folder: "Β_εξάμηνο", labelEl: "Β' Εξάμηνο", labelEn: "2nd Semester" },
-  { index: 3, folder: "Γ_εξάμηνο", labelEl: "Γ' Εξάμηνο", labelEn: "3rd Semester" },
-  { index: 4, folder: "Δ_Εξάμηνο", labelEl: "Δ' Εξάμηνο", labelEn: "4th Semester" },
-  { index: 5, folder: "Ε_Εξάμηνο", labelEl: "Ε' Εξάμηνο", labelEn: "5th Semester" },
-  { index: 6, folder: "ΣΤ_Εξάμηνο", labelEl: "ΣΤ' Εξάμηνο", labelEn: "6th Semester" },
-  { index: 7, folder: "Ζ_Εξάμηνο", labelEl: "Ζ' Εξάμηνο", labelEn: "7th Semester" },
-  { index: 8, folder: "Η_Εξάμηνο", labelEl: "Η' Εξάμηνο", labelEn: "8th Semester" },
-  { index: 9, folder: "Πτυχιακές_Γενικά", labelEl: "Γενικά & λοιπά", labelEn: "General & other" },
+  { index: 1, folder: "Α_εξάμηνο", labelEl: "Α' Εξάμηνο", labelEn: "1st Semester", shortEl: "Α'", shortEn: "1st" },
+  { index: 2, folder: "Β_εξάμηνο", labelEl: "Β' Εξάμηνο", labelEn: "2nd Semester", shortEl: "Β'", shortEn: "2nd" },
+  { index: 3, folder: "Γ_εξάμηνο", labelEl: "Γ' Εξάμηνο", labelEn: "3rd Semester", shortEl: "Γ'", shortEn: "3rd" },
+  { index: 4, folder: "Δ_Εξάμηνο", labelEl: "Δ' Εξάμηνο", labelEn: "4th Semester", shortEl: "Δ'", shortEn: "4th" },
+  { index: 5, folder: "Ε_Εξάμηνο", labelEl: "Ε' Εξάμηνο", labelEn: "5th Semester", shortEl: "Ε'", shortEn: "5th" },
+  { index: 6, folder: "ΣΤ_Εξάμηνο", labelEl: "ΣΤ' Εξάμηνο", labelEn: "6th Semester", shortEl: "ΣΤ'", shortEn: "6th" },
+  { index: 7, folder: "Ζ_Εξάμηνο", labelEl: "Ζ' Εξάμηνο", labelEn: "7th Semester", shortEl: "Ζ'", shortEn: "7th" },
+  { index: 8, folder: "Η_Εξάμηνο", labelEl: "Η' Εξάμηνο", labelEn: "8th Semester", shortEl: "Η'", shortEn: "8th" },
+  { index: 10, folder: "Επιλογής", labelEl: "Μαθήματα επιλογής", labelEn: "Electives", shortEl: "Επιλογής", shortEn: "Electives" },
+  { index: 11, folder: "Μεταπτυχιακά", labelEl: "Μεταπτυχιακά", labelEn: "Postgraduate", shortEl: "Μεταπτυχιακά", shortEn: "Postgraduate" },
+  { index: 9, folder: "Πτυχιακές_Γενικά", labelEl: "Γενικά & λοιπά", labelEn: "General & other", shortEl: "Λοιπά", shortEn: "Other" },
 ];
+const semesterOrder = (idx: number) => {
+  const i = SEMESTER_META.findIndex((m) => m.index === idx);
+  return i === -1 ? SEMESTER_META.length : i;
+};
+
+/**
+ * Joins a course on eClass. Courses with a registration code (given by the teacher; without
+ * joining, eClass shows none of their files) open a small dialog that asks for it first, or
+ * again after eClass turns a code down.
+ */
+function useJoinCourse({
+  lang,
+  showToast,
+  onJoined,
+}: {
+  lang: Lang;
+  showToast: (m: string) => void;
+  onJoined: () => Promise<void>;
+}) {
+  const [ask, setAsk] = useState<{ code: string; title: string; wrongAttempt: number } | null>(null);
+
+  const join = async (c: { code: string; title: string; needsPassword?: boolean }, password?: string) => {
+    if (c.needsPassword && password === undefined) {
+      setAsk({ code: c.code, title: c.title, wrongAttempt: 0 });
+      return;
+    }
+    try {
+      await api.enroll(c.code, password);
+      setAsk(null);
+      showToast(lang === "el" ? `Εγγράφηκες στο ${c.title}` : `Joined ${c.title}`);
+      await onJoined();
+    } catch (err) {
+      if (err instanceof ApiError && err.code?.startsWith("password_")) {
+        const wrong = err.code === "password_wrong";
+        setAsk((prev) => ({ code: c.code, title: c.title, wrongAttempt: (prev?.wrongAttempt ?? 0) + (wrong ? 1 : 0) }));
+        return;
+      }
+      showToast((err as Error).message);
+    }
+  };
+
+  const dialog = ask ? (
+    <CourseCodeDialog
+      key={ask.code}
+      lang={lang}
+      title={ask.title}
+      wrongAttempt={ask.wrongAttempt}
+      onSubmit={(pw) => join({ code: ask.code, title: ask.title }, pw)}
+      onClose={() => setAsk(null)}
+    />
+  ) : null;
+
+  return { join, dialog, askCode: (c: { code: string; title: string }) => setAsk({ ...c, wrongAttempt: 0 }) };
+}
+
+function CourseCodeDialog({
+  lang,
+  title,
+  wrongAttempt,
+  onSubmit,
+  onClose,
+}: {
+  lang: Lang;
+  title: string;
+  wrongAttempt: number;
+  onSubmit: (password: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const wrong = wrongAttempt > 0;
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  // Wrong code: shake the field and select it for retyping (once per refused attempt)
+  useEffect(() => {
+    if (!wrongAttempt) return;
+    const el = inputRef.current;
+    el?.select();
+    if (!el || reducedMotion()) return;
+    el.animate(
+      [0, -10, 10, -6, 6, -3, 0].map((px) => ({ transform: `translateX(${px}px)` })),
+      { duration: 360, easing: "ease-out" },
+    );
+  }, [wrongAttempt]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 p-4"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <form
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="course-code-title"
+        onSubmit={async (e) => {
+          e.preventDefault();
+          if (!value.trim() || busy) return;
+          setBusy(true);
+          try {
+            await onSubmit(value.trim());
+          } finally {
+            setBusy(false);
+          }
+        }}
+        className="enter w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 space-y-4 mb-[env(safe-area-inset-bottom)]"
+      >
+        <div className="space-y-1">
+          <h2 id="course-code-title" className="text-base">
+            {lang === "el" ? "Κωδικός μαθήματος" : "Course code"}
+          </h2>
+          <p className="text-sm text-[var(--muted)]">
+            {lang === "el"
+              ? `Το «${title}» ζητά κωδικό εγγραφής για να δεις τα αρχεία του. Τον δίνει ο διδάσκων.`
+              : `"${title}" asks for a registration code before its files open. Your teacher gives it out.`}
+          </p>
+        </div>
+        <div className="space-y-1.5">
+          <input
+            ref={inputRef}
+            type="text"
+            autoComplete="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            aria-invalid={wrong || undefined}
+            aria-describedby={wrong ? "course-code-error" : undefined}
+            placeholder={lang === "el" ? "Κωδικός" : "Code"}
+            className={`w-full px-3 py-2.5 rounded-xl text-sm bg-[var(--surface-2)] border focus:outline-none ${
+              wrong ? "border-[var(--danger)]" : "border-[var(--border)] focus:border-[var(--accent)]"
+            }`}
+          />
+          {wrong && (
+            <p id="course-code-error" className="text-xs text-[var(--danger)]">
+              {lang === "el" ? "Λάθος κωδικός. Δοκίμασε ξανά." : "That code didn't work. Try again."}
+            </p>
+          )}
+        </div>
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-3.5 py-2 rounded-xl text-sm text-[var(--muted)] hover:text-[var(--text)] cursor-pointer"
+          >
+            {lang === "el" ? "Άκυρο" : "Cancel"}
+          </button>
+          <button
+            type="submit"
+            disabled={!value.trim() || busy}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[var(--accent)] text-[var(--on-accent)] hover:bg-[var(--accent-hover)] cursor-pointer disabled:opacity-50 disabled:cursor-default"
+          >
+            {busy && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+            {lang === "el" ? "Εγγραφή" : "Join"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+/** eClass titles typed in capitals ("ΑΝΑΓΝΩΡΙΣΗ ΠΡΟΤΥΠΩΝ") get a little extra letter spacing. */
+const isAllCaps = (s: string) => /\p{Lu}/u.test(s) && s === s.toLocaleUpperCase("el");
 
 function CoursesView({
   lang,
@@ -1572,6 +1899,7 @@ function CoursesView({
   const [collapsedSemesters, setCollapsedSemesters] = useState<Set<number>>(new Set());
   const [searchQuery, setSearchQuery] = useState("");
   const [busyCode, setBusyCode] = useState<string | null>(null);
+  const { join, dialog: courseCodeDialog } = useJoinCourse({ lang, showToast, onJoined: onChanged });
 
   useEffect(() => {
     setViewMode(initialViewMode);
@@ -1656,9 +1984,8 @@ function CoursesView({
       list.push(s);
       map.set(idx, list);
     }
-    return [...map.entries()].sort((a, b) => a[0] - b[0]);
+    return [...map.entries()].sort((a, b) => semesterOrder(a[0]) - semesterOrder(b[0]));
   }, [filteredSubjects]);
-  const visibleRowCount = filteredSubjects.length;
 
   // A semester filter that no longer exists (e.g. after switching department) would show an empty page
   useEffect(() => {
@@ -1679,11 +2006,46 @@ function CoursesView({
     });
   };
 
+  /** Collapse-all and download-all: in the toolbar on wider screens; on a phone collapse-all sits beside the semester chips. */
+  const listActions = (
+    <>
+      {groupedBySemester.length > 1 && (
+        <button
+          onClick={() => {
+            const allCollapsed = groupedBySemester.every(([idx]) => collapsedSemesters.has(idx));
+            setCollapsedSemesters(allCollapsed ? new Set() : new Set(groupedBySemester.map(([idx]) => idx)));
+          }}
+          title={
+            groupedBySemester.every(([idx]) => collapsedSemesters.has(idx))
+              ? lang === "el" ? "Ανάπτυξη όλων" : "Expand all"
+              : lang === "el" ? "Σύμπτυξη όλων" : "Collapse all"
+          }
+          className="p-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--text)] cursor-pointer shrink-0"
+        >
+          <ChevronDown
+            className={`w-4 h-4 transition-colors ${
+              groupedBySemester.every(([idx]) => collapsedSemesters.has(idx)) ? "" : "rotate-180"
+            }`}
+          />
+        </button>
+      )}
+      <a
+        href="/api/documents/zip-all"
+        title={tr("downloadAllCourses")}
+        aria-label={tr("downloadAllCourses")}
+        className="hidden sm:block p-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--accent)] hover:border-[var(--accent)] shrink-0"
+      >
+        <Download className="w-4 h-4" />
+      </a>
+    </>
+  );
+
   return (
     <div className="flex-1 flex flex-col gap-4">
+      {courseCodeDialog}
       {/* One compact toolbar: My courses / All, search, department, semester, actions */}
       <div className="flex flex-col xl:flex-row xl:items-center gap-2">
-        <div className="inline-flex self-start rounded-xl border border-[var(--border)] bg-[var(--surface)] p-0.5 shrink-0">
+        <div className="flex sm:inline-flex sm:self-start rounded-xl border border-[var(--border)] bg-[var(--surface)] p-0.5 shrink-0">
           {(
             [
               ["enrolled", tr("viewEnrolledOnly"), enrolledCourses.length],
@@ -1696,7 +2058,7 @@ function CoursesView({
                 setViewMode(mode);
                 setSelectedSemester("all");
               }}
-              className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+              className={`flex-1 sm:flex-none px-3 py-2 sm:py-1.5 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
                 viewMode === mode
                   ? "bg-[var(--accent)] text-[var(--on-accent)]"
                   : "text-[var(--muted)] hover:text-[var(--text)]"
@@ -1727,7 +2089,9 @@ function CoursesView({
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div
+          className={`${viewMode === "all" && departments.length > 0 ? "flex" : "hidden sm:flex"} items-center justify-end gap-2`}
+        >
           {viewMode === "all" && departments.length > 0 && (
             <div className="relative flex-1 xl:flex-none xl:w-60 min-w-0">
               <select
@@ -1746,7 +2110,8 @@ function CoursesView({
             </div>
           )}
 
-          <div className="relative flex-1 xl:flex-none xl:w-48 min-w-0">
+          {/* Phones pick the semester from the chips below; wider screens keep the compact select */}
+          <div className="relative hidden sm:block flex-1 xl:flex-none xl:w-48 min-w-0">
             <select
               aria-label={lang === "el" ? "Εξάμηνο" : "Semester"}
               value={selectedSemester === "all" ? "all" : String(selectedSemester)}
@@ -1782,34 +2147,57 @@ function CoursesView({
             <ChevronDown className="w-3.5 h-3.5 text-[var(--muted)] absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
           </div>
 
-          {groupedBySemester.length > 1 && (
-            <button
-              onClick={() => {
-                const allCollapsed = groupedBySemester.every(([idx]) => collapsedSemesters.has(idx));
-                setCollapsedSemesters(allCollapsed ? new Set() : new Set(groupedBySemester.map(([idx]) => idx)));
-              }}
-              title={
-                groupedBySemester.every(([idx]) => collapsedSemesters.has(idx))
-                  ? lang === "el" ? "Ανάπτυξη όλων" : "Expand all"
-                  : lang === "el" ? "Σύμπτυξη όλων" : "Collapse all"
-              }
-              className="p-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--text)] cursor-pointer shrink-0"
-            >
-              <ChevronDown
-                className={`w-4 h-4 transition-colors ${
-                  groupedBySemester.every(([idx]) => collapsedSemesters.has(idx)) ? "" : "rotate-180"
-                }`}
-              />
-            </button>
-          )}
-          <a
-            href="/api/documents/zip-all"
-            title={tr("downloadAllCourses")}
-            className="p-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--accent)] hover:border-[var(--accent)] shrink-0"
-          >
-            <Download className="w-4 h-4" />
-          </a>
+          <div className="hidden sm:contents">{listActions}</div>
         </div>
+
+        {/* Phone semester filter: one row of chips, scrolls sideways when it runs out of room */}
+        {sourceSubjects.length > 0 && (
+          <div className="sm:hidden flex items-center gap-2">
+            <div
+              role="radiogroup"
+              aria-label={lang === "el" ? "Εξάμηνο" : "Semester"}
+              className="flex-1 min-w-0 -ml-4 pl-4 flex gap-2 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            >
+              {[
+                { value: "all" as const, label: lang === "el" ? "Όλα" : "All", count: sourceSubjects.length },
+                ...SEMESTER_META.filter((m) => (semesterCounts.get(m.index) ?? 0) > 0).map((m) => ({
+                  value: m.index,
+                  label: lang === "el" ? m.shortEl : m.shortEn,
+                  count: semesterCounts.get(m.index) ?? 0,
+                })),
+              ].map((chip) => {
+                const on = selectedSemester === chip.value;
+                return (
+                  <button
+                    key={chip.value}
+                    type="button"
+                    role="radio"
+                    aria-checked={on}
+                    onClick={() => {
+                      setSelectedSemester(chip.value);
+                      if (chip.value !== "all") {
+                        setCollapsedSemesters((prev) => {
+                          const next = new Set(prev);
+                          next.delete(chip.value as number);
+                          return next;
+                        });
+                      }
+                    }}
+                    className={`shrink-0 inline-flex items-baseline gap-1.5 h-9 px-3.5 rounded-full border text-sm font-medium transition-colors cursor-pointer ${
+                      on
+                        ? "border-transparent bg-[var(--accent-soft)] text-[var(--accent-text)]"
+                        : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)]"
+                    }`}
+                  >
+                    <span className="self-center">{chip.label}</span>
+                    <span className="self-center text-xs tabular-nums opacity-75">{chip.count}</span>
+                  </button>
+                );
+              })}
+            </div>
+            {listActions}
+          </div>
+        )}
       </div>
 
       {/* Collapsible Minimalist Semester Dropdowns & Subject Rows */}
@@ -1860,19 +2248,16 @@ function CoursesView({
           )}
         </div>
       ) : (
-        <div className="flex-1 flex flex-col gap-3">
+        <div className="flex flex-col gap-3">
           {groupedBySemester.map(([semIndex, list]) => {
             const meta =
               SEMESTER_META.find((m) => m.index === semIndex) ??
               SEMESTER_META[SEMESTER_META.length - 1];
             const isOpen = !collapsedSemesters.has(semIndex);
-            // Stretch open sections to the page height (weighted by row count); skip for tiny lists
-            const fill = isOpen && visibleRowCount >= 4;
 
             return (
               <section
                 key={semIndex}
-                style={fill ? { flexGrow: list.length + 1 } : undefined}
                 className="flex flex-col rounded-2xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden transition-colors"
               >
                 {/* Minimalist Collapsible Semester Dropdown Header */}
@@ -1886,7 +2271,7 @@ function CoursesView({
                       toggleSemesterAccordion(semIndex);
                     }
                   }}
-                  className="px-4 py-2.5 flex items-center justify-between gap-3 bg-[var(--surface)] hover:bg-[var(--surface-2)]/70 transition-colors cursor-pointer select-none"
+                  className="px-4 py-3 sm:py-2.5 flex items-center justify-between gap-3 bg-[var(--surface)] hover:bg-[var(--surface-2)]/70 transition-colors cursor-pointer select-none"
                 >
                   <div className="flex items-center gap-2.5 min-w-0">
                     <ChevronRight
@@ -1902,7 +2287,8 @@ function CoursesView({
                     href={`/api/documents/zip-all?semester=${semIndex}`}
                     onClick={(e) => e.stopPropagation()}
                     title={`${tr("downloadSemesterZip")} (${meta.folder}.zip)`}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors shrink-0"
+                    aria-label={`${tr("downloadSemesterZip")} (${meta.folder}.zip)`}
+                    className="hidden sm:inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors shrink-0"
                   >
                     <Download className="w-3.5 h-3.5" />
                     <span className="hidden sm:inline">.zip</span>
@@ -1910,35 +2296,58 @@ function CoursesView({
                 </div>
 
                 {/* Expandable Minimalist Course List */}
-                <div className={`accordion ${fill ? "flex-1 flex flex-col" : ""}`} data-open={isOpen} inert={!isOpen}>
-                  <div className={`border-t border-[var(--border)] divide-y divide-[var(--border)] ${fill ? "flex-1 flex flex-col" : ""}`}>
+                <div className="accordion" data-open={isOpen} inert={!isOpen}>
+                  <div className="border-t border-[var(--border)] divide-y divide-[var(--border)]">
                     {list.map((c) => {
                       const isBusy = busyCode === c.code;
                       return (
                         <div
                           key={c.code}
-                          className={`px-4 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 sm:gap-3 hover:bg-[var(--surface-2)]/40 transition-colors ${fill ? "flex-1" : ""}`}
+                          className={`pl-4 pr-2 sm:pr-4 py-3 sm:py-2.5 flex items-center justify-between gap-2 sm:gap-3 hover:bg-[var(--surface-2)]/40 active:bg-[var(--surface-2)]/70 sm:active:bg-transparent transition-colors`}
                         >
-                          {/* Left: Subject Code, Title & Professor */}
+                          {/* Title and meta. On a phone the whole block opens the course; the title
+                              gets two full lines, and code + teacher share one quiet line under it. */}
                           <div
+                            role="link"
+                            tabIndex={0}
                             onClick={() => onSelectCourse(c.code, "documents")}
-                            className="min-w-0 flex-1 cursor-pointer group"
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") onSelectCourse(c.code, "documents");
+                            }}
+                            className="min-w-0 flex-1 cursor-pointer group rounded-md"
                           >
-                            <div className="flex items-baseline gap-2 flex-wrap">
-                              <span className="text-xs text-[var(--muted)] font-mono">{c.publicCode ?? c.code}</span>
-                              <h3 className="text-sm font-medium group-hover:text-[var(--accent-text)] transition-colors truncate">
+                            <div className="flex items-baseline gap-2 min-w-0">
+                              <span className="hidden sm:inline text-xs text-[var(--muted)] font-mono shrink-0">
+                                {c.publicCode ?? c.code}
+                              </span>
+                              <h3
+                                className={`text-[0.9375rem] leading-snug sm:text-sm font-medium group-hover:text-[var(--accent-text)] transition-colors line-clamp-2 sm:line-clamp-none sm:truncate ${
+                                  isAllCaps(c.title) ? "caps-title" : ""
+                                }`}
+                              >
                                 {c.title}
                               </h3>
-                              {c.enrolled && (
-                                <span className="text-[0.6875rem] px-1.5 py-0.5 rounded-full bg-[var(--ok-soft)] text-[var(--ok)] font-medium inline-flex items-center gap-1">
+                              {/* In "My courses" every row is enrolled, so the mark only shows in "All" */}
+                              {c.enrolled && viewMode === "all" && (
+                                <span className="hidden sm:inline-flex text-[0.6875rem] px-1.5 py-0.5 rounded-full bg-[var(--ok-soft)] text-[var(--ok)] font-medium items-center gap-1 shrink-0">
                                   <CheckCircle2 className="w-2.5 h-2.5" />
-                                  <span className="hidden sm:inline">{tr("enrolledBadge")}</span>
+                                  <span>{tr("enrolledBadge")}</span>
                                 </span>
                               )}
                             </div>
 
-                            <div className="mt-0.5 flex items-center gap-1.5 text-xs text-[var(--muted)]">
-                              <User className="w-3 h-3 shrink-0" />
+                            <div className="mt-1 sm:mt-0.5 flex items-center gap-1.5 text-xs text-[var(--muted)] min-w-0">
+                              {c.enrolled && viewMode === "all" && (
+                                <CheckCircle2
+                                  className="sm:hidden w-3.5 h-3.5 shrink-0 text-[var(--ok)]"
+                                  aria-label={tr("enrolledBadge")}
+                                />
+                              )}
+                              <span className="sm:hidden font-mono shrink-0">{c.publicCode ?? c.code}</span>
+                              <span aria-hidden className="sm:hidden">
+                                ·
+                              </span>
+                              <User className="hidden sm:block w-3 h-3 shrink-0" />
                               <span className="truncate">
                                 {c.professor ||
                                   (lang === "el" ? "Διδάσκων Τμήματος" : "Department Instructor")}
@@ -1946,11 +2355,11 @@ function CoursesView({
                             </div>
                           </div>
 
-                          {/* Right: Minimalist Action Buttons */}
-                          <div className="flex items-center justify-end gap-1.5 shrink-0">
+                          {/* Actions: labelled on wider screens; on a phone only join/leave (downloads live inside the course) */}
+                          <div className="flex items-center justify-end gap-1 sm:gap-1.5 shrink-0">
                             <button
                               onClick={() => onSelectCourse(c.code, "documents")}
-                              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent-soft)] text-[var(--accent)] hover:opacity-90 cursor-pointer"
+                              className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent-soft)] text-[var(--accent)] hover:opacity-90 cursor-pointer"
                             >
                               <FolderOpen className="w-3.5 h-3.5" />
                               <span>{tr("viewFilesBtn")}</span>
@@ -1959,7 +2368,8 @@ function CoursesView({
                             <a
                               href={`/api/courses/${encodeURIComponent(c.code)}/documents/zip`}
                               title={tr("downloadCourseZip")}
-                              className="p-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+                              aria-label={tr("downloadCourseZip")}
+                              className="hidden sm:inline-flex items-center justify-center sm:p-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
                             >
                               <Download className="w-3.5 h-3.5" />
                             </a>
@@ -1990,10 +2400,11 @@ function CoursesView({
                                     setBusyCode(null);
                                   }
                                 }}
-                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium hover:bg-[var(--danger-soft)] text-[var(--muted)] hover:text-[var(--danger)] cursor-pointer disabled:opacity-50"
+                                aria-label={tr("unenrollCourse")}
+                                className="inline-flex items-center justify-center gap-1 w-9 h-9 sm:w-auto sm:h-auto sm:px-2.5 sm:py-1.5 rounded-lg text-xs font-medium hover:bg-[var(--danger-soft)] text-[var(--muted)] hover:text-[var(--danger)] cursor-pointer disabled:opacity-50"
                               >
-                                <UserMinus className="w-3.5 h-3.5" />
-                                <span>{lang === "el" ? "Απεγγραφή" : "Leave"}</span>
+                                <UserMinus className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
+                                <span className="hidden sm:inline">{lang === "el" ? "Απεγγραφή" : "Leave"}</span>
                               </button>
                             ) : (
                               <button
@@ -2001,21 +2412,27 @@ function CoursesView({
                                 onClick={async () => {
                                   setBusyCode(c.code);
                                   try {
-                                    await api.enroll(c.code);
-                                    showToast(
-                                      lang === "el" ? `Εγγράφηκες στο ${c.title}` : `Joined ${c.title}`,
-                                    );
-                                    await onChanged();
-                                  } catch (err) {
-                                    showToast((err as Error).message);
+                                    await join(c);
                                   } finally {
                                     setBusyCode(null);
                                   }
                                 }}
-                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--surface-2)] hover:bg-[var(--accent)] hover:text-[var(--on-accent)] transition-colors cursor-pointer disabled:opacity-40"
+                                title={
+                                  c.locked
+                                    ? lang === "el" ? "Οι εγγραφές είναι κλειστές" : "Registration is closed"
+                                    : c.needsPassword
+                                      ? lang === "el" ? "Θέλει κωδικό εγγραφής" : "Needs a registration code"
+                                      : undefined
+                                }
+                                aria-label={tr("enrollBtn")}
+                                className="inline-flex items-center justify-center gap-1 w-9 h-9 sm:w-auto sm:h-auto sm:px-2.5 sm:py-1.5 rounded-lg text-xs font-medium bg-[var(--surface-2)] hover:bg-[var(--accent)] hover:text-[var(--on-accent)] transition-colors cursor-pointer disabled:opacity-40"
                               >
-                                <UserPlus className="w-3.5 h-3.5" />
-                                <span>{tr("enrollBtn")}</span>
+                                {c.needsPassword ? (
+                                  <KeyRound className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
+                                ) : (
+                                  <UserPlus className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
+                                )}
+                                <span className="hidden sm:inline">{tr("enrollBtn")}</span>
                               </button>
                             )}
                           </div>
@@ -2068,6 +2485,7 @@ function CourseDetailView({
   showToast: (m: string) => void;
 }) {
   const tr = (k: DictKey) => t(lang, k);
+  const { join, dialog: courseCodeDialog, askCode } = useJoinCourse({ lang, showToast, onJoined: onEnrolledOrUnenrolled });
   const [dir, setDir] = useState("/");
   const [docs, setDocs] = useState<DocNode[]>([]);
   const [docsLoading, setDocsLoading] = useState(false);
@@ -2198,21 +2616,36 @@ function CourseDetailView({
             </button>
           ) : (
             <button
-              onClick={async () => {
-                await api.enroll(course.code);
-                showToast(
-                  lang === "el" ? `Εγγράφηκες στο ${course.title}` : `Joined ${course.title}`,
-                );
-                await onEnrolledOrUnenrolled();
-              }}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent-soft)] cursor-pointer"
+              onClick={() => void join(course)}
+              disabled={course.locked}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent-soft)] cursor-pointer disabled:opacity-50 disabled:cursor-default"
             >
-              <UserPlus className="w-3.5 h-3.5" />
+              {course.needsPassword ? <KeyRound className="w-3.5 h-3.5" /> : <UserPlus className="w-3.5 h-3.5" />}
               <span>{tr("enrollBtn")}</span>
             </button>
           )}
         </div>
       </div>
+      {courseCodeDialog}
+
+      {/* eClass shows nothing of a code-protected course until you join it with its code */}
+      {!course.enrolled && course.needsPassword && (
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3 p-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)]">
+          <KeyRound className="hidden sm:block w-4 h-4 text-[var(--muted)] shrink-0" />
+          <p className="text-sm text-[var(--muted)] flex-1">
+            {lang === "el"
+              ? "Τα αρχεία αυτού του μαθήματος ανοίγουν με τον κωδικό εγγραφής που δίνει ο διδάσκων."
+              : "This course's files open with the registration code your teacher gives out."}
+          </p>
+          <button
+            onClick={() => askCode(course)}
+            className="self-start sm:self-auto inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-medium bg-[var(--accent)] text-[var(--on-accent)] hover:bg-[var(--accent-hover)] cursor-pointer shrink-0"
+          >
+            <KeyRound className="w-3.5 h-3.5" />
+            {lang === "el" ? "Βάλε κωδικό" : "Enter code"}
+          </button>
+        </div>
+      )}
 
       {/* Sub-navigation tabs */}
       <div className="flex items-center gap-1 border-b border-[var(--border)] overflow-x-auto whitespace-nowrap -mx-4 px-4 md:mx-0 md:px-0">
@@ -3235,8 +3668,9 @@ function SettingsView({
       </div>
 
       <SettingsGroup title={tr("appearanceSection")}>
-        <SettingsRow label={tr("themeLabel")}>
+        <SettingsRow label={tr("themeLabel")} stack>
           <Segmented
+            stretch="mobile"
             value={me.settings.theme}
             disabled={busy}
             onChange={(v) => patch({ theme: v })}
@@ -3247,8 +3681,9 @@ function SettingsView({
             ]}
           />
         </SettingsRow>
-        <SettingsRow label={tr("languageLabel")}>
+        <SettingsRow label={tr("languageLabel")} stack>
           <Segmented
+            stretch="mobile"
             value={me.settings.language}
             disabled={busy}
             onChange={(v) => patch({ language: v })}
@@ -3264,8 +3699,10 @@ function SettingsView({
         <SettingsRow
           label={lang === "el" ? "Μέγεθος κειμένου" : "Text size"}
           hint={lang === "el" ? "Ισχύει σε όλη την εφαρμογή." : "Applies across the whole app."}
+          stack
         >
           <Segmented
+            stretch="mobile"
             value={String(me.settings.accessibility.fontScale)}
             disabled={busy}
             onChange={(v) => patch({ accessibility: { fontScale: Number(v) as 0.9 | 1 | 1.15 | 1.3 } })}
@@ -3284,8 +3721,10 @@ function SettingsView({
               ? "Χωρίς κινήσεις και μεταβάσεις. «Συσκευή» ακολουθεί τη ρύθμιση του κινητού/υπολογιστή."
               : "No movement or transitions. “Device” follows your phone or computer setting."
           }
+          stack
         >
           <Segmented
+            stretch="mobile"
             value={me.settings.accessibility.reduceMotion}
             disabled={busy}
             onChange={(v) => patch({ accessibility: { reduceMotion: v } })}
@@ -3303,13 +3742,14 @@ function SettingsView({
           <SettingsRow
             label={tr("departmentLabel")}
             hint={lang === "el" ? "Ο κατάλογος «Όλα» και ο βοηθός χρησιμοποιούν αυτό το τμήμα." : "Used by the “All” catalog and the assistant."}
+            stack
           >
             <select
               aria-label={tr("departmentLabel")}
               value={me.departmentId ?? ""}
               disabled={busy}
               onChange={(e) => patch({ departmentId: e.target.value })}
-              className="max-w-[12rem] sm:max-w-xs px-3 py-1.5 rounded-lg text-sm border border-[var(--border)] bg-[var(--surface-2)] text-[var(--text)] focus:outline-none focus:border-[var(--accent)] cursor-pointer"
+              className="w-full sm:w-auto sm:max-w-xs px-3 py-2 sm:py-1.5 rounded-lg text-sm border border-[var(--border)] bg-[var(--surface-2)] text-[var(--text)] focus:outline-none focus:border-[var(--accent)] cursor-pointer"
             >
               {departments.map((d) => (
                 <option key={d.id} value={d.id}>
@@ -3361,8 +3801,9 @@ function SettingsView({
             onChange={(v) => setNotify("deadlines", v)}
           />
         </SettingsRow>
-        <SettingsRow label={tr("pollIntervalLabel")}>
+        <SettingsRow label={tr("pollIntervalLabel")} stack>
           <Segmented
+            stretch="mobile"
             value={String(me.settings.pollIntervalMin)}
             disabled={busy}
             onChange={(v) => patch({ pollIntervalMin: Number(v) })}
@@ -3500,26 +3941,6 @@ function SettingsView({
   );
 }
 
-/** Browsers offer "Install" through this event (Chrome, Edge, Android); kept so Settings can ask later. */
-interface InstallPromptEvent extends Event {
-  prompt: () => Promise<void>;
-  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
-}
-let deferredInstall: InstallPromptEvent | null = null;
-if (typeof window !== "undefined") {
-  window.addEventListener("beforeinstallprompt", (e) => {
-    e.preventDefault();
-    deferredInstall = e as InstallPromptEvent;
-  });
-}
-
-function isInstalledApp(): boolean {
-  return (
-    window.matchMedia("(display-mode: standalone)").matches ||
-    (navigator as unknown as { standalone?: boolean }).standalone === true
-  );
-}
-
 /**
  * Deadlines on the home screen. Phone browsers don't let web apps place widgets, so on Android and
  * iPhone the deadlines go into the phone's own calendar (a private subscription link) and that
@@ -3538,7 +3959,7 @@ function HomeScreenCalendarSettings({
 }) {
   const el = lang === "el";
   const [busy, setBusy] = useState(false);
-  const [canInstall, setCanInstall] = useState(() => Boolean(deferredInstall));
+  const canInstall = useCanInstall();
   const installed = isInstalledApp();
   const ua = navigator.userAgent;
   const isWindows = /Windows/.test(ua);
@@ -3546,12 +3967,6 @@ function HomeScreenCalendarSettings({
   const feed = me.calendarFeedUrl;
   const webcal = feed?.replace(/^https?:\/\//, "webcal://");
   const googleAdd = webcal ? `https://calendar.google.com/calendar/r?cid=${encodeURIComponent(webcal)}` : undefined;
-
-  useEffect(() => {
-    const onPrompt = () => setCanInstall(true);
-    window.addEventListener("beforeinstallprompt", onPrompt);
-    return () => window.removeEventListener("beforeinstallprompt", onPrompt);
-  }, []);
 
   const run = async (fn: () => Promise<void>) => {
     setBusy(true);
@@ -3575,12 +3990,7 @@ function HomeScreenCalendarSettings({
           hint={el ? "Το myClass ως εφαρμογή, με εικονίδιο και συντομεύσεις." : "myClass as an app, with an icon and shortcuts."}
         >
           <button
-            onClick={async () => {
-              if (!deferredInstall) return;
-              await deferredInstall.prompt();
-              deferredInstall = null;
-              setCanInstall(false);
-            }}
+            onClick={() => void promptInstall()}
             className="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent)] text-[var(--on-accent)] cursor-pointer"
           >
             {el ? "Εγκατάσταση" : "Install"}
@@ -3692,22 +4102,32 @@ function SettingsGroup({ title, children }: { title: string; children: React.Rea
   );
 }
 
+/**
+ * One setting. `stack` is for wide controls (segmented choices): on a phone the control moves
+ * under the label at full width, so the label and hint keep the whole line instead of a sliver.
+ */
 function SettingsRow({
   label,
   hint,
+  stack,
   children,
 }: {
   label: string;
   hint?: string;
+  stack?: boolean;
   children: React.ReactNode;
 }) {
   return (
-    <div className="px-4 py-3 flex items-center justify-between gap-3 min-h-[52px]">
+    <div
+      className={`px-4 py-3 flex justify-between min-h-[52px] ${
+        stack ? "flex-col gap-2.5 sm:flex-row sm:items-center sm:gap-3" : "items-center gap-3"
+      }`}
+    >
       <div className="min-w-0">
         <div className="text-sm">{label}</div>
         {hint && <div className="text-xs text-[var(--muted)] mt-0.5">{hint}</div>}
       </div>
-      <div className="shrink-0">{children}</div>
+      <div className={stack ? "w-full sm:w-auto sm:shrink-0" : "shrink-0"}>{children}</div>
     </div>
   );
 }
@@ -3755,13 +4175,13 @@ function Segmented<T extends string>({
   options: Array<{ value: T; label: string; icon?: React.ReactNode }>;
   onChange: (v: T) => void;
   disabled?: boolean;
-  stretch?: boolean;
+  /** Full width always, or (`"mobile"`) only on phones, where it sits under its label. */
+  stretch?: boolean | "mobile";
 }) {
+  const wide = stretch === true ? "flex w-full" : stretch === "mobile" ? "flex w-full sm:inline-flex sm:w-auto" : "inline-flex";
+  const grow = stretch === true ? "flex-1" : stretch === "mobile" ? "flex-1 sm:flex-none" : "";
   return (
-    <div
-      role="radiogroup"
-      className={`${stretch ? "flex w-full" : "inline-flex"} rounded-xl bg-[var(--surface-2)] p-1 gap-0.5`}
-    >
+    <div role="radiogroup" className={`${wide} rounded-xl bg-[var(--surface-2)] p-1 gap-0.5`}>
       {options.map((o) => (
         <button
           key={o.value}
@@ -3770,14 +4190,15 @@ function Segmented<T extends string>({
           aria-checked={value === o.value}
           disabled={disabled}
           onClick={() => value !== o.value && onChange(o.value)}
-          className={`${stretch ? "flex-1" : ""} inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:cursor-default ${
+          className={`${grow} inline-flex items-center justify-center gap-1.5 px-2.5 py-2 sm:py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:cursor-default ${
             value === o.value
               ? "bg-[var(--surface)] text-[var(--text)] shadow-sm"
               : "text-[var(--muted)] hover:text-[var(--text)]"
           }`}
         >
           {o.icon}
-          <span className={o.icon ? "hidden sm:inline" : undefined}>{o.label}</span>
+          {/* Icon-only on a phone, unless the control has the whole width to itself */}
+          <span className={o.icon && stretch !== "mobile" ? "hidden sm:inline" : undefined}>{o.label}</span>
         </button>
       ))}
     </div>
@@ -3840,7 +4261,8 @@ function MobileTab({
     <button
       onClick={onClick}
       aria-current={active ? "page" : undefined}
-      className={`relative flex-1 min-w-0 min-h-[52px] flex flex-col items-center justify-center gap-1 py-1 text-[0.6875rem] tracking-[-0.01em] font-medium transition-colors cursor-pointer ${
+      // Tab labels stop growing at 12px (like the phone's own tab bars), so five of them still fit at A++
+      className={`relative flex-1 min-w-0 min-h-[52px] px-0.5 flex flex-col items-center justify-center gap-1 py-1 text-[min(0.6875rem,12px)] font-medium transition-colors cursor-pointer ${
         active ? "text-[var(--accent-text)]" : "text-[var(--muted)]"
       }`}
     >
@@ -3856,7 +4278,7 @@ function MobileTab({
           </span>
         )}
       </div>
-      <span className="truncate max-w-full">{label}</span>
+      <span className="truncate max-w-full px-0.5">{label}</span>
     </button>
   );
 }

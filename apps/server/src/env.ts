@@ -84,6 +84,11 @@ if (isProd) {
   if (!str("VAPID_PUBLIC_KEY") || !str("VAPID_PRIVATE_KEY")) {
     problems.push("VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY are not set (push keys live only in DATA_DIR)");
   }
+  if (!str("GEMINI_API_KEY")) {
+    problems.push(
+      "GEMINI_API_KEY is not set: the assistant, summaries and study material only work for students who add their own key",
+    );
+  }
   if (!str("DATA_DIR")) {
     problems.push(
       `DATA_DIR is not set (using ${DATA_DIR}); on hosts with an ephemeral disk all users and sessions are lost on every redeploy`,

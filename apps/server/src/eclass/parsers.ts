@@ -710,7 +710,9 @@ export function parseCatalogHtml(html: string): ParsedCatalogPage {
       (cb.length === 0 && !enrolled) ||
       (cb.attr("disabled") !== undefined && !enrolled && !hasPasswordInput);
 
-    const locked = isRegClosed || hasPasswordInput || item.find(".fa-lock").length > 0;
+    // A password course still takes registrations: the student types the course's code
+    const needsPassword = !enrolled && (hasPasswordInput || (item.find(".fa-lock").length > 0 && !cb.hasClass("reg_closed")));
+    const locked = isRegClosed && !needsPassword;
 
     courses.push({
       code,
@@ -720,6 +722,7 @@ export function parseCatalogHtml(html: string): ParsedCatalogPage {
       numericId,
       enrolled,
       locked,
+      ...(needsPassword ? { needsPassword } : {}),
     });
   });
 

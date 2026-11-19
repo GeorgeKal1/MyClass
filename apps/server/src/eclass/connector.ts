@@ -60,6 +60,7 @@ import {
   UNIPI_CENTRAL_BASE_URL,
   UNIPI_DEPARTMENTS,
 } from "./unipi-curriculum.js";
+import { curriculumSemester, isPostgraduatePath, POSTGRAD_INDEX } from "./unipi-curricula.js";
 import { ECLASS_MODULES, withOrigin } from "./request-origin.js";
 import { getUniversity } from "./universities.js";
 
@@ -67,6 +68,17 @@ export interface SubmissionInput {
   files: Array<{ name: string; type: string; data: Buffer }>;
   text?: string;
   comments?: string;
+}
+
+/** Joining a course that asks for its registration code: none given ("required") or a wrong one. */
+export class CoursePasswordError extends Error {
+  constructor(
+    readonly reason: "required" | "wrong",
+    readonly courseTitle: string,
+  ) {
+    super(reason === "required" ? `"${courseTitle}" asks for a registration code` : `Wrong registration code for "${courseTitle}"`);
+    this.name = "CoursePasswordError";
+  }
 }
 
 export interface EclassConnector {
@@ -87,7 +99,8 @@ export interface EclassConnector {
   listCatalog(query?: string, departmentId?: string): Promise<CatalogCourse[]>;
   /** The student's own usage statistics, merged across every portal they use. */
   getMyStats(): Promise<MyStats>;
-  enrollCourse(codeOrId: string): Promise<Course>;
+  /** `password`: the course's registration code, for courses that ask for one. */
+  enrollCourse(codeOrId: string, password?: string): Promise<Course>;
   unenrollCourse(codeOrId: string): Promise<Course>;
   downloadFile(
     courseCode: string,
@@ -372,14 +385,30 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
   const downloadUrlCache = new Map<string, string>();
   const messagePortalMap = new Map<string, string>();
 
-  /** Semester grouping: curated Informatics curriculum, otherwise title / faculty-name hints. */
-  const semesterFor = (code: string, title: string, hints: string[] = [], defaultYear?: number) => {
+  /**
+   * Semester grouping, most specific first: curated Informatics curriculum, postgraduate programme
+   * folders, a semester named in the title, the department's study guide, then faculty-folder names.
+   */
+  const semesterFor = (
+    code: string,
+    title: string,
+    hints: string[] = [],
+    ctx: { deptId?: string; publicCode?: string; postgraduate?: boolean } = {},
+  ) => {
     if (resolveUniPiPortalForCourse(code) === "thales" || CS_COURSE_SEMESTER[code.toUpperCase()]) {
-      const sem = resolveSemesterForCourse(code, title, defaultYear);
+      const sem = resolveSemesterForCourse(code, title);
       return { semester: sem.shortLabel, semesterIndex: sem.index, semesterFolder: sem.folder };
     }
-    const idx = [title, ...hints].map(semesterFromText).find((n) => n !== undefined);
-    const sem = idx !== undefined ? SEMESTERS[Math.min(idx, 9)] : undefined;
+    const fromText = (text: string) => {
+      const n = semesterFromText(text);
+      return n === undefined ? undefined : Math.min(n, 9);
+    };
+    const idx = ctx.postgraduate
+      ? POSTGRAD_INDEX
+      : (fromText(title) ??
+        curriculumSemester(ctx.deptId, { code, publicCode: ctx.publicCode, title }) ??
+        hints.map(fromText).find((n) => n !== undefined));
+    const sem = idx !== undefined ? SEMESTERS[idx] : undefined;
     return sem
       ? { semester: sem.shortLabel, semesterIndex: sem.index, semesterFolder: sem.folder }
       : { semester: undefined, semesterIndex: undefined, semesterFolder: undefined };
@@ -531,15 +560,20 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
   };
 
   /** "[Α] - (ΨΣ-014) - Λογική" -> title "Λογική", public code "ΨΣ-014", semester 1. */
-  const tidyTitle = <T extends { code: string; title: string; publicCode?: string }>(c: T, hints: string[] = []) => {
+  const tidyTitle = <T extends { code: string; title: string; publicCode?: string }>(
+    c: T,
+    hints: string[] = [],
+    ctx: { deptId?: string; postgraduate?: boolean } = {},
+  ) => {
     const split = splitCourseTitle(c.title);
+    const publicCode = split.curriculumCode ?? c.publicCode;
     const bracketSem = split.semesterIndex !== undefined ? SEMESTERS[split.semesterIndex] : undefined;
     const sem = bracketSem
       ? { semester: bracketSem.shortLabel, semesterIndex: bracketSem.index, semesterFolder: bracketSem.folder }
-      : semesterFor(c.code, split.title, hints);
+      : semesterFor(c.code, split.title, hints, { ...ctx, publicCode });
     return {
       title: split.title,
-      publicCode: split.curriculumCode ?? c.publicCode,
+      publicCode,
       ...sem,
     };
   };
@@ -550,7 +584,8 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     rememberCourseTitles(user, hostOf(portalBase), [{ code: c.code, title: c.title }]);
     return {
       ...c,
-      ...tidyTitle(c),
+      // Enrolled courses are read against the student's own department curriculum
+      ...tidyTitle(c, [], { deptId: userDepartmentId(user) }),
       portal: hostOf(portalBase),
       url: c.url ?? `${portalBase}/courses/${encodeURIComponent(c.code)}/`,
       enrolled: true,
@@ -714,7 +749,7 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
           coursePortalByUser.set(`${user.id}|${c.code.toUpperCase()}`, portalBase);
           return {
             ...c,
-            ...tidyTitle(c, [...facultyPath].reverse()),
+            ...tidyTitle(c, [...facultyPath].reverse(), { deptId: departmentId, postgraduate: isPostgraduatePath(facultyPath) }),
             departmentId,
             departmentName: deptName ?? facultyPath[0],
             portal: hostOf(portalBase),
@@ -737,7 +772,11 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
                     const s = resolveSemesterForCourse(c.code, c.title, src.defaultYear);
                     return { semester: s.shortLabel, semesterIndex: s.index, semesterFolder: s.folder };
                   })()
-                : tidyTitle(c, [...facultyPath].reverse());
+                : tidyTitle(c, [...facultyPath].reverse(), {
+                    deptId: dept.id,
+                    // Lefkippos is a postgraduate portal on its own; there its semesters are the programme's
+                    postgraduate: src.portal === "central" && isPostgraduatePath(facultyPath),
+                  });
             return {
               ...c,
               ...sem,
@@ -840,13 +879,19 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     portalBase: string,
     numericId: number,
     state: "true" | "false",
+    password?: string,
   ): Promise<string> => {
     let token = csrfTokenByBase.get(portalBase) ?? (await fetchPortalCsrfToken(portalBase));
     const doSubmit = async (csrf: string | undefined) => {
       const http = getHttp();
       const res = await http.request(`${portalBase}/modules/auth/course_submit.php`, {
         method: "POST",
-        form: { cid: String(numericId), state, ...(csrf ? { token: csrf } : {}) },
+        form: {
+          cid: String(numericId),
+          state,
+          ...(password !== undefined ? { password } : {}),
+          ...(csrf ? { token: csrf } : {}),
+        },
         headers: {
           "X-Requested-With": "XMLHttpRequest",
           Referer: `${portalBase}/modules/auth/courses.php`,
@@ -857,7 +902,8 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     };
 
     let statusText = await doSubmit(token);
-    if (statusText !== "registered" && statusText !== "unregistered") {
+    // "unauthorized" answers a wrong course code; retrying with a new token would not change that
+    if (statusText !== "registered" && statusText !== "unregistered" && statusText !== "unauthorized") {
       // Refresh CSRF token (re-login happens inside authedGet if needed) and retry once
       token = await fetchPortalCsrfToken(portalBase);
       statusText = await doSubmit(token);
@@ -1197,7 +1243,7 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     },
     defaultDepartmentId,
     listCatalog,
-    async enrollCourse(codeOrId: string): Promise<Course> {
+    async enrollCourse(codeOrId: string, password?: string): Promise<Course> {
       const catalog = await listCatalog();
       const q = codeOrId.trim().toLowerCase();
       const match =
@@ -1209,11 +1255,18 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
         throw new Error(`Course "${codeOrId}" was not found in the university catalog`);
       }
       if (match.locked) {
-        throw new Error(`Course "${match.title}" requires a password or has closed registration on eClass`);
+        throw new Error(`Registration for "${match.title}" is closed on eClass`);
+      }
+      const code = password?.trim();
+      if (match.needsPassword && !code) {
+        throw new CoursePasswordError("required", match.title);
       }
 
       const portalBase = resolvePortalBase(match.code);
-      const statusText = await submitCourseToggle(portalBase, match.numericId, "true");
+      const statusText = await submitCourseToggle(portalBase, match.numericId, "true", code || undefined);
+      if (statusText === "unauthorized" && (match.needsPassword || code)) {
+        throw new CoursePasswordError(code ? "wrong" : "required", match.title);
+      }
       if (statusText !== "registered") {
         throw new Error(`eClass could not register "${match.title}" (response: ${statusText || "unknown"})`);
       }

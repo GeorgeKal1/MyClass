@@ -36,7 +36,7 @@ export interface Course {
   numericId?: number;
   /** Official or user-assigned semester label (e.g. "Α' Εξάμηνο", "Ε' Εξάμηνο"). */
   semester?: string;
-  /** Numeric semester index (1..8 for Α'–Η' Εξάμηνο, 9 for Thesis/Other). */
+  /** Numeric semester index (1..8 for Α'–Η' Εξάμηνο, 9 general/other, 10 electives pool, 11 postgraduate). */
   semesterIndex?: number;
   /** Folder-safe semester label (e.g. "Α_εξάμηνο" .. "Η_Εξάμηνο"). */
   semesterFolder?: string;
@@ -47,6 +47,8 @@ export interface Course {
   url?: string;
   enrolled?: boolean;
   locked?: boolean;
+  /** Joining needs the course's registration code. */
+  needsPassword?: boolean;
   archived?: boolean;
   color?: string;
 }
@@ -187,11 +189,13 @@ export interface CatalogCourse {
   professor?: string;
   numericId?: number;
   enrolled: boolean;
-  /** Course requires a password or closed registration on eClass. */
+  /** Registration is closed on eClass (no way to join from here). */
   locked?: boolean;
+  /** Joining needs the course's registration code, given by the teacher. */
+  needsPassword?: boolean;
   /** Official semester label (e.g. "Α' Εξάμηνο" .. "Η' Εξάμηνο"). */
   semester?: string;
-  /** Numeric semester index (1..8 for Α'–Η' Εξάμηνο, 9 for Thesis/Other). */
+  /** Numeric semester index (1..8 for Α'–Η' Εξάμηνο, 9 general/other, 10 electives pool, 11 postgraduate). */
   semesterIndex?: number;
   /** Folder-safe semester name (e.g. "Α_εξάμηνο", "Β_εξάμηνο", "Γ_εξάμηνο", "Δ_Εξάμηνο", "Ε_Εξάμηνο", etc.). */
   semesterFolder?: string;
@@ -333,7 +337,7 @@ export const DEFAULT_SETTINGS: UserSettings = {
   language: "el",
   pollIntervalMin: 15,
   notify: { announcements: true, messages: true, assignments: true, deadlines: true, push: false },
-  accessibility: { fontScale: 1, reduceMotion: "system" },
+  accessibility: { fontScale: 1, reduceMotion: "on" },
   mutedCourses: [],
   downloads: { allCoursesMode: "single-zip" },
   ai: { mode: "server", model: "" },

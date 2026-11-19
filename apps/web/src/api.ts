@@ -31,6 +31,16 @@ export class ServerUnavailableError extends Error {
   }
 }
 
+/** An error answer from our API; `code` names the cases the app handles itself (e.g. "password_required"). */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly code?: string,
+  ) {
+    super(message);
+  }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
@@ -47,16 +57,18 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     let errMsg: string | undefined;
+    let errCode: string | undefined;
     try {
-      const body = (await res.json()) as { error?: string };
+      const body = (await res.json()) as { error?: string; code?: string };
       errMsg = body.error;
+      errCode = body.code;
     } catch {
       /* not a JSON error from our API */
     }
     // A 5xx without our JSON error body means the request never reached the API
     // (e.g. Vite's proxy answers 500 when the backend is down).
     if (!errMsg && res.status >= 500) throw new ServerUnavailableError();
-    throw new Error(errMsg ?? `HTTP ${res.status}`);
+    throw new ApiError(errMsg ?? `HTTP ${res.status}`, errCode);
   }
   return (await res.json()) as T;
 }
@@ -147,10 +159,11 @@ export const api = {
       activeDepartment?: string;
     }>(`/api/catalog${qs ? `?${qs}` : ""}`);
   },
-  enroll: (course: string) =>
+  /** `password`: the course's registration code, for courses that ask for one. */
+  enroll: (course: string, password?: string) =>
     req<{ course: Course }>("/api/courses/enroll", {
       method: "POST",
-      body: JSON.stringify({ course }),
+      body: JSON.stringify(password !== undefined ? { course, password } : { course }),
     }),
   unenroll: (code: string) =>
     req<{ course: Course }>(`/api/courses/${encodeURIComponent(code)}/unenroll`, {

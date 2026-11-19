@@ -8,7 +8,7 @@
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#111216",
-  "theme_color": "#7765cb",
+  "theme_color": "#181a1f",
   "icons": [
     {
       "src": "/icon.svg",
@@ -41,7 +41,7 @@
       "name": "Βοηθός",
       "short_name": "Βοηθός",
       "description": "Ask the assistant",
-      "url": "/assistant",
+      "url": "/assistant?open=1",
       "icons": [{ "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" }]
     }
   ],
