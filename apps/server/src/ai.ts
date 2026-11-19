@@ -1,114 +1,27 @@
-import type { CatalogCourse, ChatMessage, ChatStreamEvent, PendingAction } from "@myclass/shared";
-import { decrypt, encrypt, randomId } from "./crypto.js";
-import { getConnectorForUser } from "./eclass/connector.js";
-import { getUniversity } from "./eclass/universities.js";
-import { getCurrentAcademicYearBounds, hasPastAcademicYearTag, SEMESTERS } from "./eclass/unipi-curriculum.js";
+import type {
+  Announcement,
+  AnnouncementTriage,
+  ChatMessage,
+  ChatStreamEvent,
+  ExamQuestion,
+  Flashcard,
+  PendingAction,
+  QuizQuestion,
+  StudyKind,
+  StudyMaterial,
+} from "@myclass/shared";
+import crypto from "node:crypto";
+import { decrypt, randomId, sha256 } from "./crypto.js";
+import { getConnectorForUser, userDepartmentId } from "./eclass/connector.js";
+import { getCurrentAcademicYearBounds, UNIPI_DEPARTMENTS } from "./eclass/unipi-curriculum.js";
 import { prepareDocumentForAi } from "./doctext.js";
 import { env } from "./env.js";
-import { oauthStates, users, type UserRecord } from "./store.js";
+import { rankGeminiModels } from "./gemini-models.js";
+import { AiQuotaError, consumeAiQuota, refundAiQuota } from "./quota.js";
+import { users, type UserRecord } from "./store.js";
 
 /* ------------------------------------------------------------------ */
-/* Google OAuth 2.0 helper (for "Connect Google account" in Settings)  */
-/* ------------------------------------------------------------------ */
-
-export function buildGoogleOAuthUrl(userId: string): string | null {
-  if (!env.google.clientId || !env.google.clientSecret) return null;
-  const state = randomId(18);
-  oauthStates.put(state, userId);
-  const params = new URLSearchParams({
-    client_id: env.google.clientId,
-    redirect_uri: env.google.redirectUri,
-    response_type: "code",
-    access_type: "offline",
-    prompt: "consent",
-    scope: `${env.google.scopes} openid email`,
-    state,
-  });
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
-}
-
-export async function handleGoogleOAuthCallback(code: string, state: string): Promise<string | null> {
-  const userId = oauthStates.take(state);
-  if (!userId) return null;
-
-  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      code,
-      client_id: env.google.clientId,
-      client_secret: env.google.clientSecret,
-      redirect_uri: env.google.redirectUri,
-      grant_type: "authorization_code",
-    }),
-  });
-  if (!tokenRes.ok) {
-    throw new Error(`Google token exchange failed (${tokenRes.status})`);
-  }
-  const tokens = (await tokenRes.json()) as {
-    access_token: string;
-    refresh_token?: string;
-    expires_in?: number;
-  };
-
-  let email: string | undefined;
-  try {
-    const infoRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
-      headers: { Authorization: `Bearer ${tokens.access_token}` },
-    });
-    if (infoRes.ok) {
-      const info = (await infoRes.json()) as { email?: string };
-      email = info.email;
-    }
-  } catch {
-    /* optional */
-  }
-
-  users.update(userId, (u) => {
-    u.ai.google = {
-      encRefreshToken: tokens.refresh_token ? encrypt(tokens.refresh_token) : u.ai.google?.encRefreshToken,
-      accessToken: tokens.access_token,
-      expiresAt: Date.now() + (tokens.expires_in ?? 3500) * 1000,
-      email: email ?? u.ai.google?.email,
-    };
-    u.settings.ai.mode = "google";
-  });
-
-  return userId;
-}
-
-async function getValidGoogleAccessToken(user: UserRecord): Promise<string | null> {
-  const g = user.ai.google;
-  if (!g) return null;
-  if (g.accessToken && g.expiresAt && g.expiresAt > Date.now() + 30_000) {
-    return g.accessToken;
-  }
-  if (!g.encRefreshToken || !env.google.clientId || !env.google.clientSecret) return null;
-
-  const refreshToken = decrypt(g.encRefreshToken);
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      refresh_token: refreshToken,
-      client_id: env.google.clientId,
-      client_secret: env.google.clientSecret,
-      grant_type: "refresh_token",
-    }),
-  });
-  if (!res.ok) return null;
-  const data = (await res.json()) as { access_token: string; expires_in?: number };
-  users.update(user.id, (u) => {
-    if (u.ai.google) {
-      u.ai.google.accessToken = data.access_token;
-      u.ai.google.expiresAt = Date.now() + (data.expires_in ?? 3500) * 1000;
-    }
-  });
-  return data.access_token;
-}
-
-/* ------------------------------------------------------------------ */
-/* Tool definitions for Gemini Interactions API                        */
+/* Tool definitions (Gemini function calling)                          */
 /* ------------------------------------------------------------------ */
 
 const TOOLS = [
@@ -123,7 +36,7 @@ const TOOLS = [
     type: "function",
     name: "search_catalog",
     description:
-      "Lists or searches all subjects across all university semesters (Α' Εξάμηνο through Η' Εξάμηνο, i.e. semesters 1..8) with course code, title, professor name, semester, and enrollment status.",
+      "Lists or searches the course catalog of a University of Piraeus department (all semesters) with course code, title, professor, semester and enrollment status. Defaults to the student's own department.",
     parameters: {
       type: "object",
       properties: {
@@ -137,7 +50,7 @@ const TOOLS = [
         },
         departmentId: {
           type: "string",
-          description: "Optional department ID (defaults to 'cs-ug' for Informatics Undergraduate)",
+          description: `Optional department id, one of: ${UNIPI_DEPARTMENTS.map((d) => `${d.id} (${d.nameEn})`).join(", ")}. Defaults to the student's department.`,
         },
       },
     },
@@ -300,9 +213,17 @@ async function runReadOnlyTool(
   args: Record<string, unknown>,
 ): Promise<unknown> {
   const connector = getConnectorForUser(user);
+  /** Enrolled courses, but an eClass failure is reported instead of looking like "no courses". */
+  const enrolledOrThrow = async () => {
+    const { courses, warnings } = await connector.listCoursesDetailed();
+    if (courses.length === 0 && warnings.length > 0) {
+      throw new Error(`Could not read eClass: ${warnings.map((w) => `${w.portal}: ${w.message}`).join("; ")}`);
+    }
+    return courses;
+  };
   switch (name) {
     case "list_courses": {
-      const list = await connector.listCourses();
+      const list = await enrolledOrThrow();
       return list.map((c) => ({
         ...c,
         semester: user.courseMeta[c.code]?.semester ?? c.semester,
@@ -325,6 +246,7 @@ async function runReadOnlyTool(
       return connector.listDocuments(courseCode, dir);
     }
     case "get_announcements": {
+      if (!(typeof args.courseCode === "string" && args.courseCode)) await enrolledOrThrow();
       const list = await connector.getAnnouncements(
         typeof args.courseCode === "string" && args.courseCode ? args.courseCode : undefined,
       );
@@ -360,6 +282,7 @@ async function runReadOnlyTool(
       };
     }
     case "get_deadlines": {
+      if (!(typeof args.courseCode === "string" && args.courseCode)) await enrolledOrThrow();
       const list = await connector.getAssignments(
         typeof args.courseCode === "string" && args.courseCode ? args.courseCode : undefined,
       );
@@ -456,88 +379,243 @@ export async function executeConfirmedAction(
 }
 
 /* ------------------------------------------------------------------ */
-/* Gemini Interactions API client (v1beta/interactions)                */
+/* Gemini client (generateContent + function calling)                  */
 /* ------------------------------------------------------------------ */
 
-interface InteractionStep {
-  type: string;
-  id?: string;
-  name?: string;
-  arguments?: Record<string, unknown>;
-  content?: Array<{ type: string; text?: string }>;
+const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+
+interface GeminiPart {
+  text?: string;
+  thought?: boolean;
+  functionCall?: { id?: string; name: string; args?: Record<string, unknown> };
+  functionResponse?: { id?: string; name: string; response: Record<string, unknown> };
+  inlineData?: { mimeType: string; data: string };
+  [key: string]: unknown;
 }
 
-interface InteractionResponse {
-  id?: string;
-  steps?: InteractionStep[];
-  output_text?: string;
+interface GeminiContent {
+  role: "user" | "model";
+  parts: GeminiPart[];
 }
 
-async function resolveGeminiAuth(
-  user: UserRecord,
-): Promise<{ headers: Record<string, string>; model: string } | null> {
-  const model = user.settings.ai.model || env.gemini.model || "gemini-3.8-flash";
+interface GeminiResponse {
+  candidates?: Array<{ content?: GeminiContent; finishReason?: string }>;
+  promptFeedback?: { blockReason?: string };
+}
 
+interface GeminiAuth {
+  /** "own" = the student's key, "server" = the shared myClass key. */
+  source: "own" | "server";
+  key: string;
+}
+
+type GeminiFailure = "no-key" | "bad-key" | "quota" | "empty" | "error";
+
+class GeminiError extends Error {
+  constructor(
+    public reason: GeminiFailure,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** Keys to try, in order: the student's own key (when they chose it), then the shared server key. */
+function geminiAuthCandidates(user: UserRecord): GeminiAuth[] {
+  const out: GeminiAuth[] = [];
   if (user.settings.ai.mode === "apiKey" && user.ai.encApiKey) {
-    return { headers: { "x-goog-api-key": decrypt(user.ai.encApiKey) }, model };
-  }
-  if (user.settings.ai.mode === "google" && user.ai.google) {
-    if (user.ai.google.accessToken === "aistudio-key" && user.ai.encApiKey) {
-      return { headers: { "x-goog-api-key": decrypt(user.ai.encApiKey) }, model };
+    try {
+      out.push({ source: "own", key: decrypt(user.ai.encApiKey) });
+    } catch {
+      /* unreadable key – ignore */
     }
-    const token = await getValidGoogleAccessToken(user);
-    if (token) return { headers: { Authorization: `Bearer ${token}` }, model };
   }
-  if (user.ai.encApiKey) {
-    return { headers: { "x-goog-api-key": decrypt(user.ai.encApiKey) }, model };
-  }
-  if (env.gemini.apiKey) {
-    return { headers: { "x-goog-api-key": env.gemini.apiKey }, model };
-  }
-  return null;
+  if (env.gemini.apiKey) out.push({ source: "server", key: env.gemini.apiKey });
+  return out;
 }
 
-async function callGeminiInteractions(
-  authHeaders: Record<string, string>,
-  model: string,
-  history: unknown[],
-  systemInstruction: string,
-  withTools = true,
-): Promise<InteractionResponse> {
-  const res = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...authHeaders,
-    },
-    body: JSON.stringify({
-      model,
-      store: false,
-      system_instruction: systemInstruction,
-      input: history,
-      ...(withTools ? { tools: TOOLS } : {}),
-    }),
-  });
+/** Usable models per key (keyed by a hash of the key), discovered with the ListModels API. */
+const modelCache = new Map<string, { at: number; models: string[] }>();
+const MODEL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const FALLBACK_MODELS = ["gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-flash-latest", "gemini-2.5-flash"];
+/** Models that just answered "overloaded" / "quota" are skipped for a while (a 503 can take ~30 s). */
+const modelCooldown = new Map<string, number>();
+const COOLDOWN_MS = 5 * 60 * 1000;
 
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Gemini API (${res.status}): ${errText.slice(0, 240)}`);
-  }
-  return (await res.json()) as InteractionResponse;
-}
+const keyId = (auth: GeminiAuth) => sha256(auth.key).slice(0, 16);
 
-function extractTextFromSteps(resp: InteractionResponse): string {
-  if (typeof resp.output_text === "string" && resp.output_text.trim()) return resp.output_text;
-  const parts: string[] = [];
-  for (const step of resp.steps ?? []) {
-    if (step.type === "model_output" && Array.isArray(step.content)) {
-      for (const c of step.content) {
-        if (c.type === "text" && c.text) parts.push(c.text);
+async function modelsFor(auth: GeminiAuth, override?: string): Promise<string[]> {
+  let entry = modelCache.get(keyId(auth));
+  if (!entry || Date.now() - entry.at > MODEL_CACHE_TTL_MS) {
+    let list = FALLBACK_MODELS;
+    try {
+      const res = await fetch(`${GEMINI_BASE}/models?pageSize=1000`, {
+        headers: { "x-goog-api-key": auth.key },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.status === 400 || res.status === 401 || res.status === 403) {
+        throw new GeminiError(
+          "bad-key",
+          `Gemini rejected the ${auth.source === "own" ? "personal" : "server"} API key (${res.status})`,
+        );
       }
+      if (res.ok) {
+        const data = (await res.json()) as {
+          models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>;
+        };
+        const ids = (data.models ?? [])
+          .filter((m) => m.supportedGenerationMethods?.includes("generateContent"))
+          .map((m) => String(m.name ?? "").replace(/^models\//, ""))
+          .filter(Boolean);
+        const ranked = rankGeminiModels(ids);
+        if (ranked.length) list = ranked;
+      }
+    } catch (err) {
+      if (err instanceof GeminiError) throw err;
+      /* network problem – use the static fallbacks */
+    }
+    entry = { at: Date.now(), models: list };
+    modelCache.set(keyId(auth), entry);
+  }
+  const preferred = override?.trim();
+  return preferred ? [preferred, ...entry.models.filter((m) => m !== preferred)] : entry.models;
+}
+
+function dropModel(auth: GeminiAuth, model: string) {
+  const entry = modelCache.get(keyId(auth));
+  if (entry) entry.models = entry.models.filter((m) => m !== model);
+}
+
+/** Within one assistant turn we stay on the key+model that answered first (thought signatures are model-bound). */
+interface GeminiSession {
+  auth?: GeminiAuth;
+  model?: string;
+}
+
+/**
+ * Calls generateContent, falling back across models (unknown model, quota, overload) and
+ * keys (rejected personal key -> shared server key). Throws a GeminiError with the reason.
+ */
+async function geminiGenerate(
+  user: UserRecord,
+  bodyOrBuild: Record<string, unknown> | ((auth: GeminiAuth) => Promise<Record<string, unknown>>),
+  session: GeminiSession = {},
+): Promise<{ response: GeminiResponse; model: string }> {
+  const auths = geminiAuthCandidates(user);
+  if (auths.length === 0) throw new GeminiError("no-key", "No Gemini API key is configured");
+
+  let lastReason: GeminiFailure = "error";
+  let lastMessage = "Gemini did not answer";
+
+  const current = session.auth;
+  const ordered = current ? [current, ...auths.filter((a) => a.key !== current.key)] : auths;
+  for (const auth of ordered) {
+    let models: string[];
+    try {
+      models = await modelsFor(auth, user.settings.ai.model || env.gemini.model);
+    } catch (err) {
+      lastReason = err instanceof GeminiError ? err.reason : "error";
+      lastMessage = (err as Error).message;
+      continue;
+    }
+    if (session.model && current?.key === auth.key) {
+      models = [session.model, ...models.filter((m) => m !== session.model)];
+    }
+    // A request with an uploaded file is built per key (Gemini files belong to the key that uploaded them)
+    let body: Record<string, unknown>;
+    try {
+      body = typeof bodyOrBuild === "function" ? await bodyOrBuild(auth) : bodyOrBuild;
+    } catch (err) {
+      if (!(err instanceof GeminiError)) throw err;
+      lastReason = err.reason;
+      lastMessage = err.message;
+      continue;
+    }
+
+    // Skip models that were overloaded a moment ago (unless every model is cooling down)
+    const now = Date.now();
+    const warm = models.filter((m) => (modelCooldown.get(`${keyId(auth)}|${m}`) ?? 0) <= now);
+    for (const model of (warm.length ? warm : models).slice(0, 5)) {
+      let res: Response;
+      try {
+        res = await fetch(`${GEMINI_BASE}/models/${encodeURIComponent(model)}:generateContent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": auth.key },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(60_000),
+        });
+      } catch (err) {
+        modelCooldown.set(`${keyId(auth)}|${model}`, Date.now() + COOLDOWN_MS);
+        lastReason = "error";
+        lastMessage = `Gemini request failed: ${(err as Error).message}`;
+        continue;
+      }
+      if (res.ok) {
+        session.auth = auth;
+        session.model = model;
+        return { response: (await res.json()) as GeminiResponse, model };
+      }
+
+      const errText = (await res.text()).slice(0, 400);
+      console.warn(`[gemini] ${model} (${auth.source} key) -> ${res.status}: ${errText.replace(/\s+/g, " ").slice(0, 200)}`);
+      if (res.status === 401 || res.status === 403 || /API_KEY_INVALID|API key not valid|PERMISSION_DENIED/i.test(errText)) {
+        lastReason = "bad-key";
+        lastMessage = `Gemini rejected the ${auth.source === "own" ? "personal" : "server"} API key`;
+        break; // try the next key
+      }
+      if (res.status === 404 || /is not found|not supported for generateContent|is not available|no longer available/i.test(errText)) {
+        dropModel(auth, model);
+        lastReason = "error";
+        lastMessage = `Model ${model} is not available`;
+        continue;
+      }
+      if (res.status === 429 || res.status >= 500) {
+        modelCooldown.set(`${keyId(auth)}|${model}`, Date.now() + COOLDOWN_MS);
+        lastReason = res.status === 429 ? "quota" : "error";
+        lastMessage = `Gemini ${model} answered ${res.status}`;
+        continue;
+      }
+      // Any other 400 is a problem with the request itself; another model would reject it too
+      throw new GeminiError("error", `Gemini API (${res.status}): ${errText.slice(0, 240)}`);
     }
   }
-  return parts.join("\n").trim();
+  throw new GeminiError(lastReason, lastMessage);
 }
+
+function textOf(resp: GeminiResponse): string {
+  const parts = resp.candidates?.[0]?.content?.parts ?? [];
+  return parts
+    .filter((p) => typeof p.text === "string" && !p.thought)
+    .map((p) => p.text)
+    .join("")
+    .trim();
+}
+
+function aiUnavailableText(lang: "el" | "en", reason: GeminiFailure, detail?: string): string {
+  const el: Record<GeminiFailure, string> = {
+    "no-key":
+      "Ο βοηθός AI δεν έχει ρυθμιστεί ακόμα σε αυτόν τον server. Πρόσθεσε το δικό σου κλειδί Gemini στις Ρυθμίσεις ή ζήτα από τον διαχειριστή να ορίσει GEMINI_API_KEY.",
+    "bad-key": "Η Google δεν δέχτηκε το κλειδί Gemini. Έλεγξε το κλειδί στις Ρυθμίσεις.",
+    quota: "Το όριο χρήσης του Gemini εξαντλήθηκε προσωρινά. Δοκίμασε ξανά σε λίγο.",
+    empty: "Το Gemini δεν έδωσε απάντηση. Δοκίμασε να το διατυπώσεις λίγο διαφορετικά.",
+    error: "Ο βοηθός AI δεν απάντησε αυτή τη φορά. Δοκίμασε ξανά σε λίγο.",
+  };
+  const en: Record<GeminiFailure, string> = {
+    "no-key":
+      "The AI assistant is not set up on this server yet. Add your own Gemini key in Settings, or ask the admin to set GEMINI_API_KEY.",
+    "bad-key": "Google did not accept the Gemini key. Check the key in Settings.",
+    quota: "The Gemini usage limit was reached for now. Try again in a little while.",
+    empty: "Gemini returned no answer. Try rephrasing the question.",
+    error: "The AI assistant didn't answer this time. Try again shortly.",
+  };
+  const base = (lang === "el" ? el : en)[reason];
+  return reason === "error" && detail ? `${base} (${detail})` : base;
+}
+
+/** Function declarations in the shape generateContent expects (no empty `properties`). */
+const FUNCTION_DECLARATIONS = TOOLS.map(({ name, description, parameters }) =>
+  Object.keys(parameters.properties).length ? { name, description, parameters } : { name, description },
+);
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -582,44 +660,120 @@ function truncateJson(value: unknown, max = 24_000): string {
 const summaryCache = new Map<string, { at: number; summary: string; name: string }>();
 const SUMMARY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-async function callGeminiGenerate(
-  auth: { headers: Record<string, string>; model: string },
-  parts: unknown[],
-  systemInstruction: string,
-): Promise<string> {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(auth.model)}:generateContent`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...auth.headers },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemInstruction }] },
-        contents: [{ role: "user", parts }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
-      }),
-    },
-  );
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Gemini API (${res.status}): ${errText.slice(0, 240)}`);
-  }
-  const data = (await res.json()) as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+/* Gemini file upload, for PDFs too big to send inline (18-50 MB) */
+
+const UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta/files";
+/** Uploaded files live 48 h on Gemini's side; reuse them for a while per key and content. */
+const uploadCache = new Map<string, { uri: string; at: number }>();
+const UPLOAD_REUSE_MS = 36 * 60 * 60 * 1000;
+
+async function uploadToGemini(auth: GeminiAuth, data: Buffer, mimeType: string, displayName: string): Promise<string> {
+  const cacheKey = `${keyId(auth)}|${crypto.createHash("sha256").update(data).digest("hex")}`;
+  const hit = uploadCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < UPLOAD_REUSE_MS) return hit.uri;
+
+  const fail = (status: number, what: string): never => {
+    throw new GeminiError(
+      status === 401 || status === 403 ? "bad-key" : status === 429 ? "quota" : "error",
+      `Gemini file upload ${what} (${status})`,
+    );
   };
-  const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("").trim();
-  if (!text) throw new Error("Gemini returned an empty answer");
-  return text;
+  const start = await fetch(UPLOAD_BASE, {
+    method: "POST",
+    headers: {
+      "x-goog-api-key": auth.key,
+      "X-Goog-Upload-Protocol": "resumable",
+      "X-Goog-Upload-Command": "start",
+      "X-Goog-Upload-Header-Content-Length": String(data.length),
+      "X-Goog-Upload-Header-Content-Type": mimeType,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ file: { display_name: displayName.slice(0, 120) } }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const uploadUrl = start.headers.get("x-goog-upload-url");
+  if (!start.ok || !uploadUrl) fail(start.status, "could not start");
+  const done = await fetch(uploadUrl!, {
+    method: "POST",
+    headers: { "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize" },
+    body: new Uint8Array(data),
+    signal: AbortSignal.timeout(180_000),
+  });
+  if (!done.ok) fail(done.status, "failed");
+  let file = ((await done.json()) as { file?: { name?: string; uri?: string; state?: string } }).file;
+  // PDFs are usually ready at once; wait up to a minute while Gemini processes larger ones
+  for (let i = 0; file?.state === "PROCESSING" && i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const res = await fetch(`${GEMINI_BASE}/${file.name}`, { headers: { "x-goog-api-key": auth.key } });
+    if (res.ok) file = (await res.json()) as typeof file;
+  }
+  if (!file?.uri || file.state === "FAILED") throw new GeminiError("error", "Gemini could not process the uploaded file");
+  uploadCache.set(cacheKey, { uri: file.uri, at: Date.now() });
+  return file.uri;
+}
+
+/**
+ * Downloads one course file and returns how to send it to Gemini: inline (PDF/image under
+ * 18 MB), uploaded first (bigger PDFs), or as extracted text. Built per key because uploads are.
+ */
+async function documentParts(
+  user: UserRecord,
+  courseCode: string,
+  path: string,
+  instruction: (filename: string) => string,
+): Promise<{ name: string; parts: (auth: GeminiAuth) => Promise<GeminiPart[]> }> {
+  const connector = getConnectorForUser(user);
+  const file = await connector.downloadFile(courseCode, path);
+  const data = Buffer.isBuffer(file.body) ? file.body : Buffer.from(await streamToBuffer(file.body));
+  const prepared = prepareDocumentForAi(file.filename, file.contentType, data, user.settings.language);
+  if (prepared.kind === "unsupported") throw new Error(prepared.reason);
+  const text = instruction(file.filename);
+  if (prepared.kind === "upload") {
+    return {
+      name: file.filename,
+      parts: async (auth) => [
+        {
+          fileData: {
+            mimeType: prepared.mimeType,
+            fileUri: await uploadToGemini(auth, prepared.data, prepared.mimeType, file.filename),
+          },
+        },
+        { text },
+      ],
+    };
+  }
+  const parts: GeminiPart[] =
+    prepared.kind === "inline"
+      ? [{ inlineData: { mimeType: prepared.mimeType, data: prepared.data.toString("base64") } }, { text }]
+      : [{ text: `${text}\n\n----- DOCUMENT TEXT -----\n${prepared.text || "(the file contains no extractable text)"}` }];
+  return { name: file.filename, parts: async () => parts };
+}
+
+/** Gemini answered 400 about the request itself: for a file this means it could not read it. */
+function documentErrorText(lang: "el" | "en", err: GeminiError): string {
+  if (/token count exceeds/i.test(err.message)) {
+    return lang === "el"
+      ? "Το αρχείο είναι πολύ μεγάλο για το AI (πάρα πολλές σελίδες). Δοκίμασε ένα μικρότερο αρχείο του μαθήματος."
+      : "The file is too long for the AI (too many pages). Try a smaller file from the course.";
+  }
+  if (err.reason === "error" && /\(400\)/.test(err.message)) {
+    return lang === "el"
+      ? "Το AI δεν μπόρεσε να διαβάσει αυτό το αρχείο (ίσως είναι κατεστραμμένο ή προστατευμένο)."
+      : "The AI couldn't read this file (it may be damaged or protected).";
+  }
+  return aiUnavailableText(lang, err.reason);
 }
 
 /**
  * Summarizes (or answers `question` about) one document of a course. Used by the
  * "AI summary" button in Documents and by the assistant's `read_document` tool.
+ * `countQuota` is set for the button; inside a chat turn the turn itself was counted.
  */
 export async function summarizeCourseDocument(
   user: UserRecord,
   courseCode: string,
   path: string,
-  opts: { question?: string; refresh?: boolean } = {},
+  opts: { question?: string; refresh?: boolean; countQuota?: boolean } = {},
 ): Promise<{ name: string; summary: string; cached: boolean }> {
   const lang = user.settings.language;
   const cacheKey = `${user.id}|${courseCode}|${path}|${lang}`;
@@ -628,20 +782,8 @@ export async function summarizeCourseDocument(
     if (hit && Date.now() - hit.at < SUMMARY_TTL_MS) return { name: hit.name, summary: hit.summary, cached: true };
   }
 
-  const auth = await resolveGeminiAuth(user);
-  if (!auth) {
-    throw new Error(
-      lang === "el"
-        ? "Η σύνοψη με AI χρειάζεται σύνδεση με Gemini (Ρυθμίσεις → Βοηθός AI)."
-        : "AI summaries need a Gemini connection (Settings → AI assistant).",
-    );
-  }
-
-  const connector = getConnectorForUser(user);
-  const file = await connector.downloadFile(courseCode, path);
-  const data = Buffer.isBuffer(file.body) ? file.body : Buffer.from(await streamToBuffer(file.body));
-  const prepared = prepareDocumentForAi(file.filename, file.contentType, data);
-  if (prepared.kind === "unsupported") throw new Error(prepared.reason);
+  if (geminiAuthCandidates(user).length === 0) throw new Error(aiUnavailableText(lang, "no-key"));
+  const stamp = opts.countQuota ? consumeAiQuota(user) : null;
 
   const languageName = lang === "el" ? "Greek" : "English";
   const system = opts.question
@@ -654,18 +796,296 @@ export async function summarizeCourseDocument(
       `requirements, deadlines, submission format and grading weight exactly as written. Keep formulas readable in plain text (no LaTeX). ` +
       `No headings, no preamble, no closing remarks. Max ~250 words.`;
 
-  const instruction = opts.question
-    ? `Document: "${file.filename}". Question: ${opts.question}`
-    : `Summarize the document "${file.filename}".`;
+  let raw: string;
+  let name: string;
+  try {
+    const doc = await documentParts(user, courseCode, path, (filename) =>
+      opts.question ? `Document: "${filename}". Question: ${opts.question}` : `Summarize the document "${filename}".`,
+    );
+    name = doc.name;
+    const { response } = await geminiGenerate(user, async (auth) => ({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [{ role: "user", parts: await doc.parts(auth) }],
+      generationConfig: { temperature: 0.2, maxOutputTokens: 8192 },
+    }));
+    raw = textOf(response);
+  } catch (err) {
+    refundAiQuota(user, stamp);
+    if (!(err instanceof GeminiError)) throw err;
+    throw new Error(documentErrorText(lang, err));
+  }
+  if (!raw) {
+    refundAiQuota(user, stamp);
+    throw new Error(aiUnavailableText(lang, "empty"));
+  }
+  const summary = cleanReadableAssistantText(raw);
+  if (!opts.question) summaryCache.set(cacheKey, { at: Date.now(), summary, name });
+  return { name, summary, cached: false };
+}
 
-  const parts =
-    prepared.kind === "inline"
-      ? [{ inlineData: { mimeType: prepared.mimeType, data: prepared.data.toString("base64") } }, { text: instruction }]
-      : [{ text: `${instruction}\n\n----- DOCUMENT TEXT -----\n${prepared.text || "(the file contains no extractable text)"}` }];
+/* ------------------------------------------------------------------ */
+/* Study material: flashcards, quiz, exam-style questions              */
+/* ------------------------------------------------------------------ */
 
-  const summary = cleanReadableAssistantText(await callGeminiGenerate(auth, parts, system));
-  if (!opts.question) summaryCache.set(cacheKey, { at: Date.now(), summary, name: file.filename });
-  return { name: file.filename, summary, cached: false };
+const studyCache = new Map<string, { at: number; material: StudyMaterial }>();
+
+/** Pulls the first JSON object/array out of a model answer (tolerates ```json fences and stray text). */
+export function parseJsonLoose(raw: string): unknown {
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.search(/[[{]/);
+    const end = Math.max(cleaned.lastIndexOf("}"), cleaned.lastIndexOf("]"));
+    if (start < 0 || end <= start) throw new Error("No JSON in the answer");
+    return JSON.parse(cleaned.slice(start, end + 1));
+  }
+}
+
+const clip = (v: unknown, max: number) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+
+/** Validates and trims what the model returned into the shape the app renders. */
+export function normalizeStudyMaterial(kind: StudyKind, name: string, data: unknown): StudyMaterial {
+  const obj = (data && typeof data === "object" ? data : {}) as Record<string, unknown>;
+  const list = (key: string): Record<string, unknown>[] => {
+    const v = Array.isArray(data) ? data : obj[key];
+    return Array.isArray(v) ? v.filter((x): x is Record<string, unknown> => !!x && typeof x === "object") : [];
+  };
+  if (kind === "flashcards") {
+    const cards: Flashcard[] = list("cards")
+      .map((c) => ({ front: clip(c.front, 300), back: clip(c.back, 800) }))
+      .filter((c) => c.front && c.back)
+      .slice(0, 20);
+    if (!cards.length) throw new Error("No flashcards in the answer");
+    return { kind, name, cards };
+  }
+  if (kind === "quiz") {
+    const questions: QuizQuestion[] = list("questions")
+      .map((q) => ({
+        question: clip(q.question, 600),
+        options: Array.isArray(q.options) ? q.options.map((o) => clip(o, 300)).filter(Boolean).slice(0, 5) : [],
+        answer: Number(q.answer),
+        explanation: clip(q.explanation, 600),
+      }))
+      .filter((q) => q.question && q.options.length >= 2 && Number.isInteger(q.answer) && q.answer >= 0 && q.answer < q.options.length)
+      .slice(0, 15);
+    if (!questions.length) throw new Error("No quiz questions in the answer");
+    return { kind, name, questions };
+  }
+  const questions: ExamQuestion[] = list("questions")
+    .map((q) => ({
+      question: clip(q.question, 1200),
+      points: Math.max(0, Math.round(Number(q.points) || 0)),
+      modelAnswer: clip(q.modelAnswer, 3000),
+    }))
+    .filter((q) => q.question && q.modelAnswer)
+    .slice(0, 8);
+  if (!questions.length) throw new Error("No exam questions in the answer");
+  return { kind, name, questions };
+}
+
+const STUDY_PROMPTS: Record<StudyKind, string> = {
+  flashcards:
+    "Make 12 flashcards covering the most important definitions, concepts, formulas and results of the document. " +
+    'Return JSON: {"cards":[{"front":"short question or term","back":"concise answer, max 2 sentences"}]}.',
+  quiz:
+    "Make an 8-question multiple-choice quiz that checks real understanding of the document (not trivia about the file). " +
+    "Each question has 4 options, exactly one correct, with plausible distractors. Vary the position of the correct option. " +
+    'Return JSON: {"questions":[{"question":"...","options":["...","...","...","..."],"answer":0,"explanation":"why the answer is right, 1-2 sentences"}]} ' +
+    'where "answer" is the 0-based index of the correct option.',
+  exam:
+    "Make 5 exam-style practice questions like a university professor would set on this material: a mix of definitions/theory, " +
+    "a worked problem or exercise if the material allows, and one question that connects ideas. Give each a point value so the set totals 100, " +
+    "and a model answer a grader would accept (step by step for problems). " +
+    'Return JSON: {"questions":[{"question":"...","points":20,"modelAnswer":"..."}]}.',
+};
+
+export async function generateStudyMaterial(
+  user: UserRecord,
+  courseCode: string,
+  path: string,
+  kind: StudyKind,
+  opts: { refresh?: boolean } = {},
+): Promise<StudyMaterial> {
+  const lang = user.settings.language;
+  const cacheKey = `${user.id}|${courseCode}|${path}|${kind}|${lang}`;
+  if (!opts.refresh) {
+    const hit = studyCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < SUMMARY_TTL_MS) return { ...hit.material, cached: true };
+  }
+  if (geminiAuthCandidates(user).length === 0) throw new Error(aiUnavailableText(lang, "no-key"));
+  const stamp = consumeAiQuota(user);
+
+  const system =
+    `You create study material for a university student from their course file. Write all text in ${lang === "el" ? "Greek" : "English"} ` +
+    "(keep technical terms, code and formulas as in the document). Use ONLY what the document teaches. " +
+    "Formulas in readable plain text (no LaTeX). Answer with JSON only, no prose around it.";
+  try {
+    const doc = await documentParts(user, courseCode, path, (filename) => `Document: "${filename}". ${STUDY_PROMPTS[kind]}`);
+    const { response } = await geminiGenerate(user, async (auth) => ({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [{ role: "user", parts: await doc.parts(auth) }],
+      generationConfig: { temperature: 0.4, maxOutputTokens: 8192, responseMimeType: "application/json" },
+    }));
+    const raw = textOf(response);
+    if (!raw) throw new GeminiError("empty", "Empty answer");
+    const material = normalizeStudyMaterial(kind, doc.name, parseJsonLoose(raw));
+    studyCache.set(cacheKey, { at: Date.now(), material });
+    return material;
+  } catch (err) {
+    refundAiQuota(user, stamp);
+    if (err instanceof GeminiError) throw new Error(documentErrorText(lang, err));
+    if (err instanceof SyntaxError || /JSON|^No (flashcards|quiz|exam)/.test((err as Error).message)) {
+      throw new Error(
+        lang === "el"
+          ? "Το AI δεν επέστρεψε σωστό σετ αυτή τη φορά. Δοκίμασε ξανά."
+          : "The AI didn't return a usable set this time. Try again.",
+      );
+    }
+    throw err;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Announcement triage: "action needed" vs "FYI"                       */
+/* ------------------------------------------------------------------ */
+
+const ACTION_PATTERNS = [
+  /προθεσμ/i,
+  /υποβολ|υποβάλ/i,
+  /παράδοσ|παραδοτ/i,
+  /δήλωσ|δηλώσ/i,
+  /εγγραφ/i,
+  /υποχρεωτικ/i,
+  /να (?:φέρετε|στείλετε|συμπληρώσετε|δηλώσετε|ανεβάσετε|εγγραφείτε|παρουσιαστείτε)/i,
+  /\bdeadline\b/i,
+  /\bsubmi(?:t|ssion)\b/i,
+  /\bdue\b/i,
+  /\bregist(?:er|ration)\b/i,
+  /\bmandatory\b/i,
+  /\bsign[ -]?up\b/i,
+  // Changes to when or where class happens
+  /αλλαγ[ήη] (?:αίθουσας|ώρας|ημερομηνίας)/i,
+  /ακύρωσ|ακυρών|ακυρώ/i,
+  /αναβολ|αναβάλλ/i,
+  /\bcancell?ed\b/i,
+  /\brescheduled?\b/i,
+  /\broom change\b/i,
+];
+
+/** Keyword fallback when the AI is unavailable: deadlines, submissions, registrations, or a class moved/cancelled. */
+export function heuristicTriage(a: Pick<Announcement, "title" | "contentText">): AnnouncementTriage {
+  const text = `${a.title}\n${a.contentText}`;
+  return { label: ACTION_PATTERNS.some((r) => r.test(text)) ? "action" : "fyi" };
+}
+
+const TRIAGE_BATCH = 40;
+const TRIAGE_KEEP = 600;
+/** After a failed AI triage call, keywords answer for a while before Gemini is asked again. */
+const TRIAGE_RETRY_MS = 10 * 60 * 1000;
+const triageRetryAt = new Map<string, number>();
+const triageInFlight = new Map<string, Promise<unknown>>();
+
+/**
+ * Classifies announcements once each (results are kept on the user record). New ones go to
+ * Gemini in one batched call (title + the start of the text, ~150 tokens each); without a key,
+ * or if the call fails, keywords decide for now and the AI gets another go later.
+ * Background work: not counted against the student's hourly quota.
+ */
+export async function triageAnnouncements(
+  user: UserRecord,
+  announcements: Announcement[],
+): Promise<Record<string, AnnouncementTriage>> {
+  const known = user.triage ?? {};
+  const out: Record<string, AnnouncementTriage> = {};
+  const fresh: Announcement[] = [];
+  for (const a of announcements) {
+    const hit = known[a.id];
+    if (hit) out[a.id] = hit.reason ? { label: hit.label, reason: hit.reason } : { label: hit.label };
+    else fresh.push(a);
+  }
+  if (!fresh.length) return out;
+
+  // One AI call per student at a time: a second caller waits, then reuses what the first stored
+  const running = triageInFlight.get(user.id);
+  if (running) {
+    await running.catch(() => undefined);
+    return triageAnnouncements(users.get(user.id) ?? user, announcements);
+  }
+  const job = triageFresh(user, fresh, out);
+  triageInFlight.set(user.id, job);
+  try {
+    return await job;
+  } finally {
+    triageInFlight.delete(user.id);
+  }
+}
+
+async function triageFresh(
+  user: UserRecord,
+  fresh: Announcement[],
+  out: Record<string, AnnouncementTriage>,
+): Promise<Record<string, AnnouncementTriage>> {
+  // Newest first, so the ones on screen are classified by the AI
+  const batch = [...fresh].sort((x, y) => y.date.localeCompare(x.date)).slice(0, TRIAGE_BATCH);
+  const fromAi: Record<string, AnnouncementTriage> = {};
+  if (geminiAuthCandidates(user).length > 0 && (triageRetryAt.get(user.id) ?? 0) <= Date.now()) {
+    const lang = user.settings.language;
+    const items = batch.map((a, i) => ({
+      i,
+      course: a.courseTitle ?? a.courseCode,
+      date: a.date.slice(0, 10),
+      title: a.title.slice(0, 200),
+      text: a.contentText.replace(/\s+/g, " ").slice(0, 500),
+    }));
+    try {
+      const { response } = await geminiGenerate(user, {
+        systemInstruction: {
+          parts: [
+            {
+              text:
+                `You sort university course announcements for a student. Today is ${new Date().toISOString().slice(0, 10)}. ` +
+                '"action" = the student must do something or change plans: submit or upload work, register or declare something, a deadline, ' +
+                "bring or prepare something, attend a mandatory, moved or cancelled session, an exam date or room, reply to the professor. " +
+                '"fyi" = information only: material uploaded, grades posted with nothing to do, general news, greetings. ' +
+                `For "action" add "reason": what to do and by when, max 6 words, in ${lang === "el" ? "Greek" : "English"} ` +
+                `(e.g. "${lang === "el" ? "Υποβολή εργασίας έως 25/11" : "Submit project by 25/11"}"). ` +
+                'Answer with JSON only: {"items":[{"i":0,"label":"action","reason":"..."},{"i":1,"label":"fyi"}]}.',
+            },
+          ],
+        },
+        contents: [{ role: "user", parts: [{ text: JSON.stringify(items) }] }],
+        generationConfig: { temperature: 0, maxOutputTokens: 4096, responseMimeType: "application/json" },
+      });
+      const parsed = parseJsonLoose(textOf(response)) as { items?: Array<{ i?: number; label?: string; reason?: string }> };
+      for (const r of parsed.items ?? []) {
+        const a = typeof r.i === "number" ? batch[r.i] : undefined;
+        if (!a || (r.label !== "action" && r.label !== "fyi")) continue;
+        const reason = r.label === "action" && typeof r.reason === "string" ? r.reason.trim().slice(0, 60) : "";
+        fromAi[a.id] = reason ? { label: r.label, reason } : { label: r.label };
+      }
+    } catch (err) {
+      triageRetryAt.set(user.id, Date.now() + TRIAGE_RETRY_MS);
+      console.warn("[triage] Gemini failed, using keywords for now:", (err as Error).message);
+    }
+  }
+
+  users.update(user.id, (u) => {
+    const map = (u.triage ??= {});
+    const now = Date.now();
+    for (const [id, t] of Object.entries(fromAi)) map[id] = { ...t, at: now };
+    // Without any AI key the keywords are the final answer
+    if (geminiAuthCandidates(user).length === 0) {
+      for (const a of batch) map[a.id] ??= { ...heuristicTriage(a), at: now };
+    }
+    const ids = Object.keys(map);
+    if (ids.length > TRIAGE_KEEP) {
+      ids.sort((x, y) => map[x].at - map[y].at);
+      for (const id of ids.slice(0, ids.length - TRIAGE_KEEP)) delete map[id];
+    }
+  });
+  for (const a of fresh) out[a.id] = fromAi[a.id] ?? heuristicTriage(a);
+  return out;
 }
 
 async function streamToBuffer(stream: AsyncIterable<Uint8Array> | NodeJS.ReadableStream): Promise<Buffer> {
@@ -680,8 +1100,7 @@ async function streamToBuffer(stream: AsyncIterable<Uint8Array> | NodeJS.Readabl
 
 async function buildSystemInstruction(user: UserRecord): Promise<string> {
   const acadYear = getCurrentAcademicYearBounds();
-  const uni = getUniversity(user.universityId);
-  const uniName = uni ? `${uni.nameEn} (${uni.name})` : "a Greek university";
+  const dept = UNIPI_DEPARTMENTS.find((d) => d.id === userDepartmentId(user));
   const now = formatAthens(new Date(), "en");
 
   let courseLines = "(could not load the course list – call list_courses)";
@@ -705,18 +1124,19 @@ async function buildSystemInstruction(user: UserRecord): Promise<string> {
   }
 
   return [
-    `You are myClass, the study assistant inside an app that brings a student's Open eClass at ${uniName} into one place.`,
+    "You are myClass, the study assistant inside an app that brings a University of Piraeus (Πανεπιστήμιο Πειραιώς) student's Open eClass into one place.",
     "",
     "CONTEXT",
     `- Now: ${now} (Europe/Athens). Academic year ${acadYear.label}.`,
-    `- Student: ${user.displayName} (username ${user.username}).`,
+    `- Student: ${user.displayName} (username ${user.username})${dept ? `, ${dept.nameEn} / ${dept.name} (department id ${dept.id})` : ""}.`,
+    "- eClass portals: eclass.unipi.gr (all departments), thales.cs.unipi.gr (Informatics), aristarchus.ds.unipi.gr (Digital Systems undergraduate) and lefkippos.ds.unipi.gr (Digital Systems MSc).",
     "- Enrolled courses (code — title — professor — semester):",
     courseLines,
     "- The app has: Home (calendar with all deadlines), Courses (documents with an 'AI summary' button, announcements, assignments with file upload/submission, every other eClass tool), Messages, Assistant (you), Settings.",
     "",
     "HOW TO WORK",
     "- Get facts with tools. Never invent courses, dates, grades, files, rooms or professors. If a tool returns nothing or fails, say so in one sentence and suggest the next step.",
-    "- Match course names loosely: Greek or English, with/without accents, abbreviations and nicknames (e.g. 'ΒΔ' = Βάσεις Δεδομένων, 'OOP' = Αντικειμενοστρεφής Προγραμματισμός). Prefer the enrolled list above; use search_catalog only for courses not in it.",
+    "- Match course names loosely: Greek or English, with/without accents, abbreviations and nicknames (e.g. 'ΒΔ' = Βάσεις Δεδομένων, 'OOP' = Αντικειμενοστρεφής Προγραμματισμός). Prefer the enrolled list above; use search_catalog only for courses not in it (pass departmentId for another department).",
     "- Deadlines / 'what do I have this week': call get_deadlines (optionally with courseCode). Show upcoming, unsubmitted items first, sorted by date, with days left. Mention overdue or already-submitted items only if relevant.",
     "- Questions about what a file, lecture, exercise sheet or project brief says: call list_documents for the course (open sub-folders if needed), pick the best-matching file, then call read_document with the student's question. Answer from that content and name the file you used.",
     "- Assignment questions ('what does project 2 ask', 'can I still submit'): get_deadlines, then get_assignment_details.",
@@ -724,11 +1144,12 @@ async function buildSystemInstruction(user: UserRecord): Promise<string> {
     "- Uploading/submitting work is done in the app (Courses → course → Assignments → Submit); you cannot attach files yourself, but you can check requirements and status.",
     "- If a request is ambiguous (e.g. two courses or files match), ask ONE short question that lists the options. If it's clear, act without asking.",
     "- Only use items from the current academic year unless the student explicitly asks about older ones.",
+    "- Overviews ('what's new', 'what do I have today', 'summarize my week'): combine get_announcements, get_deadlines and get_messages as needed.",
     "- For general study help (explain a concept, make a study plan, quiz me), answer directly from your knowledge; use course files when the student refers to their course material.",
     "",
     "STYLE",
     "- Reply in the student's language (Greek or English) and match their tone. Be concise: answer first, details after. No filler, no repeating the question.",
-    "- Plain text, short paragraphs, '• ' bullets. Use **bold** only for key names, dates and numbers. No headings, tables, LaTeX or code blocks (unless the student asks for code).",
+    "- Plain text, short paragraphs, '• ' bullets. Use **bold** only for key names, dates and numbers. No headings, tables, emojis, LaTeX or code blocks (unless the student asks for code).",
     "- Dates like 'Παρ 21 Νοε, 23:59' in Greek or 'Fri 21 Nov, 23:59' in English. Times are Europe/Athens.",
   ].join("\n");
 }
@@ -742,6 +1163,15 @@ export async function runAssistantTurn(
   userMessageText: string,
   emit: (ev: ChatStreamEvent) => void,
 ): Promise<ChatMessage> {
+  const lang = user.settings.language;
+  // Earlier turns as plain text (tool calls/results stay inside the turn that made them).
+  // The last five exchanges are enough context and keep every request's input small.
+  const priorTurns: GeminiContent[] = user.chat.messages
+    .filter((m) => m.text.trim())
+    .slice(-10)
+    .map((m) => ({ role: m.role === "user" ? "user" : "model", parts: [{ text: m.text }] }));
+  while (priorTurns.length && priorTurns[0].role !== "user") priorTurns.shift();
+
   const userMsg: ChatMessage = {
     id: randomId(8),
     role: "user",
@@ -755,119 +1185,100 @@ export async function runAssistantTurn(
   const toolsUsed: string[] = [];
   let pendingAction: PendingAction | undefined;
   let finalText = "";
+  let stamp: number | null = null;
 
-  const auth = await resolveGeminiAuth(user);
-  const lang = user.settings.language;
+  try {
+    // Limit on the shared key; throws AiQuotaError (answered below without calling Gemini)
+    stamp = consumeAiQuota(user);
+    const systemInstruction = await buildSystemInstruction(user);
+    const contents: GeminiContent[] = [...priorTurns, { role: "user", parts: [{ text: userMessageText }] }];
+    const session: GeminiSession = {};
 
-  if (auth) {
-    try {
-      const systemInstruction = await buildSystemInstruction(user);
+    const MAX_ROUNDS = 8;
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      const lastRound = round === MAX_ROUNDS - 1;
+      const { response } = await geminiGenerate(
+        user,
+        {
+          systemInstruction: { parts: [{ text: systemInstruction }] },
+          contents,
+          tools: [{ functionDeclarations: FUNCTION_DECLARATIONS }],
+          toolConfig: { functionCallingConfig: { mode: lastRound ? "NONE" : "AUTO" } },
+          generationConfig: { temperature: 0.4 },
+        },
+        session,
+      );
 
-      // Persisted history holds ONLY plain text turns. Tool calls/results stay inside one turn:
-      // replaying a function_result whose function_call was cut off by the history window made
-      // Gemini reject the request, which silently dropped the chat to the keyword-only fallback.
-      const priorTurns = (user.chat.history as Array<{ type?: string }>)
-        .filter((s) => s && (s.type === "user_input" || s.type === "model_output"))
-        .slice(-20);
-      while (priorTurns.length && priorTurns[0].type !== "user_input") priorTurns.shift();
+      const parts = response.candidates?.[0]?.content?.parts ?? [];
+      const calls = parts.filter((p) => p.functionCall?.name);
+      // Keep the model turn verbatim (it carries thought signatures the next call needs)
+      if (parts.length) contents.push({ role: "model", parts });
 
-      const history: unknown[] = [
-        ...priorTurns,
-        { type: "user_input", content: [{ type: "text", text: userMessageText }] },
-      ];
+      if (calls.length === 0) {
+        finalText = textOf(response);
+        break;
+      }
 
-      const MAX_ROUNDS = 6;
-      for (let round = 0; round < MAX_ROUNDS; round++) {
-        const lastRound = round === MAX_ROUNDS - 1;
-        const resp = await callGeminiInteractions(auth.headers, auth.model, history, systemInstruction, !lastRound);
-        const steps = resp.steps ?? [];
-        history.push(...steps);
+      const results: GeminiPart[] = [];
+      for (const part of calls) {
+        const fc = part.functionCall!;
+        const args = fc.args ?? {};
+        toolsUsed.push(fc.name);
+        emit({ type: "tool", name: fc.name });
 
-        const fcSteps = steps.filter((s) => s.type === "function_call" && s.name);
-        if (fcSteps.length === 0 || lastRound) {
-          finalText = extractTextFromSteps(resp);
-          break;
-        }
-
-        let hitMutating = false;
-        for (const fc of fcSteps) {
-          const toolName = fc.name!;
-          const args = fc.arguments ?? {};
-          toolsUsed.push(toolName);
-          emit({ type: "tool", name: toolName });
-
-          if (MUTATING_TOOLS.has(toolName)) {
-            pendingAction = {
-              id: randomId(8),
-              tool: toolName,
-              args,
-              summary: describePendingAction(toolName, args, lang),
-              status: "pending",
-            };
-            emit({ type: "action", action: pendingAction });
-            users.update(user.id, (u) => {
-              u.chat.pending[pendingAction!.id] = {
-                action: pendingAction!,
-                callId: fc.id ?? pendingAction!.id,
-              };
-            });
-            hitMutating = true;
-            break;
-          }
-
-          let toolResult: unknown;
-          try {
-            toolResult = await runReadOnlyTool(user, toolName, args);
-          } catch (toolErr) {
-            // Let the model explain the failure instead of aborting the whole answer
-            toolResult = { error: (toolErr as Error).message || "Tool failed" };
-          }
-          history.push({
-            type: "function_result",
-            name: toolName,
-            call_id: fc.id,
-            result: [{ type: "text", text: truncateJson(toolResult) }],
+        if (MUTATING_TOOLS.has(fc.name)) {
+          const action: PendingAction = {
+            id: randomId(8),
+            tool: fc.name,
+            args,
+            summary: describePendingAction(fc.name, args, lang),
+            status: "pending",
+          };
+          pendingAction = action;
+          emit({ type: "action", action });
+          users.update(user.id, (u) => {
+            u.chat.pending[action.id] = { action, callId: fc.id ?? action.id };
           });
-        }
-
-        if (hitMutating) {
-          finalText =
-            extractTextFromSteps(resp) ||
-            (lang === "el"
-              ? `Ετοίμασα την ενέργεια: **${pendingAction?.summary}**. Πάτησε **Επιβεβαίωση** παρακάτω για να εκτελεστεί.`
-              : `I prepared the action: **${pendingAction?.summary}**. Click **Confirm** below to run it.`);
           break;
         }
+
+        let toolResult: unknown;
+        try {
+          toolResult = await runReadOnlyTool(user, fc.name, args);
+        } catch (toolErr) {
+          // Let the model explain the failure instead of aborting the whole answer
+          toolResult = { error: (toolErr as Error).message || "Tool failed" };
+        }
+        results.push({
+          functionResponse: {
+            ...(fc.id ? { id: fc.id } : {}),
+            name: fc.name,
+            response: { content: truncateJson(toolResult) },
+          },
+        });
       }
 
-      if (!finalText.trim() && !pendingAction) {
+      if (pendingAction) {
         finalText =
-          lang === "el"
-            ? "Δεν κατάφερα να ολοκληρώσω την απάντηση. Μπορείς να το ρωτήσεις λίγο πιο συγκεκριμένα (π.χ. με το όνομα του μαθήματος);"
-            : "I couldn't complete that answer. Could you ask a bit more specifically (e.g. with the course name)?";
+          textOf(response) ||
+          (lang === "el"
+            ? `Ετοίμασα την ενέργεια: **${pendingAction.summary}**. Πάτησε **Επιβεβαίωση** για να εκτελεστεί.`
+            : `I prepared the action: **${pendingAction.summary}**. Click **Confirm** to run it.`);
+        break;
       }
-
-      users.update(user.id, (u) => {
-        u.chat.history = [
-          ...priorTurns,
-          { type: "user_input", content: [{ type: "text", text: userMessageText }] },
-          { type: "model_output", content: [{ type: "text", text: finalText }] },
-        ].slice(-20);
-      });
-    } catch (err) {
-      console.warn("[assistant] Gemini failed, using offline assistant:", (err as Error).message);
-      const fallback = await runLocalSmartAssistant(user, userMessageText, toolsUsed, emit);
-      const note =
-        lang === "el"
-          ? "(Το Gemini δεν απάντησε αυτή τη φορά, οπότε απαντώ με τον απλό βοηθό χωρίς AI.)\n\n"
-          : "(Gemini didn't respond this time, so this answer comes from the basic offline assistant.)\n\n";
-      finalText = note + fallback.text;
-      pendingAction = fallback.action;
+      contents.push({ role: "user", parts: results });
     }
-  } else {
-    const fallback = await runLocalSmartAssistant(user, userMessageText, toolsUsed, emit);
-    finalText = fallback.text;
-    pendingAction = fallback.action;
+
+    if (!finalText.trim() && !pendingAction) finalText = aiUnavailableText(lang, "empty");
+  } catch (err) {
+    if (err instanceof AiQuotaError) {
+      finalText = err.message;
+    } else {
+      console.warn("[assistant] Gemini failed:", (err as Error).message);
+      // A turn Gemini never answered does not count against the hour
+      if (!toolsUsed.length) refundAiQuota(user, stamp);
+      finalText = aiUnavailableText(lang, err instanceof GeminiError ? err.reason : "error", (err as Error).message);
+    }
   }
 
   finalText = cleanReadableAssistantText(finalText);
@@ -884,6 +1295,7 @@ export async function runAssistantTurn(
 
   users.update(user.id, (u) => {
     u.chat.messages.push(assistantMsg);
+    u.chat.history = [];
   });
 
   emit({ type: "done", message: assistantMsg });
@@ -907,580 +1319,4 @@ function cleanReadableAssistantText(raw: string): string {
     // Strip backticks around course codes/filenames
     .replace(/`([^`\n]+)`/g, "$1")
     .trim();
-}
-
-/* ------------------------------------------------------------------ */
-/* Helpers for matching courses & semesters in natural language        */
-/* ------------------------------------------------------------------ */
-
-function normalizeGreek(str: string): string {
-  return str
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/ς/g, "σ");
-}
-
-function detectSemesterIndexFromPrompt(q: string): number | null {
-  const n = normalizeGreek(q);
-  // Do not confuse "1st project" / "1η εργασία" with "1st semester"
-  const mentionsSemesterContext = /(εξαμην|semester|\bsem\b)/i.test(n);
-  if (/α_εξαμηνο|α'\s*εξαμην|α΄\s*εξαμην|α\s+εξαμην/.test(n)) return 1;
-  if (/β_εξαμηνο|β'\s*εξαμην|β΄\s*εξαμην|β\s+εξαμην/.test(n)) return 2;
-  if (/γ_εξαμηνο|γ'\s*εξαμην|γ΄\s*εξαμην|γ\s+εξαμην/.test(n)) return 3;
-  if (/δ_εξαμηνο|δ'\s*εξαμην|δ΄\s*εξαμην|δ\s+εξαμην/.test(n)) return 4;
-  if (/ε_εξαμηνο|ε'\s*εξαμην|ε΄\s*εξαμην|ε\s+εξαμην/.test(n)) return 5;
-  if (/στ_εξαμηνο|στ'\s*εξαμην|στ΄\s*εξαμην|στ\s+εξαμην/.test(n)) return 6;
-  if (/ζ_εξαμηνο|ζ'\s*εξαμην|ζ΄\s*εξαμην|ζ\s+εξαμην/.test(n)) return 7;
-  if (/η_εξαμηνο|η'\s*εξαμην|η΄\s*εξαμην|η\s+εξαμην/.test(n)) return 8;
-
-  if (!mentionsSemesterContext) return null;
-  if (/\b(1ο|1ου|πρωτο|1st|sem\s*1|semester\s*1)\b/.test(n)) return 1;
-  if (/\b(2ο|2ου|δευτερο|2nd|sem\s*2|semester\s*2)\b/.test(n)) return 2;
-  if (/\b(3ο|3ου|τριτο|3rd|sem\s*3|semester\s*3)\b/.test(n)) return 3;
-  if (/\b(4ο|4ου|τεταρτο|4th|sem\s*4|semester\s*4)\b/.test(n)) return 4;
-  if (/\b(5ο|5ου|πεμπτο|5th|sem\s*5|semester\s*5)\b/.test(n)) return 5;
-  if (/\b(6ο|6ου|εκτο|6th|sem\s*6|semester\s*6)\b/.test(n)) return 6;
-  if (/\b(7ο|7ου|εβδομο|7th|sem\s*7|semester\s*7)\b/.test(n)) return 7;
-  if (/\b(8ο|8ου|ογδοο|8th|sem\s*8|semester\s*8)\b/.test(n)) return 8;
-  return null;
-}
-
-function detectProjectOrdinalFromPrompt(q: string): number | null {
-  const n = normalizeGreek(q);
-  if (
-    /(?:^|[^a-zα-ω0-9])(1η|1ης|1ο|πρωτη|πρωτης|1st|first)(?:$|[^a-zα-ω0-9])/.test(n) ||
-    /(εργασια|ergasia|project|assignment)\s*[_-]?1(?:$|[^0-9])/.test(n)
-  ) {
-    return 1;
-  }
-  if (
-    /(?:^|[^a-zα-ω0-9])(2η|2ης|2ο|δευτερη|δευτερης|2nd|second)(?:$|[^a-zα-ω0-9])/.test(n) ||
-    /(εργασια|ergasia|project|assignment)\s*[_-]?2(?:$|[^0-9])/.test(n)
-  ) {
-    return 2;
-  }
-  if (
-    /(?:^|[^a-zα-ω0-9])(3η|3ης|3ο|τριτη|τριτης|3rd|third)(?:$|[^a-zα-ω0-9])/.test(n) ||
-    /(εργασια|ergasia|project|assignment)\s*[_-]?3(?:$|[^0-9])/.test(n)
-  ) {
-    return 3;
-  }
-  if (
-    /(?:^|[^a-zα-ω0-9])(4η|4ης|4ο|τεταρτη|4th|fourth)(?:$|[^a-zα-ω0-9])/.test(n) ||
-    /(εργασια|ergasia|project|assignment)\s*[_-]?4(?:$|[^0-9])/.test(n)
-  ) {
-    return 4;
-  }
-  return null;
-}
-
-function matchesProjectOrdinal(text: string, ordinal: number | null, requireExplicit = false): boolean {
-  if (ordinal === null) return true;
-  const n = normalizeGreek(text);
-  // Reject "πτυχιακές εργασίες" (bachelor thesis) or "ιεραρχική ανάλυση εργασιών" (lecture topic)
-  if (/πτυχιακ|ιεραρχικ/i.test(n)) return false;
-
-  for (let k = 1; k <= 5; k++) {
-    if (k === ordinal) continue;
-    const otherRe = new RegExp(
-      `((?:^|[^a-zα-ω0-9])${k}(η|ης|ο)(?:$|[^a-zα-ω0-9])|(εργασια|ergasia|project|γε|ασκηση)\\s*[_-]?${k}(?:$|[^0-9]))`,
-      "i",
-    );
-    if (otherRe.test(n)) return false;
-  }
-
-  if (requireExplicit) {
-    const targetRe = new RegExp(
-      `((?:^|[^a-zα-ω0-9])${ordinal}(η|ης|ο)(?:$|[^a-zα-ω0-9])|(εργασια|ergasia|project|γε|ασκηση)\\s*[_-]?${ordinal}(?:$|[^0-9])|smart_mars)`,
-      "i",
-    );
-    return targetRe.test(n);
-  }
-  return true;
-}
-
-const STOPWORDS_FOR_COURSE_MATCH = new Set([
-  "εργασια",
-  "εργασιες",
-  "εργασιας",
-  "πρωτη",
-  "δευτερη",
-  "τριτη",
-  "προθεσμια",
-  "παραδοση",
-  "μαθημα",
-  "μαθηματα",
-  "project",
-  "projects",
-  "assignment",
-  "assignments",
-  "first",
-  "second",
-  "deadline",
-  "deadlines",
-  "arxeia",
-  "αρχεια",
-  "εγγραφα",
-]);
-
-function findMatchingCatalogCourse(prompt: string, catalog: CatalogCourse[]): CatalogCourse | undefined {
-  const qNorm = normalizeGreek(prompt);
-  // 1. Exact code match
-  for (const c of catalog) {
-    const codeL = c.code.toLowerCase();
-    const pubL = (c.publicCode ?? "").toLowerCase();
-    if (
-      qNorm.includes(codeL) ||
-      (pubL && pubL.length >= 4 && qNorm.includes(normalizeGreek(pubL)))
-    ) {
-      return c;
-    }
-  }
-  // 2. Best title word overlap (ignoring generic query words)
-  let best: { course: CatalogCourse; score: number } | undefined;
-  for (const c of catalog) {
-    const words = normalizeGreek(c.title)
-      .split(/[^a-zα-ω0-9]+/)
-      .filter((w) => w.length >= 4 && !STOPWORDS_FOR_COURSE_MATCH.has(w));
-    let score = 0;
-    for (const w of words) {
-      if (qNorm.includes(w.slice(0, Math.max(4, w.length - 2)))) {
-        score += w.length;
-      }
-    }
-    if (score >= 5 && score > (best?.score ?? 0)) {
-      best = { course: c, score };
-    }
-  }
-  return best?.course;
-}
-
-/* ------------------------------------------------------------------ */
-/* Built-in local assistant (works before a Gemini key is configured)  */
-/* ------------------------------------------------------------------ */
-
-async function runLocalSmartAssistant(
-  user: UserRecord,
-  prompt: string,
-  toolsUsed: string[],
-  emit: (ev: ChatStreamEvent) => void,
-): Promise<{ text: string; action?: PendingAction }> {
-  const q = prompt.toLowerCase();
-  const qNorm = normalizeGreek(prompt);
-  const lang = user.settings.language;
-  const connector = getConnectorForUser(user);
-
-  // 1. Unenroll / remove a course
-  if (/(απεγγραφ|διαγραφ|βγαλ|αφαιρεσ|unenroll|remove|drop|leave)/i.test(qNorm)) {
-    toolsUsed.push("list_courses");
-    emit({ type: "tool", name: "list_courses" });
-    const courses = await connector.listCourses();
-    const match =
-      courses.find(
-        (c) =>
-          qNorm.includes(c.code.toLowerCase()) ||
-          (c.publicCode && qNorm.includes(normalizeGreek(c.publicCode))) ||
-          normalizeGreek(c.title)
-            .split(/\s+/)
-            .some((w) => w.length > 4 && qNorm.includes(w.slice(0, Math.max(4, w.length - 1)))),
-      ) ?? courses[courses.length - 1];
-
-    if (!match) {
-      return {
-        text:
-          lang === "el"
-            ? "Δεν βρέθηκε εγγεγραμμένο μάθημα προς απεγγραφή."
-            : "No enrolled course found to unenroll.",
-      };
-    }
-
-    const targetTitle = `${match.title} (${match.publicCode ?? match.code})`;
-    const action: PendingAction = {
-      id: randomId(8),
-      tool: "unenroll_course",
-      args: { course: match.code },
-      summary: describePendingAction("unenroll_course", { course: targetTitle }, lang),
-      status: "pending",
-    };
-    users.update(user.id, (u) => {
-      u.chat.pending[action.id] = { action, callId: action.id };
-    });
-    emit({ type: "action", action });
-    return {
-      text:
-        lang === "el"
-          ? `Βρήκα το μάθημα **${targetTitle}** (${match.semester ?? ""}). Θέλεις να προχωρήσω σε απεγγραφή από το eClass; Επιβεβαίωσε παρακάτω:`
-          : `I found **${targetTitle}** (${match.semester ?? ""}). Would you like me to remove it from your eClass courses? Please confirm below:`,
-      action,
-    };
-  }
-
-  // 2. Enroll / join a course
-  if (/(εγγραφ|δηλωσ|προσθεσ|μπω|join|enroll|add\s+course|register)/i.test(qNorm)) {
-    toolsUsed.push("search_catalog");
-    emit({ type: "tool", name: "search_catalog" });
-    const catalog = await connector.listCatalog();
-    const available = catalog.filter((c) => !c.enrolled && !c.locked);
-    const match = findMatchingCatalogCourse(prompt, available) ?? findMatchingCatalogCourse(prompt, catalog) ?? available[0];
-
-    if (!match) {
-      return {
-        text:
-          lang === "el"
-            ? "Δεν βρέθηκε διαθέσιμο μάθημα για εγγραφή στον κατάλογο."
-            : "No matching available course found in the catalog.",
-      };
-    }
-
-    const action: PendingAction = {
-      id: randomId(8),
-      tool: "enroll_course",
-      args: { course: match.code },
-      summary: describePendingAction("enroll_course", { course: `${match.title} (${match.code})` }, lang),
-      status: "pending",
-    };
-    users.update(user.id, (u) => {
-      u.chat.pending[action.id] = { action, callId: action.id };
-    });
-    emit({ type: "action", action });
-    return {
-      text:
-        lang === "el"
-          ? `Βρήκα το μάθημα **${match.title}** (\`${match.code}\` · ${match.semester ?? ""} · Διδάσκων: ${match.professor ?? "—"}). Πάτησε **Επιβεβαίωση** για να ολοκληρωθεί η εγγραφή:`
-          : `I found **${match.title}** (\`${match.code}\` · ${match.semester ?? ""} · Prof: ${match.professor ?? "—"}). Click **Confirm** below to complete registration:`,
-      action,
-    };
-  }
-
-  // 3. Projects / Assignments / Deadlines (Current Academic Year ONLY — filters out previous years!)
-  if (/(εργασι|προθεσμι|παραδοσ|project|deadline|assignment|homework|due|παραδοτε)/i.test(qNorm)) {
-    toolsUsed.push("get_deadlines", "get_announcements", "list_documents");
-    emit({ type: "tool", name: "get_deadlines" });
-
-    const acadYear = getCurrentAcademicYearBounds();
-    const ordinal = detectProjectOrdinalFromPrompt(prompt);
-    const catalog = await connector.listCatalog();
-    const specificCourse = findMatchingCatalogCourse(prompt, catalog);
-
-    const [rawAssignments, rawAnnouncements] = await Promise.all([
-      connector.getAssignments(specificCourse?.code),
-      connector.getAnnouncements(specificCourse?.code),
-    ]);
-
-    const assignments = rawAssignments.filter(
-      (a) => !hasPastAcademicYearTag(a.title) && matchesProjectOrdinal(a.title, ordinal),
-    );
-
-    const projectAnnouncements = rawAnnouncements.filter((a) => {
-      const text = `${a.title} ${a.contentText}`;
-      if (hasPastAcademicYearTag(text)) return false;
-      if (/πτυχιακ/i.test(normalizeGreek(a.title))) return false;
-      if (!/(εργασι|project|παραδοσ|assignment)/i.test(normalizeGreek(text))) return false;
-      return matchesProjectOrdinal(a.title, ordinal, ordinal !== null);
-    });
-
-    const targetCourseCodes = new Set<string>();
-    if (specificCourse) {
-      targetCourseCodes.add(specificCourse.code);
-    } else {
-      for (const a of assignments) targetCourseCodes.add(a.courseCode);
-      for (const ann of projectAnnouncements) targetCourseCodes.add(ann.courseCode);
-    }
-
-    emit({ type: "tool", name: "list_documents" });
-    const projectFilesByCourse = new Map<string, string[]>();
-    await Promise.all(
-      [...targetCourseCodes].slice(0, 5).map(async (code) => {
-        try {
-          const docs = await connector.listDocuments(code, "/");
-          const matchingDocs = docs.filter((d) => {
-            if (d.isDir || hasPastAcademicYearTag(d.name)) return false;
-            const n = normalizeGreek(d.name);
-            if (/ιεραρχικ|πτυχιακ|μαθημα_|διαλεξη/i.test(n)) return false;
-            const isProjectDoc =
-              /(ergasia|εργασι|project|εκφωνησ|θεμα|smart_mars|analysh1_ergasia)/i.test(n) ||
-              d.name.includes(String(acadYear.startYear));
-            return isProjectDoc && matchesProjectOrdinal(d.name, ordinal, ordinal !== null);
-          });
-          if (matchingDocs.length > 0) {
-            projectFilesByCourse.set(
-              code,
-              matchingDocs.map((d) => d.name),
-            );
-          }
-        } catch {
-          /* ignore */
-        }
-      }),
-    );
-
-    const sections: string[] = [];
-
-    if (assignments.length > 0) {
-      const asgLines = assignments.map((a) => {
-        const deadlineStr = a.deadline
-          ? new Date(a.deadline).toLocaleDateString(lang === "el" ? "el-GR" : "en-US", {
-              day: "2-digit",
-              month: "short",
-              year: "numeric",
-              hour: "2-digit",
-              minute: "2-digit",
-            })
-          : lang === "el"
-            ? "Ενεργή"
-            : "Active";
-        const files = projectFilesByCourse.get(a.courseCode);
-        const filesNote =
-          files && files.length > 0
-            ? `\n  📄 _${lang === "el" ? "Αρχεία τρέχοντος έτους" : "Current-year files"}:_ ${files.map((f) => `\`${f}\``).join(", ")}`
-            : "";
-        return `- **${a.courseTitle ?? a.courseCode} (\`${a.courseCode}\`)** — **${a.title}**\n  ⏰ _${
-          lang === "el" ? "Προθεσμία" : "Deadline"
-        }:_ **${deadlineStr}** · ${
-          a.submitted
-            ? lang === "el"
-              ? "✅ Παραδόθηκε"
-              : "✅ Submitted"
-            : lang === "el"
-              ? "⏳ Εκκρεμεί"
-              : "⏳ Pending"
-        }${filesNote}`;
-      });
-      sections.push(asgLines.join("\n\n"));
-    }
-
-    if (projectAnnouncements.length > 0) {
-      const annLines = projectAnnouncements.slice(0, 4).map((ann) => {
-        const files = !assignments.some((a) => a.courseCode === ann.courseCode)
-          ? projectFilesByCourse.get(ann.courseCode)
-          : undefined;
-        const filesNote =
-          files && files.length > 0
-            ? `\n  📄 _${lang === "el" ? "Αρχεία" : "Files"}:_ ${files.map((f) => `\`${f}\``).join(", ")}`
-            : "";
-        return `- **${ann.courseTitle ?? ann.courseCode} (\`${ann.courseCode}\`)** — **${ann.title}** _(${new Date(
-          ann.date,
-        ).toLocaleDateString(lang === "el" ? "el-GR" : "en-US")})_\n  ${ann.contentText.slice(0, 220)}${filesNote}`;
-      });
-      sections.push(
-        (lang === "el"
-          ? `### 📢 Σχετικές Ανακοινώσεις Εργασιών (${acadYear.label})\n`
-          : `### 📢 Related Project Announcements (${acadYear.label})\n`) + annLines.join("\n\n"),
-      );
-    }
-
-    if (sections.length === 0) {
-      return {
-        text:
-          lang === "el"
-            ? `Δεν βρέθηκαν ενεργές εργασίες για το ακαδημαϊκό έτος **${acadYear.label}** (έχουν φιλτραριστεί αυτόματα παλαιότερα έτη).`
-            : `No active projects/assignments found for academic year **${acadYear.label}** (previous academic years have been filtered out automatically).`,
-      };
-    }
-
-    const header =
-      ordinal !== null
-        ? lang === "el"
-          ? `### 📌 ${ordinal}η Εργασία — Ακαδημαϊκό Έτος ${acadYear.label}\n_(Έχουν εξαιρεθεί αυτόματα εργασίες & αρχεία προηγούμενων ετών)_\n\n`
-          : `### 📌 Project #${ordinal} — Academic Year ${acadYear.label}\n_(Projects & files from previous academic years are automatically excluded)_\n\n`
-        : lang === "el"
-          ? `### 📌 Ενεργές Εργασίες — Ακαδημαϊκό Έτος ${acadYear.label}\n\n`
-          : `### 📌 Active Projects & Deadlines — Academic Year ${acadYear.label}\n\n`;
-
-    return {
-      text: header + sections.join("\n\n"),
-    };
-  }
-
-  // 4. Inspect files / documents uploaded in a subject
-  if (/(αρχει|εγγραφ|διαφανει|σημειωσ|φακελ|υλικο|document|file|slide|folder|pdf|zip)/i.test(qNorm)) {
-    toolsUsed.push("search_catalog", "list_documents");
-    emit({ type: "tool", name: "search_catalog" });
-    const catalog = await connector.listCatalog();
-    const targetCourse =
-      findMatchingCatalogCourse(prompt, catalog) ??
-      catalog.find((c) => c.enrolled) ??
-      catalog[0];
-
-    if (targetCourse) {
-      emit({ type: "tool", name: "list_documents" });
-      const nodes = await connector.listDocuments(targetCourse.code, "/");
-      if (nodes.length === 0) {
-        return {
-          text:
-            lang === "el"
-              ? `Το μάθημα **${targetCourse.title}** (\`${targetCourse.code}\` · ${targetCourse.semester ?? ""}) δεν έχει αναρτημένα αρχεία στον αρχικό φάκελο αυτή τη στιγμή.`
-              : `**${targetCourse.title}** (\`${targetCourse.code}\`) currently has no uploaded files in its root folder.`,
-        };
-      }
-      const lines = nodes.slice(0, 20).map((n) =>
-        n.isDir
-          ? `- 📁 **${n.name}/** _(Φάκελος)_`
-          : `- 📄 **${n.name}**${n.size ? ` (${Math.max(1, Math.round(n.size / 1024))} KB)` : ""}`,
-      );
-      return {
-        text:
-          lang === "el"
-            ? `Στο μάθημα **${targetCourse.title}** (\`${targetCourse.code}\` · ${targetCourse.semester ?? ""} · Διδάσκων: _${targetCourse.professor ?? "—"}_) υπάρχουν **${nodes.length} στοιχεία** στα Έγγραφα:\n\n${lines.join("\n")}\n\nΜπορείς να το ανοίξεις στην καρτέλα **Μαθήματα → Έγγραφα** για προβολή ή λήψη \`.zip\`.`
-            : `In **${targetCourse.title}** (\`${targetCourse.code}\` · ${targetCourse.semester ?? ""} · Prof: _${targetCourse.professor ?? "—"}_), there are **${nodes.length} items** in Documents:\n\n${lines.join("\n")}`,
-      };
-    }
-  }
-
-  // 5. Semester subjects / Professors / All University Subjects queries
-  const semIdx = detectSemesterIndexFromPrompt(prompt);
-  if (
-    semIdx !== null ||
-    /(εξαμην|μαθηματ|καθηγητ|διδασκ|προγραμμα σπουδων|καταλογ|semester|subject|professor|teacher|catalog|all courses)/i.test(
-      qNorm,
-    )
-  ) {
-    toolsUsed.push("search_catalog");
-    emit({ type: "tool", name: "search_catalog" });
-    const catalog = await connector.listCatalog();
-
-    // 4a. Specific semester requested (e.g. "Α' εξάμηνο", "5ο εξάμηνο")
-    if (semIdx !== null) {
-      const semMeta = SEMESTERS[semIdx];
-      const semCourses = catalog.filter((c) => c.semesterIndex === semIdx);
-      const lines = semCourses.map(
-        (c) =>
-          `- **${c.title}** (\`${c.publicCode ?? c.code}\`) — 👤 _${c.professor ?? "—"}_${
-            c.enrolled ? " · ✅ Εγγεγραμμένος" : ""
-          }`,
-      );
-      return {
-        text:
-          lang === "el"
-            ? `### 📚 ${semMeta.label} (\`${semMeta.folder}\`) — ${semCourses.length} Μαθήματα\n\n${lines.join("\n")}`
-            : `### 📚 ${semMeta.labelEn} (\`${semMeta.folder}\`) — ${semCourses.length} Subjects\n\n${lines.join("\n")}`,
-      };
-    }
-
-    // 4b. Specific course or professor question (e.g. "Ποιος διδάσκει Κρυπτογραφία;" or "Μαθήματα του Πατσάκη")
-    const profMatches = catalog.filter((c) => {
-      if (!c.professor) return false;
-      const profWords = normalizeGreek(c.professor)
-        .split(/[^a-zα-ω0-9]+/)
-        .filter((w) => w.length >= 4);
-      return profWords.some((pw) => qNorm.includes(pw.slice(0, Math.max(4, pw.length - 1))));
-    });
-    if (profMatches.length > 0 && profMatches.length <= 15) {
-      const lines = profMatches.map(
-        (c) =>
-          `- **${c.title}** (\`${c.code}\` · ${c.semester ?? ""}) — 👤 _${c.professor}_${
-            c.enrolled ? " · ✅ Εγγεγραμμένος" : ""
-          }`,
-      );
-      return {
-        text:
-          lang === "el"
-            ? `Βρήκα **${profMatches.length} μαθήματα** με αυτόν τον διδάσκοντα:\n\n${lines.join("\n")}`
-            : `Found **${profMatches.length} courses** for that professor:\n\n${lines.join("\n")}`,
-      };
-    }
-
-    const specificCourse = findMatchingCatalogCourse(prompt, catalog);
-    if (specificCourse && /(ποιος|διδασκ|καθηγητ|κωδικ|εξαμην|who|teach|prof)/i.test(qNorm)) {
-      return {
-        text:
-          lang === "el"
-            ? `Το μάθημα **${specificCourse.title}** (\`${specificCourse.publicCode ?? specificCourse.code}\`) ανήκει στο **${specificCourse.semester}** (\`${specificCourse.semesterFolder}\`) και διδάσκεται από: **${specificCourse.professor ?? "—"}** (${specificCourse.enrolled ? "Είσαι εγγεγραμμένος" : "Διαθέσιμο στον κατάλογο"}).`
-            : `**${specificCourse.title}** (\`${specificCourse.publicCode ?? specificCourse.code}\`) is in **${specificCourse.semester}** (\`${specificCourse.semesterFolder}\`) and is taught by **${specificCourse.professor ?? "—"}**.`,
-      };
-    }
-
-    // 4c. Full overview across all 8 semesters (Α_εξάμηνο .. Η_Εξάμηνο)
-    const sections: string[] = [];
-    for (let s = 1; s <= 8; s++) {
-      const semMeta = SEMESTERS[s];
-      const list = catalog.filter((c) => c.semesterIndex === s);
-      if (list.length === 0) continue;
-      const preview = list
-        .map((c) => `  - **${c.title}** (\`${c.code}\`) — _${c.professor ?? "—"}_${c.enrolled ? " ✅" : ""}`)
-        .join("\n");
-      sections.push(`**${semMeta.shortLabel} (\`${semMeta.folder}\` — ${list.length} μαθήματα):**\n${preview}`);
-    }
-
-    return {
-      text:
-        lang === "el"
-          ? `Έχω πρόσβαση σε **όλα τα ${catalog.length} μαθήματα** του προγράμματος σπουδών (Α' έως Η' Εξάμηνο) με τους διδάσκοντες και τα αρχεία τους:\n\n${sections.join("\n\n")}`
-          : `I have live access to **all ${catalog.length} university subjects** across Semesters 1–8 with their professors and uploaded files:\n\n${sections.join("\n\n")}`,
-    };
-  }
-
-  // 6. Announcements / news
-  if (/(ανακοινωσ|νεα|news|announcement|τι νεο)/i.test(qNorm)) {
-    toolsUsed.push("get_announcements");
-    emit({ type: "tool", name: "get_announcements" });
-    const list = await connector.getAnnouncements();
-    const top = list.slice(0, 6);
-    const lines = top.map(
-      (a) =>
-        `- **[${a.courseTitle ?? a.courseCode}] ${a.title}** _(${new Date(a.date).toLocaleDateString("el-GR")})_: ${a.contentText.slice(0, 140)}`,
-    );
-    return {
-      text:
-        lang === "el"
-          ? `Οι τελευταίες ανακοινώσεις σου από το eClass:\n\n${lines.join("\n")}`
-          : `Here are your latest eClass announcements:\n\n${lines.join("\n")}`,
-    };
-  }
-
-  // 7. Messages
-  if (/(μηνυμ|inbox|message|mail)/i.test(qNorm)) {
-    toolsUsed.push("get_messages");
-    emit({ type: "tool", name: "get_messages" });
-    const msgs = await connector.getMessages();
-    const unread = msgs.filter((m) => !m.read);
-    const lines = msgs.slice(0, 6).map(
-      (m) => `- ${m.read ? "📩" : "🟣"} **${m.subject}** — _${m.sender}_ (${m.courseTitle ?? "eClass"})`,
-    );
-    return {
-      text:
-        lang === "el"
-          ? `Έχεις **${unread.length} μη αναγνωσμένα** μηνύματα (σύνολο ${msgs.length}):\n\n${lines.join("\n")}`
-          : `You have **${unread.length} unread** messages (${msgs.length} total):\n\n${lines.join("\n")}`,
-    };
-  }
-
-  // Default: overview of enrolled courses + full catalog access
-  toolsUsed.push("list_courses", "search_catalog", "get_announcements");
-  emit({ type: "tool", name: "list_courses" });
-  const [courses, catalog, announcements] = await Promise.all([
-    connector.listCourses(),
-    connector.listCatalog(),
-    connector.getAnnouncements(),
-  ]);
-
-  const sample = courses[0]?.title ?? (lang === "el" ? "Βάσεις Δεδομένων" : "Databases");
-  const sample2 = courses[1]?.title ?? sample;
-  return {
-    text:
-      lang === "el"
-        ? `Γεια σου **${user.displayName}**! Βλέπω **${courses.length} μαθήματα** στο eClass σου` +
-          (catalog.length ? ` και **${catalog.length}** στον κατάλογο του τμήματος.` : ".") +
-          (announcements[0] ? `
-
-• Τελευταία ανακοίνωση: **${announcements[0].title}** (${announcements[0].courseTitle ?? ""})` : "") +
-          `
-
-Ρώτα με για παράδειγμα:
-• «Τι προθεσμίες έχω αυτή την εβδομάδα;»
-• «Τι αρχεία έχει το ${sample};»
-• «Τι νέα ανακοίνωση έχει το ${sample2};»`
-        : `Hi **${user.displayName}**! I can see **${courses.length} courses** on your eClass` +
-          (catalog.length ? ` and **${catalog.length}** in your department's catalog.` : ".") +
-          (announcements[0] ? `
-
-• Latest announcement: **${announcements[0].title}** (${announcements[0].courseTitle ?? ""})` : "") +
-          `
-
-Try asking:
-• "What deadlines do I have this week?"
-• "What files does ${sample} have?"
-• "Any new announcements in ${sample2}?"`,
-  };
 }

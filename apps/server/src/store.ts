@@ -33,6 +33,34 @@ export interface PendingToolCall {
   callId: string;
 }
 
+/**
+ * Aggregates only (no URLs or content): per portal host, per eClass day, per course and tool,
+ * the hits and seconds that myClass' background requests added to the student's eClass usage log.
+ */
+export interface EclassHitLedger {
+  /** ISO time recording started. eClass days before it cannot be separated. */
+  since: string;
+  portals: Record<
+    string,
+    {
+      /** Course code (upper case) -> course title as eClass lists it, to match usage rows. */
+      titles: Record<string, string>;
+      /** "YYYY-MM-DD" -> "CODE|moduleId" -> [hits, seconds]. Seconds may be negative (see hit-ledger.ts). */
+      days: Record<string, Record<string, [number, number]>>;
+    }
+  >;
+}
+
+/** Last known assignment deadlines (for reminders, the calendar feed and the widget). */
+export interface KnownDeadline {
+  id: string;
+  courseCode: string;
+  courseTitle?: string;
+  title: string;
+  deadline: string;
+  submitted: boolean;
+}
+
 export interface UserRecord {
   id: string;
   universityId: string;
@@ -46,15 +74,26 @@ export interface UserRecord {
   encSession?: string;
   settings: UserSettings;
   ai: {
+    /** AES-GCM encrypted personal Gemini API key (optional). */
     encApiKey?: string;
-    google?: { encRefreshToken?: string; accessToken?: string; expiresAt?: number; email?: string };
   };
   courseMeta: Record<string, CourseMeta>;
   seen: { announcements: string[]; messages: string[]; assignments: string[]; initialized: boolean };
   lastPollAt?: string;
   lastPollError?: string;
+  /** What myClass' own automatic requests added to eClass' usage log (see eclass/hit-ledger.ts). */
+  eclassHits?: EclassHitLedger;
   notifications: NotificationItem[];
   pushSubscriptions: PushSub[];
+  /** Times (ms) of AI requests on the shared key within the last hour (see quota.ts). */
+  aiUsage?: number[];
+  /** Announcement id -> triage result, so each announcement is classified once. */
+  triage?: Record<string, { label: "action" | "fyi"; reason?: string; at: number }>;
+  deadlines?: KnownDeadline[];
+  /** "assignmentId|24h" / "assignmentId|1h" reminders already sent. */
+  remindersSent?: string[];
+  /** Secret for the private calendar feed URL (absent = feed off). */
+  calendarToken?: string;
   chat: {
     messages: ChatMessage[];
     /** Raw Gemini interaction steps (stateless mode – we own the history). */
@@ -72,7 +111,6 @@ interface SessionRecord {
 interface DbShape {
   users: Record<string, UserRecord>;
   sessions: Record<string, SessionRecord>;
-  oauthStates: Record<string, { userId: string; expiresAt: number }>;
 }
 
 const DB_FILE = path.join(DATA_DIR, "db.json");
@@ -80,9 +118,9 @@ const DB_FILE = path.join(DATA_DIR, "db.json");
 function load(): DbShape {
   try {
     const raw = JSON.parse(fs.readFileSync(DB_FILE, "utf8")) as Partial<DbShape>;
-    return { users: raw.users ?? {}, sessions: raw.sessions ?? {}, oauthStates: raw.oauthStates ?? {} };
+    return { users: raw.users ?? {}, sessions: raw.sessions ?? {} };
   } catch {
-    return { users: {}, sessions: {}, oauthStates: {} };
+    return { users: {}, sessions: {} };
   }
 }
 
@@ -143,6 +181,8 @@ export function newUser(id: string, universityId: string, username: string): Use
     ai: {},
     courseMeta: {},
     seen: { announcements: [], messages: [], assignments: [], initialized: false },
+    // A new user has no background checks in their past, so every day can be separated
+    eclassHits: { since: new Date().toISOString(), portals: {} },
     notifications: [],
     pushSubscriptions: [],
     chat: { messages: [], history: [], pending: {} },
@@ -154,7 +194,19 @@ export const users = {
     const u = db.users[id];
     if (u) {
       // forward-compatible defaults when the shape evolves
-      u.settings = { ...structuredClone(DEFAULT_SETTINGS), ...u.settings };
+      const defaults = structuredClone(DEFAULT_SETTINGS);
+      u.settings = {
+        ...defaults,
+        ...u.settings,
+        notify: { ...defaults.notify, ...u.settings?.notify },
+        accessibility: { ...defaults.accessibility, ...u.settings?.accessibility },
+      };
+      // Older records: removed "google" AI mode and the old hard-coded model name
+      const ai = u.settings.ai ?? DEFAULT_SETTINGS.ai;
+      u.settings.ai = {
+        mode: ai.mode === "apiKey" || (String(ai.mode) === "google" && u.ai?.encApiKey) ? "apiKey" : "server",
+        model: /^gemini-3\.8-flash$/.test(ai.model ?? "") ? "" : (ai.model ?? ""),
+      };
     }
     return u;
   },
@@ -200,20 +252,5 @@ export const sessions = {
   delete(sid: string) {
     delete db.sessions[sid];
     persist();
-  },
-};
-
-/* -------------------------- oauth state ------------------------ */
-
-export const oauthStates = {
-  put(state: string, userId: string) {
-    db.oauthStates[state] = { userId, expiresAt: Date.now() + 10 * 60 * 1000 };
-    persist();
-  },
-  take(state: string): string | undefined {
-    const s = db.oauthStates[state];
-    delete db.oauthStates[state];
-    persist();
-    return s && s.expiresAt > Date.now() ? s.userId : undefined;
   },
 };

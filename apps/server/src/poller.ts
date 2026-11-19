@@ -2,8 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import webpush from "web-push";
 import type { NotificationItem } from "@myclass/shared";
+import { triageAnnouncements } from "./ai.js";
 import { randomId } from "./crypto.js";
+import { rememberDeadlines, sendDeadlineReminders } from "./deadlines.js";
 import { getConnectorForUser } from "./eclass/connector.js";
+import { withOrigin } from "./eclass/request-origin.js";
 import { DATA_DIR, env } from "./env.js";
 import { users, type UserRecord } from "./store.js";
 
@@ -71,7 +74,10 @@ export async function emitNotification(user: UserRecord, item: NotificationItem)
 
   // Send Web Push if enabled
   if (user.settings.notify.push && user.pushSubscriptions.length > 0) {
+    // A tag per item, so a new announcement does not replace the previous one on the lock screen
     const payload = JSON.stringify({
+      id: item.id,
+      kind: item.kind,
       title: item.title,
       body: item.body,
       route: item.route ?? "/",
@@ -99,32 +105,64 @@ export async function emitNotification(user: UserRecord, item: NotificationItem)
 /* Polling diff logic                                                  */
 /* ------------------------------------------------------------------ */
 
-export async function pollUserNow(user: UserRecord): Promise<NotificationItem[]> {
+/**
+ * Checks eClass for new announcements, messages and assignments. Every call (timer, after
+ * login, after a submission, the refresh button) is a background check, not the student
+ * reading eClass, so its requests are tagged "background" and kept out of My stats.
+ */
+/** How often background polling may load the per-course assignment pages (each one counts as a visit on eClass). */
+const ASSIGNMENT_CHECK_EVERY_MS = 6 * 60 * 60_000;
+const lastAssignmentCheck = new Map<string, number>();
+
+export function pollUserNow(user: UserRecord): Promise<NotificationItem[]> {
+  return withOrigin("background", () => pollUserNowInContext(user));
+}
+
+async function pollUserNowInContext(user: UserRecord): Promise<NotificationItem[]> {
   const connector = getConnectorForUser(user);
   const muted = new Set(user.settings.mutedCourses);
   const created: NotificationItem[] = [];
 
   try {
+    // Announcements and messages come from account-wide endpoints that eClass does not count
+    // as course visits. Assignments need one course page per course, and each of those is
+    // logged as a visit in the student's usage stats, so that check runs rarely.
+    const checkAssignments =
+      user.settings.notify.assignments &&
+      (!user.seen.initialized || Date.now() - (lastAssignmentCheck.get(user.id) ?? 0) >= ASSIGNMENT_CHECK_EVERY_MS);
+    if (checkAssignments) lastAssignmentCheck.set(user.id, Date.now());
+
     const [announcements, messages, assignments] = await Promise.all([
       user.settings.notify.announcements ? connector.getAnnouncements() : Promise.resolve([]),
       user.settings.notify.messages ? connector.getMessages() : Promise.resolve([]),
-      user.settings.notify.assignments ? connector.getAssignments() : Promise.resolve([]),
+      checkAssignments ? connector.getAssignments() : Promise.resolve([]),
     ]);
 
     const seenAnn = new Set(user.seen.announcements);
     const seenMsg = new Set(user.seen.messages);
     const seenAsg = new Set(user.seen.assignments);
     const isFirstSync = !user.seen.initialized;
+    if (checkAssignments) rememberDeadlines(user, assignments);
+
+    // Sort new announcements into "action needed" / "FYI" (one batched AI call, keywords as fallback)
+    const newAnnouncements = isFirstSync ? [] : announcements.filter((a) => !seenAnn.has(a.id) && !muted.has(a.courseCode));
+    const triage = newAnnouncements.length
+      ? await triageAnnouncements(user, newAnnouncements).catch(() => ({}) as Record<string, never>)
+      : {};
+    const actionPrefix = user.settings.language === "el" ? "Χρειάζεται ενέργεια" : "Action needed";
 
     for (const a of announcements) {
       if (!seenAnn.has(a.id)) {
         seenAnn.add(a.id);
         if (!isFirstSync && !muted.has(a.courseCode)) {
+          const t = triage[a.id];
+          const action = t?.label === "action";
           created.push({
             id: randomId(8),
             kind: "announcement",
-            title: a.courseTitle ? `${a.courseTitle}: ${a.title}` : a.title,
-            body: a.contentText.slice(0, 180),
+            title: `${action ? `${actionPrefix} · ` : ""}${a.courseTitle ? `${a.courseTitle}: ${a.title}` : a.title}`,
+            body: action && t.reason ? `${t.reason} — ${a.contentText.slice(0, 150)}` : a.contentText.slice(0, 180),
+            triage: t?.label,
             courseCode: a.courseCode,
             courseTitle: a.courseTitle,
             date: a.date,
@@ -198,9 +236,12 @@ export async function pollUserNow(user: UserRecord): Promise<NotificationItem[]>
 }
 
 export function startBackgroundPoller() {
-  // Tick every 60s and check which users are due according to their pollIntervalMin
+  // Tick every 60s: deadline reminders, then the users due a check according to their pollIntervalMin
   setInterval(() => {
     const now = Date.now();
+    void sendDeadlineReminders(emitNotification, now).catch((err) =>
+      console.warn("[reminders] failed:", (err as Error).message),
+    );
     for (const u of users.all()) {
       if (!u.remember) continue;
       const intervalMs = Math.max(5, u.settings.pollIntervalMin || 15) * 60_000;

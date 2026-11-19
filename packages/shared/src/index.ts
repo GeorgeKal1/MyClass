@@ -16,58 +16,6 @@ export interface University {
   status: "verified" | "beta" | "untested";
 }
 
-/**
- * Best-effort university detection from a CAS username or institutional e-mail.
- * Returns `null` when the username does not clearly belong to one university,
- * so the user is asked to choose instead of being sent to the wrong eClass.
- * Shared by the login form (preview) and the server (login).
- */
-const UNIVERSITY_EMAIL_DOMAINS: Array<[string, string[]]> = [
-  ["unipi", ["unipi.gr"]],
-  ["uoa", ["uoa.gr"]],
-  ["ntua", ["ntua.gr"]],
-  ["aueb", ["aueb.gr"]],
-  ["uniwa", ["uniwa.gr"]],
-  ["panteion", ["panteion.gr"]],
-  ["hua", ["hua.gr"]],
-  ["uom", ["uom.edu.gr", "uom.gr"]],
-  ["upatras", ["upatras.gr", "upnet.gr"]],
-  ["duth", ["duth.gr"]],
-  ["uth", ["uth.gr"]],
-  ["uowm", ["uowm.gr"]],
-  ["uop", ["uop.gr"]],
-  ["hmu", ["hmu.gr"]],
-  ["aegean", ["aegean.gr"]],
-  ["uoi", ["uoi.gr"]],
-];
-
-const UNIVERSITY_USERNAME_PATTERNS: Array<[string, RegExp]> = [
-  ["uoa", /^sdi\d{5,}$/],
-  // University of the Aegean department prefixes (e.g. icsd21001, dpsd20012)
-  ["aegean", /^(icsd|dpsd)\d{4,}$/],
-  ["uom", /^(iis|ics|dai|mai)\d{4,}$/],
-  ["uniwa", /^(ice|eee|cs|bme|civ|mech)\d{4,}$/],
-  ["ntua", /^(el|mc|cv|ch|ar|ge|na|mm)\d{5,}$/],
-  // University of Piraeus student IDs: p24xxx (Informatics), e24xxx (Digital Systems), …
-  ["unipi", /^(p|e|m|o|x|s|b|n|d|t|psp|mp|mpsp|mte|pms)\d{4,}$/],
-];
-
-export function detectUniversityId(rawUsername: string): string | null {
-  const u = rawUsername.trim().toLowerCase();
-  if (!u) return null;
-  if (u.includes("@")) {
-    const domain = u.split("@")[1] ?? "";
-    for (const [id, domains] of UNIVERSITY_EMAIL_DOMAINS) {
-      if (domains.some((d) => domain === d || domain.endsWith(`.${d}`))) return id;
-    }
-  }
-  const local = u.split("@")[0];
-  for (const [id, re] of UNIVERSITY_USERNAME_PATTERNS) {
-    if (re.test(local)) return id;
-  }
-  return null;
-}
-
 export interface DepartmentInfo {
   id: string;
   name: string;
@@ -198,6 +146,40 @@ export interface PortalWarning {
   message: string;
 }
 
+/** The student's own eClass usage ("Τα στατιστικά μου"), merged across their portals. */
+export interface MyStats {
+  /** Period covered, as YYYY-MM-DD (the last twelve months). */
+  from: string;
+  to: string;
+  totals: {
+    visits: number;
+    seconds: number;
+    activeDays: number;
+    courses: number;
+  };
+  /** Last 30 days against the 30 days before them. */
+  recent: { visits: number; seconds: number; prevVisits: number; prevSeconds: number };
+  /** Twelve calendar months, oldest first, `month` as YYYY-MM (empty months included). */
+  months: Array<{ month: string; visits: number; seconds: number }>;
+  /** Courses by time spent, most first. */
+  courses: Array<{ title: string; code?: string; visits: number; seconds: number; lastDay: string }>;
+  /** eClass tools (Documents, Announcements, …) by visits, most first. */
+  tools: Array<{ name: string; visits: number; seconds: number }>;
+  /** Visits per weekday, Monday first. */
+  weekdays: number[];
+  warnings?: PortalWarning[];
+  /**
+   * Present when myClass' own background checks were taken out of eClass' log, or could not be.
+   * `visits` is exact, `seconds` an estimate (net of time given back to the student's visits).
+   */
+  adjustment?: {
+    visits: number;
+    seconds: number;
+    /** YYYY-MM-DD: days before this still include background checks (recorded before myClass kept count). */
+    uncorrectedBefore?: string;
+  };
+}
+
 export interface CatalogCourse {
   code: string;
   publicCode?: string;
@@ -223,7 +205,7 @@ export interface CatalogCourse {
 /* Notifications                                                       */
 /* ------------------------------------------------------------------ */
 
-export type NotificationKind = "announcement" | "message" | "assignment" | "system";
+export type NotificationKind = "announcement" | "message" | "assignment" | "deadline" | "system";
 
 export interface NotificationItem {
   id: string;
@@ -236,7 +218,74 @@ export interface NotificationItem {
   read: boolean;
   /** Link inside myClass, e.g. /courses/ABC101?tab=announcements */
   route?: string;
+  /** Announcements only: whether the student has to do something. */
+  triage?: TriageLabel;
 }
+
+/* ------------------------------------------------------------------ */
+/* Announcement triage                                                 */
+/* ------------------------------------------------------------------ */
+
+/** "action": the student has to do something (submit, register, show up, reply). "fyi": just information. */
+export type TriageLabel = "action" | "fyi";
+
+export interface AnnouncementTriage {
+  label: TriageLabel;
+  /** A few words on what to do, e.g. "Υποβολή έως 25/11" (action items only). */
+  reason?: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Study material (generated from one course file)                     */
+/* ------------------------------------------------------------------ */
+
+export type StudyKind = "flashcards" | "quiz" | "exam";
+
+export interface Flashcard {
+  front: string;
+  back: string;
+}
+
+export interface QuizQuestion {
+  question: string;
+  options: string[];
+  /** Index into `options`. */
+  answer: number;
+  explanation: string;
+}
+
+export interface ExamQuestion {
+  question: string;
+  /** Suggested marks out of 100 for the whole set. */
+  points: number;
+  modelAnswer: string;
+}
+
+export type StudyMaterial =
+  | { kind: "flashcards"; name: string; cards: Flashcard[]; cached?: boolean }
+  | { kind: "quiz"; name: string; questions: QuizQuestion[]; cached?: boolean }
+  | { kind: "exam"; name: string; questions: ExamQuestion[]; cached?: boolean };
+
+export const TriageRequest = z.object({
+  items: z
+    .array(
+      z.object({
+        id: z.string().max(200),
+        courseCode: z.string().max(100),
+        courseTitle: z.string().max(300).optional(),
+        title: z.string().max(500),
+        contentText: z.string().max(600),
+        date: z.string().max(40),
+      }),
+    )
+    .max(100),
+});
+
+export const StudyRequest = z.object({
+  path: z.string().min(1).max(2000),
+  kind: z.enum(["flashcards", "quiz", "exam"]),
+  refresh: z.boolean().optional(),
+});
 
 /* ------------------------------------------------------------------ */
 /* User / settings                                                     */
@@ -244,7 +293,8 @@ export interface NotificationItem {
 
 export type ThemePref = "light" | "dark" | "system";
 export type Lang = "el" | "en";
-export type AiMode = "server" | "apiKey" | "google";
+/** "server": the shared myClass Gemini key; "apiKey": the student's own Gemini key. */
+export type AiMode = "server" | "apiKey";
 
 export interface UserSettings {
   theme: ThemePref;
@@ -254,7 +304,15 @@ export interface UserSettings {
     announcements: boolean;
     messages: boolean;
     assignments: boolean;
+    /** Push reminders 24 h and 1 h before an unsubmitted assignment is due. */
+    deadlines: boolean;
     push: boolean;
+  };
+  accessibility: {
+    /** Text size multiplier: 0.9, 1, 1.15 or 1.3. */
+    fontScale: number;
+    /** "system" follows the device's reduced-motion setting. */
+    reduceMotion: "system" | "on" | "off";
   };
   mutedCourses: string[];
   downloads: {
@@ -263,18 +321,22 @@ export interface UserSettings {
   };
   ai: {
     mode: AiMode;
+    /** Optional Gemini model override; empty = the server picks the best available Flash model. */
     model: string;
   };
+  /** University of Piraeus department whose catalog "All courses" shows (empty = detected from the username). */
+  departmentId?: string;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
   theme: "system",
   language: "el",
   pollIntervalMin: 15,
-  notify: { announcements: true, messages: true, assignments: true, push: false },
+  notify: { announcements: true, messages: true, assignments: true, deadlines: true, push: false },
+  accessibility: { fontScale: 1, reduceMotion: "system" },
   mutedCourses: [],
   downloads: { allCoursesMode: "single-zip" },
-  ai: { mode: "server", model: "gemini-3.8-flash" },
+  ai: { mode: "server", model: "" },
 };
 
 export interface Me {
@@ -289,11 +351,19 @@ export interface Me {
   settings: UserSettings;
   ai: {
     hasApiKey: boolean;
-    googleConnected: boolean;
-    googleEmail?: string;
-    googleAvailable: boolean;
     serverKeyAvailable: boolean;
+    /** Hourly limit on the shared key; null when the student uses their own key (no limit). */
+    quota: AiQuota | null;
   };
+  /** Private iCalendar feed of deadlines (for a phone calendar and its home-screen widget), when turned on. */
+  calendarFeedUrl?: string;
+}
+
+export interface AiQuota {
+  limit: number;
+  used: number;
+  /** ISO time the oldest counted request leaves the one-hour window (when used > 0). */
+  resetAt?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -334,7 +404,6 @@ export type ChatStreamEvent =
 /* ------------------------------------------------------------------ */
 
 export const LoginRequest = z.object({
-  universityId: z.string().max(40).optional().default("auto"),
   username: z.string().min(1).max(200),
   password: z.string().min(1).max(500),
   remember: z.boolean().default(true),
@@ -346,15 +415,25 @@ export const SettingsPatch = z
     theme: z.enum(["light", "dark", "system"]),
     language: z.enum(["el", "en"]),
     pollIntervalMin: z.number().int().min(5).max(240),
-    notify: z.object({
-      announcements: z.boolean(),
-      messages: z.boolean(),
-      assignments: z.boolean(),
-      push: z.boolean(),
-    }),
+    notify: z
+      .object({
+        announcements: z.boolean(),
+        messages: z.boolean(),
+        assignments: z.boolean(),
+        deadlines: z.boolean(),
+        push: z.boolean(),
+      })
+      .partial(),
+    accessibility: z
+      .object({
+        fontScale: z.union([z.literal(0.9), z.literal(1), z.literal(1.15), z.literal(1.3)]),
+        reduceMotion: z.enum(["system", "on", "off"]),
+      })
+      .partial(),
     mutedCourses: z.array(z.string()),
     downloads: z.object({ allCoursesMode: z.enum(["single-zip", "zip-per-course"]) }),
-    ai: z.object({ mode: z.enum(["server", "apiKey", "google"]), model: z.string().min(1) }),
+    ai: z.object({ mode: z.enum(["server", "apiKey"]), model: z.string().max(80).optional().default("") }),
+    departmentId: z.string().max(20),
   })
   .partial();
 export type SettingsPatch = z.infer<typeof SettingsPatch>;

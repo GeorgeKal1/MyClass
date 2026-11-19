@@ -1,5 +1,4 @@
 import "dotenv/config";
-import { detectUniversityId } from "@myclass/shared";
 import {
   getConnectorForUser,
   performEclassLogin,
@@ -21,10 +20,10 @@ async function step<T>(label: string, fn: () => Promise<T>): Promise<T | undefin
   const started = Date.now();
   try {
     const res = await fn();
-    console.log(`✓ ${label} (${Date.now() - started} ms)`);
+    console.log(`OK ${label} (${Date.now() - started} ms)`);
     return res;
   } catch (err) {
-    console.log(`✗ ${label}: ${(err as Error).message}`);
+    console.log(`FAIL ${label}: ${(err as Error).message}`);
     return undefined;
   }
 }
@@ -32,9 +31,7 @@ async function step<T>(label: string, fn: () => Promise<T>): Promise<T | undefin
 async function main() {
   const username = process.env.PROBE_USERNAME?.trim();
   const password = process.env.PROBE_PASSWORD;
-  const uniId = process.env.PROBE_UNIVERSITY || (username ? detectUniversityId(username) : null) || "unipi";
-  const uni = getUniversity(uniId);
-  if (!uni) throw new Error(`Unknown university: ${uniId}`);
+  const uni = getUniversity();
 
   console.log(`[probe] University: ${uni.nameEn} (${uni.eclassUrl})`);
   if (!username || !password) {
@@ -81,6 +78,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("✗ Probe failed:", err);
+  console.error("Probe failed:", err);
   process.exit(1);
 });

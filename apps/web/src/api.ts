@@ -1,5 +1,8 @@
 import type {
   Announcement,
+  AnnouncementTriage,
+  StudyKind,
+  StudyMaterial,
   Assignment,
   AssignmentDetail,
   CourseTool,
@@ -15,10 +18,10 @@ import type {
   LoginRequest,
   Me,
   Message,
+  MyStats,
   NotificationItem,
   PendingAction,
   SettingsPatch,
-  University,
 } from "@myclass/shared";
 
 /** The API server could not be reached (offline, restarting, or the dev proxy has no backend). */
@@ -59,7 +62,6 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  universities: () => req<{ universities: University[] }>("/api/universities"),
   me: () => req<{ me: Me | null }>("/api/me"),
   login: (payload: LoginRequest) =>
     req<{ me: Me }>("/api/auth/login", { method: "POST", body: JSON.stringify(payload) }),
@@ -71,15 +73,9 @@ export const api = {
   saveApiKey: (apiKey: string) =>
     req<{ me: Me }>("/api/ai/apikey", { method: "POST", body: JSON.stringify({ apiKey }) }),
   removeApiKey: () => req<{ me: Me }>("/api/ai/apikey", { method: "DELETE" }),
-  startGoogleOAuth: () => req<{ mode: "oauth" | "aistudio"; url: string }>("/api/ai/google/start"),
-  connectGoogleAccount: (apiKey: string, email?: string) =>
-    req<{ me: Me }>("/api/ai/google/connect", {
-      method: "POST",
-      body: JSON.stringify({ apiKey, email }),
-    }),
-  disconnectGoogle: () => req<{ me: Me }>("/api/ai/google/disconnect", { method: "POST" }),
 
   courses: () => req<{ courses: Course[]; warnings?: PortalWarning[] }>("/api/courses"),
+  stats: (fresh = false) => req<{ stats: MyStats }>(`/api/stats${fresh ? "?fresh=1" : ""}`),
   courseTools: (code: string) =>
     req<{ tools: CourseTool[] }>(`/api/courses/${encodeURIComponent(code)}/tools`),
   assignmentDetail: (code: string, id: string) =>
@@ -114,6 +110,27 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ path, refresh }),
     }),
+  studyMaterial: (code: string, path: string, kind: StudyKind, refresh = false) =>
+    req<{ material: StudyMaterial; me: Me }>(`/api/courses/${encodeURIComponent(code)}/documents/study`, {
+      method: "POST",
+      body: JSON.stringify({ path, kind, refresh }),
+    }),
+  triage: (announcements: Announcement[]) =>
+    req<{ triage: Record<string, AnnouncementTriage> }>("/api/announcements/triage", {
+      method: "POST",
+      body: JSON.stringify({
+        items: announcements.slice(0, 100).map((a) => ({
+          id: a.id,
+          courseCode: a.courseCode,
+          courseTitle: a.courseTitle?.slice(0, 300),
+          title: a.title.slice(0, 500),
+          contentText: a.contentText.slice(0, 600),
+          date: a.date,
+        })),
+      }),
+    }),
+  enableCalendarFeed: () => req<{ me: Me }>("/api/calendar/feed", { method: "POST" }),
+  disableCalendarFeed: () => req<{ me: Me }>("/api/calendar/feed", { method: "DELETE" }),
   patchCourseMeta: (code: string, patch: { semester?: string; archived?: boolean }) =>
     req<{ ok: boolean }>(`/api/courses/${encodeURIComponent(code)}/meta`, {
       method: "PATCH",

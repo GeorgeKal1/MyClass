@@ -8,10 +8,26 @@ import { inflateRawSync } from "node:zlib";
 
 export type PreparedDocument =
   | { kind: "inline"; mimeType: string; data: Buffer }
+  /** Too big to send inline: goes through Gemini's file upload. */
+  | { kind: "upload"; mimeType: string; data: Buffer }
   | { kind: "text"; text: string }
   | { kind: "unsupported"; reason: string };
 
 const MAX_INLINE_BYTES = 18 * 1024 * 1024; // Gemini inline data limit is ~20MB per request
+/** Gemini's file upload takes PDFs up to 50 MB. */
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
+/**
+ * PDFs locked with the Standard security handler. Gemini cannot open them ("The document has
+ * no pages"), and the ones seen on eClass need the professor's password, so they are refused
+ * with a clear message instead of a Gemini error.
+ */
+export function isEncryptedPdf(data: Buffer): boolean {
+  const tail = data.subarray(Math.max(0, data.length - 256 * 1024)).toString("latin1");
+  if (/\/Encrypt\s+\d+\s+\d+\s+R/.test(tail)) return true;
+  // Linearized files keep the trailer near the start
+  return /\/Encrypt\s+\d+\s+\d+\s+R/.test(data.subarray(0, 64 * 1024).toString("latin1"));
+}
 const MAX_TEXT_CHARS = 120_000;
 
 /** Reads the entries of a .zip buffer (stored or deflated), returning name -> content. */
@@ -70,16 +86,30 @@ function extOf(name: string): string {
   return (name.split(".").pop() || "").toLowerCase();
 }
 
-export function prepareDocumentForAi(name: string, contentType: string, data: Buffer): PreparedDocument {
+export function prepareDocumentForAi(
+  name: string,
+  contentType: string,
+  data: Buffer,
+  lang: "el" | "en" = "en",
+): PreparedDocument {
   const ext = extOf(name);
   const ct = contentType.toLowerCase();
+  const say = (el: string, en: string): PreparedDocument => ({ kind: "unsupported", reason: lang === "el" ? el : en });
 
   if (ext === "pdf" || ct.includes("pdf")) {
-    if (data.length > MAX_INLINE_BYTES) return { kind: "unsupported", reason: "The PDF is too large to summarize (over 18 MB)." };
-    return { kind: "inline", mimeType: "application/pdf", data };
+    if (isEncryptedPdf(data)) {
+      return say(
+        "Αυτό το PDF είναι κλειδωμένο με κωδικό από τον διδάσκοντα, οπότε το AI δεν μπορεί να το διαβάσει.",
+        "This PDF is locked with a password by the instructor, so the AI can't read it.",
+      );
+    }
+    if (data.length > MAX_UPLOAD_BYTES) {
+      return say("Το PDF είναι πολύ μεγάλο για το AI (πάνω από 50 MB).", "The PDF is too large for the AI (over 50 MB).");
+    }
+    return { kind: data.length > MAX_INLINE_BYTES ? "upload" : "inline", mimeType: "application/pdf", data };
   }
   if (/^(png|jpe?g|webp|gif)$/.test(ext) || ct.startsWith("image/")) {
-    if (data.length > MAX_INLINE_BYTES) return { kind: "unsupported", reason: "The image is too large." };
+    if (data.length > MAX_INLINE_BYTES) return say("Η εικόνα είναι πολύ μεγάλη.", "The image is too large.");
     const mime = ct.startsWith("image/") ? ct.split(";")[0] : `image/${ext === "jpg" ? "jpeg" : ext}`;
     return { kind: "inline", mimeType: mime, data };
   }
@@ -103,7 +133,7 @@ export function prepareDocumentForAi(name: string, contentType: string, data: Bu
       return { kind: "text", text: xmlToText(xml, /<\/si>/g).slice(0, MAX_TEXT_CHARS) };
     }
   } catch (err) {
-    return { kind: "unsupported", reason: `Could not read the file (${(err as Error).message}).` };
+    return say(`Δεν ήταν δυνατή η ανάγνωση του αρχείου (${(err as Error).message}).`, `Could not read the file (${(err as Error).message}).`);
   }
 
   const textLike =
@@ -116,10 +146,13 @@ export function prepareDocumentForAi(name: string, contentType: string, data: Bu
   }
 
   if (/^(doc|ppt|xls)$/.test(ext)) {
-    return { kind: "unsupported", reason: "Old Office formats (.doc/.ppt/.xls) can't be summarized; ask for a PDF or the new format." };
+    return say(
+      "Τα παλιά αρχεία Office (.doc/.ppt/.xls) δεν διαβάζονται από το AI. Χρειάζεται PDF ή νεότερη μορφή.",
+      "Old Office formats (.doc/.ppt/.xls) can't be read by the AI; it needs a PDF or the newer format.",
+    );
   }
   if (/^(zip|rar|7z|tar|gz)$/.test(ext)) {
-    return { kind: "unsupported", reason: "Archives can't be summarized. Open a file inside it instead." };
+    return say("Τα συμπιεσμένα αρχεία δεν διαβάζονται. Άνοιξε ένα αρχείο μέσα τους.", "Archives can't be read. Open a file inside it instead.");
   }
-  return { kind: "unsupported", reason: `Files of type .${ext || "unknown"} can't be summarized yet.` };
+  return say(`Τα αρχεία τύπου .${ext || "άγνωστο"} δεν διαβάζονται ακόμα από το AI.`, `Files of type .${ext || "unknown"} can't be read by the AI yet.`);
 }

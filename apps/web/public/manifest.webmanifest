@@ -7,8 +7,8 @@
   "scope": "/",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#0A0910",
-  "theme_color": "#7C3AED",
+  "background_color": "#111216",
+  "theme_color": "#7765cb",
   "icons": [
     {
       "src": "/icon.svg",
@@ -27,6 +27,38 @@
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Προθεσμίες",
+      "short_name": "Προθεσμίες",
+      "description": "Calendar of upcoming deadlines",
+      "url": "/?view=calendar",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Βοηθός",
+      "short_name": "Βοηθός",
+      "description": "Ask the assistant",
+      "url": "/assistant",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ],
+  "widgets": [
+    {
+      "name": "myClass deadlines",
+      "short_name": "Deadlines",
+      "description": "Your next assignment deadlines from eClass",
+      "tag": "deadlines",
+      "template": "deadlines",
+      "ms_ac_template": "/widgets/deadlines.json",
+      "data": "/api/widget/deadlines",
+      "type": "application/json",
+      "auth": false,
+      "update": 900,
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" }],
+      "screenshots": [{ "src": "/icon-512.png", "sizes": "512x512", "label": "myClass deadlines widget" }]
     }
   ]
 }

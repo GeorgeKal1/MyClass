@@ -1,8 +1,20 @@
-import { detectUniversityId } from "@myclass/shared";
 import type { Announcement, Assignment, DepartmentInfo, DocNode } from "@myclass/shared";
 
 export const THALES_BASE_URL = "https://thales.cs.unipi.gr";
 export const UNIPI_CENTRAL_BASE_URL = "https://eclass.unipi.gr";
+/** Digital Systems runs its own Open eClass instances: "Αρίσταρχος" (undergraduate) and "Λεύκιππος" (MSc). */
+export const ARISTARCHUS_BASE_URL = "https://aristarchus.ds.unipi.gr";
+export const LEFKIPPOS_BASE_URL = "https://lefkippos.ds.unipi.gr";
+
+/** The Open eClass portals UniPi students use. All of them sign in through sso.unipi.gr (CAS). */
+export type UniPiPortal = "central" | "thales" | "aristarchus" | "lefkippos";
+
+export const PORTAL_BASE_URL: Record<UniPiPortal, string> = {
+  central: UNIPI_CENTRAL_BASE_URL,
+  thales: THALES_BASE_URL,
+  aristarchus: ARISTARCHUS_BASE_URL,
+  lefkippos: LEFKIPPOS_BASE_URL,
+};
 
 export interface SemesterMeta {
   index: number;
@@ -240,10 +252,14 @@ export const CS_COURSE_SEMESTER: Record<string, number> = {
 export const EXCLUDED_COURSE_CODES = new Set(["TMA174", "TMA173", "TMB140"]);
 
 export interface UniPiDepartmentSpec extends DepartmentInfo {
+  /** Portals the department's students are enrolled on; the first one must accept the login. */
+  portals: UniPiPortal[];
   sources: Array<{
-    portal: "thales" | "central";
+    portal: UniPiPortal;
     fc: number;
     defaultYear?: number;
+    /** Sub-folders of this root that are not crawled. */
+    skipFc?: number[];
   }>;
   extraCentralCourses?: Array<{
     code: string;
@@ -256,10 +272,10 @@ export interface UniPiDepartmentSpec extends DepartmentInfo {
 }
 
 /**
- * University of Piraeus departments. `fc` values are the department ROOT faculties on
- * eclass.unipi.gr (verified against the public faculty tree, Nov 2026); the catalog crawler
- * walks their sub-folders (undergraduate / postgraduate / other) automatically, and falls back
- * to the student's own faculty page if an id ever stops returning courses.
+ * University of Piraeus departments. `fc` values are faculty ROOTS on each portal (verified
+ * against the public faculty trees, Nov 2026); the catalog crawler walks their sub-folders
+ * (programme / semester) automatically, and falls back to the student's own faculty page on
+ * eclass.unipi.gr if an id ever stops returning courses.
  */
 export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
   {
@@ -267,6 +283,7 @@ export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
     name: "Τμήμα Πληροφορικής — Προπτυχιακό (Α' – Η' Εξάμηνο)",
     nameEn: "Department of Informatics — Undergraduate (Semesters 1–8)",
     portalLabel: "thales.cs.unipi.gr + eclass.unipi.gr",
+    portals: ["thales", "central"],
     sources: [
       { portal: "thales", fc: 19, defaultYear: 1 },
       { portal: "thales", fc: 22, defaultYear: 2 },
@@ -292,6 +309,7 @@ export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
     name: "Τμήμα Πληροφορικής — Μεταπτυχιακά (ΠΜΣ)",
     nameEn: "Department of Informatics — Postgraduate (MSc)",
     portalLabel: "thales.cs.unipi.gr",
+    portals: ["thales", "central"],
     sources: [
       { portal: "thales", fc: 32 },
       { portal: "thales", fc: 35 },
@@ -304,16 +322,31 @@ export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
   },
   {
     id: "ds",
-    name: "Τμήμα Ψηφιακών Συστημάτων",
-    nameEn: "Department of Digital Systems",
-    portalLabel: "eclass.unipi.gr",
-    sources: [{ portal: "central", fc: 13 }],
+    name: "Τμήμα Ψηφιακών Συστημάτων — Προπτυχιακό",
+    nameEn: "Department of Digital Systems — Undergraduate",
+    portalLabel: "aristarchus.ds.unipi.gr + eclass.unipi.gr",
+    // Almost every DS course lives on Aristarchus; eclass.unipi.gr only has the new DTDS courses
+    portals: ["aristarchus", "central"],
+    sources: [
+      // fc 18 holds the retired "[ΠΑΛΑΙΟ ΜΑΘΗΜΑ]" courses that are only examined
+      { portal: "aristarchus", fc: 7, skipFc: [18] },
+      { portal: "central", fc: 44 },
+    ],
+  },
+  {
+    id: "ds-pg",
+    name: "Τμήμα Ψηφιακών Συστημάτων — Μεταπτυχιακά (ΠΜΣ)",
+    nameEn: "Department of Digital Systems — Postgraduate (MSc)",
+    portalLabel: "lefkippos.ds.unipi.gr",
+    portals: ["lefkippos", "central"],
+    sources: [{ portal: "lefkippos", fc: 7 }],
   },
   {
     id: "ode",
     name: "Τμήμα Οργάνωσης και Διοίκησης Επιχειρήσεων",
     nameEn: "Department of Business Administration",
     portalLabel: "eclass.unipi.gr",
+    portals: ["central"],
     sources: [{ portal: "central", fc: 7 }],
   },
   {
@@ -321,6 +354,7 @@ export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
     name: "Τμήμα Οικονομικής Επιστήμης",
     nameEn: "Department of Economics",
     portalLabel: "eclass.unipi.gr",
+    portals: ["central"],
     sources: [{ portal: "central", fc: 6 }],
   },
   {
@@ -328,6 +362,7 @@ export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
     name: "Τμήμα Χρηματοοικονομικής και Τραπεζικής Διοικητικής",
     nameEn: "Department of Banking and Financial Management",
     portalLabel: "eclass.unipi.gr",
+    portals: ["central"],
     sources: [{ portal: "central", fc: 9 }],
   },
   {
@@ -335,6 +370,7 @@ export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
     name: "Τμήμα Στατιστικής και Ασφαλιστικής Επιστήμης",
     nameEn: "Department of Statistics and Insurance Science",
     portalLabel: "eclass.unipi.gr",
+    portals: ["central"],
     sources: [{ portal: "central", fc: 8 }],
   },
   {
@@ -342,6 +378,7 @@ export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
     name: "Τμήμα Βιομηχανικής Διοίκησης και Τεχνολογίας",
     nameEn: "Department of Industrial Management and Technology",
     portalLabel: "eclass.unipi.gr",
+    portals: ["central"],
     sources: [{ portal: "central", fc: 10 }],
   },
   {
@@ -349,6 +386,7 @@ export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
     name: "Τμήμα Ναυτιλιακών Σπουδών",
     nameEn: "Department of Maritime Studies",
     portalLabel: "eclass.unipi.gr",
+    portals: ["central"],
     sources: [{ portal: "central", fc: 11 }],
   },
   {
@@ -356,6 +394,7 @@ export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
     name: "Τμήμα Διεθνών και Ευρωπαϊκών Σπουδών",
     nameEn: "Department of International and European Studies",
     portalLabel: "eclass.unipi.gr",
+    portals: ["central"],
     sources: [{ portal: "central", fc: 14 }],
   },
   {
@@ -363,6 +402,7 @@ export const UNIPI_DEPARTMENTS: UniPiDepartmentSpec[] = [
     name: "Τμήμα Τουριστικών Σπουδών",
     nameEn: "Department of Tourism Studies",
     portalLabel: "eclass.unipi.gr",
+    portals: ["central"],
     sources: [{ portal: "central", fc: 58 }],
   },
 ];
@@ -424,12 +464,17 @@ export function resolveSemesterForCourse(
   return SEMESTERS[1];
 }
 
+/** Digital Systems MSc course code prefixes on Lefkippos. */
+const LEFKIPPOS_PREFIXES = ["CLIMATE_ICT", "LAWICT", "AI_IIT", "DSERV", "ELEARN", "DCOMMS", "SEC"];
+
 /**
- * Determines whether a course code belongs to `thales.cs.unipi.gr` (`"thales"`)
- * or `eclass.unipi.gr` (`"central"`).
+ * Best guess of the portal a course code lives on, used before the course has been seen in a
+ * listing (listings record the real portal of every course they return).
  */
-export function resolveUniPiPortalForCourse(courseCode: string): "thales" | "central" {
+export function resolveUniPiPortalForCourse(courseCode: string): UniPiPortal {
   const c = courseCode.trim().toUpperCase();
+  if (c.startsWith("DS-") || /^DS\d/.test(c)) return "aristarchus";
+  if (LEFKIPPOS_PREFIXES.some((p) => c.startsWith(p))) return "lefkippos";
   if (
     c.startsWith("TM") ||
     c.startsWith("CDS") ||
@@ -443,16 +488,8 @@ export function resolveUniPiPortalForCourse(courseCode: string): "thales" | "cen
 }
 
 /* ------------------------------------------------------------------ */
-/* Automatic University & Department Detection from Credentials        */
+/* Department detection from the CAS username                        */
 /* ------------------------------------------------------------------ */
-
-/**
- * Detects the university ID from a student's CAS username or e-mail.
- * Returns `null` when it is ambiguous (the user must then pick a university).
- */
-export function detectUniversityFromUsername(rawUsername: string): string | null {
-  return detectUniversityId(rawUsername);
-}
 
 /**
  * Automatically resolves the University of Piraeus department ID from the
@@ -539,6 +576,22 @@ export function hasPastAcademicYearTag(text: string, now = new Date()): boolean 
 }
 
 /**
+ * True for catalog entries that are exam rooms of a past exam period, e.g.
+ * "ΕΞΕΤΑΣΗ ΦΕΒΡ2024" or "[ΨΣ-507] … - Εξετάσεις Φεβρ.24". Current exam rooms stay visible.
+ */
+export function isPastExamRoom(title: string, now = new Date()): boolean {
+  const t = title
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "");
+  if (!/εξετασ|εξεταση|exam/.test(t)) return false;
+  if (hasPastAcademicYearTag(title, now)) return true;
+  const { startYear } = getCurrentAcademicYearBounds(now);
+  const m = t.match(/(?:ιαν|φεβ|μαρ|απρ|μαι|ιουν|ιουλ|αυγ|σεπ|οκτ|νοε|δεκ|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-zα-ω]*\.?\s*'?(\d{2})(?![\d/])/);
+  return Boolean(m && Number(m[1]) + 2000 < startYear);
+}
+
+/**
  * Filters raw eClass assignments so only current academic-year / active assignments appear.
  */
 export function filterCurrentAcademicYearAssignments(
@@ -614,4 +667,28 @@ export function filterCurrentAcademicYearAnnouncements(
     if (hasPastAcademicYearTag(a.title, now) && (Number.isNaN(dMs) || dMs < startMs)) return false;
     return true;
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* Course titles with the semester and code inline                     */
+/* ------------------------------------------------------------------ */
+
+const BRACKET_SEMESTER: Record<string, number> = {
+  Α: 1, A: 1, Β: 2, B: 2, Γ: 3, Δ: 4, Ε: 5, E: 5, ΣΤ: 6, Ζ: 7, Z: 7, Η: 8, H: 8,
+};
+
+/**
+ * Digital Systems portals name courses like "[Α] - (ΨΣ-014) - Λογική και Λογικός Προγραμματισμός".
+ * Splits that into the plain title, the curriculum code and the semester. Titles that do not
+ * follow the pattern come back unchanged.
+ */
+export function splitCourseTitle(raw: string): { title: string; curriculumCode?: string; semesterIndex?: number } {
+  const m = raw.trim().match(/^(?:[[(]\s*([^[\]()]{1,3}?)\s*[\])]\s*[-–]?\s*)?(?:\(([^()]{2,24})\)\s*[-–]?\s*)?(.+)$/);
+  if (!m) return { title: raw };
+  const semesterIndex = m[1] ? BRACKET_SEMESTER[m[1].toUpperCase()] : undefined;
+  const curriculumCode = m[2] && /\d/.test(m[2]) ? m[2].trim() : undefined;
+  if (semesterIndex === undefined && !curriculumCode) return { title: raw };
+  // A parenthesis that is not a code ("(Lab)") stays part of the title
+  const title = (m[2] && !curriculumCode ? `(${m[2]}) ${m[3]}` : m[3]).trim();
+  return { title, curriculumCode, semesterIndex };
 }

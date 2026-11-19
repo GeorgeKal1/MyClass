@@ -17,31 +17,31 @@ import {
   DocumentSummaryRequest,
   LoginRequest,
   SettingsPatch,
+  StudyRequest,
+  TriageRequest,
   type ChatMessage,
   type Me,
+  type MyStats,
 } from "@myclass/shared";
 import {
-  buildGoogleOAuthUrl,
   executeConfirmedAction,
-  handleGoogleOAuthCallback,
+  generateStudyMaterial,
   runAssistantTurn,
   summarizeCourseDocument,
+  triageAnnouncements,
 } from "./ai.js";
+import { buildDeadlinesIcs, markDeadlineSubmitted, rememberDeadlines, widgetData } from "./deadlines.js";
+import { AiQuotaError, quotaFor } from "./quota.js";
 import { encrypt, randomId, sha256 } from "./crypto.js";
 import {
   forgetUserSession,
   getConnectorForUser,
   performEclassLogin,
   setTransientCredentials,
+  userDepartmentId,
 } from "./eclass/connector.js";
-import {
-  detectUniPiDepartmentFromUsername,
-  detectUniversityFromUsername,
-  hasPastAcademicYearTag,
-  SEMESTERS,
-  UNIPI_DEPARTMENTS,
-} from "./eclass/unipi-curriculum.js";
-import { getUniversity, UNIVERSITIES } from "./eclass/universities.js";
+import { hasPastAcademicYearTag, SEMESTERS, UNIPI_DEPARTMENTS } from "./eclass/unipi-curriculum.js";
+import { UNIPI } from "./eclass/universities.js";
 import { env, publicUrl } from "./env.js";
 import {
   emitNotification,
@@ -106,13 +106,12 @@ const failedLoginMap = new Map<string, { count: number; resetAt: number }>();
 /* ------------------------------------------------------------------ */
 
 function toMe(u: UserRecord): Me {
-  const uni = getUniversity(u.universityId);
-  const deptId = u.universityId === "unipi" ? detectUniPiDepartmentFromUsername(u.username) : "default";
+  const deptId = userDepartmentId(u);
   const dept = UNIPI_DEPARTMENTS.find((d) => d.id === deptId);
   return {
     id: u.id,
-    universityId: u.universityId,
-    universityName: uni?.name ?? u.universityId,
+    universityId: UNIPI.id,
+    universityName: UNIPI.name,
     departmentId: dept?.id ?? deptId,
     departmentName: dept?.name,
     username: u.username,
@@ -121,15 +120,10 @@ function toMe(u: UserRecord): Me {
     settings: u.settings,
     ai: {
       hasApiKey: Boolean(u.ai.encApiKey),
-      googleConnected: Boolean(
-        u.ai.google?.encRefreshToken ||
-          u.ai.google?.accessToken ||
-          (u.settings.ai.mode === "google" && u.ai.encApiKey),
-      ),
-      googleEmail: u.ai.google?.email,
-      googleAvailable: Boolean(env.google.clientId && env.google.clientSecret),
       serverKeyAvailable: Boolean(env.gemini.apiKey),
+      quota: quotaFor(u),
     },
+    calendarFeedUrl: u.calendarToken ? `${publicUrl}/api/calendar/${u.calendarToken}.ics` : undefined,
   };
 }
 
@@ -162,6 +156,9 @@ app.onError((err, c) => {
   if (err instanceof HttpError) {
     return c.json({ error: err.message }, err.status as 400);
   }
+  if (err instanceof AiQuotaError) {
+    return c.json({ error: err.message, resetAt: err.resetAt }, 429);
+  }
   if (err instanceof ZodError) {
     return c.json({ error: "Invalid request" }, 400);
   }
@@ -178,8 +175,6 @@ app.onError((err, c) => {
 
 app.get("/api/health", (c) => c.json({ ok: true, time: new Date().toISOString() }));
 
-app.get("/api/universities", (c) => c.json({ universities: UNIVERSITIES }));
-
 app.post("/api/auth/login", async (c) => {
   const body = LoginRequest.parse(await c.req.json());
   const rateKey = body.username.trim().toLowerCase();
@@ -189,18 +184,7 @@ app.post("/api/auth/login", async (c) => {
     throw new HttpError(429, "Too many failed login attempts. Please wait 5 minutes and try again.");
   }
 
-  const resolvedUniId =
-    !body.universityId || body.universityId === "auto"
-      ? detectUniversityFromUsername(body.username)
-      : body.universityId;
-  const uni = resolvedUniId ? getUniversity(resolvedUniId) : undefined;
-  if (!uni) {
-    throw new HttpError(
-      400,
-      resolvedUniId ? "Unknown university" : "Please choose your university",
-    );
-  }
-  console.log(`[login attempt] university=${uni.id}`);
+  const uni = UNIPI;
 
   const userId = sha256(`${uni.id}:${body.username.trim().toLowerCase()}`).slice(0, 24);
   const existing = users.get(userId) ?? newUser(userId, uni.id, body.username.trim());
@@ -211,7 +195,6 @@ app.post("/api/auth/login", async (c) => {
   try {
     const { http, displayName } = await performEclassLogin(uni, existing.username, body.password);
     failedLoginMap.delete(rateKey);
-    console.log(`[login success] university=${uni.id}`);
     existing.displayName = displayName || existing.username;
     const serialized = http.serialize();
     setTransientCredentials(userId, body.password, serialized);
@@ -231,6 +214,8 @@ app.post("/api/auth/login", async (c) => {
   }
 
   users.upsert(existing);
+  // A new eClass session (and possibly other portals): recount the stats on the next visit
+  statsCache.delete(userId);
 
   const sid = randomId(24);
   sessions.create(sid, userId);
@@ -258,6 +243,7 @@ app.post("/api/auth/logout", (c) => {
 app.delete("/api/auth/account", (c) => {
   const u = requireUser(c);
   forgetUserSession(u.id);
+  statsCache.delete(u.id);
   users.delete(u.id);
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
   return c.json({ ok: true });
@@ -276,11 +262,15 @@ app.get("/api/me", (c) => {
 app.patch("/api/settings", async (c) => {
   const u = requireUser(c);
   const patch = SettingsPatch.parse(await c.req.json());
+  if (patch.departmentId && !UNIPI_DEPARTMENTS.some((d) => d.id === patch.departmentId)) {
+    throw new HttpError(400, "Unknown department");
+  }
   users.update(u.id, (rec) => {
     rec.settings = {
       ...rec.settings,
       ...patch,
       notify: { ...rec.settings.notify, ...(patch.notify ?? {}) },
+      accessibility: { ...rec.settings.accessibility, ...(patch.accessibility ?? {}) },
       downloads: { ...rec.settings.downloads, ...(patch.downloads ?? {}) },
       ai: { ...rec.settings.ai, ...(patch.ai ?? {}) },
     };
@@ -305,53 +295,7 @@ app.delete("/api/ai/apikey", (c) => {
   const u = requireUser(c);
   users.update(u.id, (rec) => {
     rec.ai.encApiKey = undefined;
-  });
-  return c.json({ me: toMe(users.get(u.id)!) });
-});
-
-app.get("/api/ai/google/start", (c) => {
-  const u = requireUser(c);
-  const url = buildGoogleOAuthUrl(u.id);
-  if (url) {
-    return c.json({ mode: "oauth" as const, url });
-  }
-  return c.json({
-    mode: "aistudio" as const,
-    url: "https://aistudio.google.com/app/apikey",
-  });
-});
-
-app.post("/api/ai/google/connect", async (c) => {
-  const u = requireUser(c);
-  const { apiKey, email } = (await c.req.json()) as { apiKey?: string; email?: string };
-  if (!apiKey || apiKey.trim().length < 10) {
-    throw new HttpError(400, "Please paste your Google Gemini key from Google AI Studio");
-  }
-  users.update(u.id, (rec) => {
-    rec.ai.encApiKey = encrypt(apiKey.trim());
-    rec.ai.google = {
-      email: email?.trim() || `${rec.username}@google`,
-      accessToken: "aistudio-key",
-      expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000,
-    };
-    rec.settings.ai.mode = "google";
-  });
-  return c.json({ me: toMe(users.get(u.id)!) });
-});
-
-app.get("/api/ai/google/callback", async (c) => {
-  const code = c.req.query("code") || "";
-  const state = c.req.query("state") || "";
-  if (!code || !state) return c.redirect(`${env.webOrigin}/settings?google=error`);
-  await handleGoogleOAuthCallback(code, state);
-  return c.redirect(`${env.webOrigin}/settings?google=connected`);
-});
-
-app.post("/api/ai/google/disconnect", (c) => {
-  const u = requireUser(c);
-  users.update(u.id, (rec) => {
-    rec.ai.google = undefined;
-    if (rec.settings.ai.mode === "google") rec.settings.ai.mode = "server";
+    rec.settings.ai.mode = "server";
   });
   return c.json({ me: toMe(users.get(u.id)!) });
 });
@@ -382,13 +326,33 @@ app.patch("/api/courses/:code/meta", async (c) => {
   return c.json({ ok: true, meta: users.get(u.id)!.courseMeta[code] });
 });
 
+/**
+ * Usage stats change slowly and cost eClass a year-long query, so they are kept for 15 minutes.
+ * Background checks keep landing in eClass' log and in the hit ledger together, so a cached
+ * result stays consistent; it is dropped on login and account deletion, and `?fresh=1` skips it.
+ */
+const statsCache = new Map<string, { at: number; stats: MyStats }>();
+const STATS_TTL_MS = 15 * 60 * 1000;
+
+app.get("/api/stats", async (c) => {
+  const u = requireUser(c);
+  const cached = statsCache.get(u.id);
+  if (cached && Date.now() - cached.at < STATS_TTL_MS && c.req.query("fresh") !== "1") {
+    return c.json({ stats: cached.stats });
+  }
+  const stats = await getConnectorForUser(u).getMyStats();
+  if (!stats.warnings) statsCache.set(u.id, { at: Date.now(), stats });
+  return c.json({ stats });
+});
+
 app.get("/api/catalog", async (c) => {
   const u = requireUser(c);
   const q = c.req.query("q") || undefined;
   const department = c.req.query("department") || undefined;
   const connector = getConnectorForUser(u);
   const departments = await connector.listDepartments();
-  const activeDepartment = department || connector.defaultDepartmentId();
+  const activeDepartment =
+    department && UNIPI_DEPARTMENTS.some((d) => d.id === department) ? department : connector.defaultDepartmentId();
   const catalog = await connector.listCatalog(q, activeDepartment);
   return c.json({ catalog, departments, activeDepartment });
 });
@@ -417,6 +381,18 @@ app.get("/api/announcements", async (c) => {
   return c.json({ announcements });
 });
 
+/** "Action needed" / "FYI" for the student's current announcements (cached per announcement). */
+app.post("/api/announcements/triage", async (c) => {
+  const u = requireUser(c);
+  // The app sends the announcements it already loaded, so eClass is not asked twice
+  const { items } = TriageRequest.parse(await c.req.json());
+  const triage = await triageAnnouncements(
+    u,
+    items.map((a) => ({ ...a, contentHtml: "" })),
+  );
+  return c.json({ triage });
+});
+
 app.get("/api/messages", async (c) => {
   const u = requireUser(c);
   const connector = getConnectorForUser(u);
@@ -438,6 +414,7 @@ app.get("/api/assignments", async (c) => {
   const courseCode = c.req.query("course") || undefined;
   const connector = getConnectorForUser(u);
   const assignments = await connector.getAssignments(courseCode);
+  rememberDeadlines(u, assignments, courseCode);
   return c.json({ assignments });
 });
 
@@ -483,6 +460,7 @@ app.post(
       comments,
     });
     if (!result.ok) throw new HttpError(422, result.message);
+    markDeadlineSubmitted(u, c.req.param("code"), c.req.param("id"));
     void pollUserNow(u);
     return c.json({ result });
   },
@@ -510,7 +488,7 @@ app.post("/api/courses/:code/documents/summary", async (c) => {
   const u = requireUser(c);
   const { path: docPath, refresh } = DocumentSummaryRequest.parse(await c.req.json());
   try {
-    const res = await summarizeCourseDocument(u, c.req.param("code"), docPath, { refresh });
+    const res = await summarizeCourseDocument(u, c.req.param("code"), docPath, { refresh, countQuota: true });
     return c.json({
       summary: {
         path: docPath,
@@ -521,6 +499,19 @@ app.post("/api/courses/:code/documents/summary", async (c) => {
       },
     });
   } catch (err) {
+    if (err instanceof AiQuotaError) throw err;
+    throw new HttpError(422, (err as Error).message);
+  }
+});
+
+app.post("/api/courses/:code/documents/study", async (c) => {
+  const u = requireUser(c);
+  const { path: docPath, kind, refresh } = StudyRequest.parse(await c.req.json());
+  try {
+    const material = await generateStudyMaterial(u, c.req.param("code"), docPath, kind, { refresh });
+    return c.json({ material, me: toMe(users.get(u.id)!) });
+  } catch (err) {
+    if (err instanceof AiQuotaError) throw err;
     throw new HttpError(422, (err as Error).message);
   }
 });
@@ -701,19 +692,14 @@ app.post("/api/notifications/test", async (c) => {
   const item = {
     id: `test-${randomId(6)}`,
     kind: "announcement" as const,
-    title:
-      u.settings.language === "el"
-        ? "Κρυπτογραφία (TMC106): Έλεγχος Ειδοποιήσεων eClass"
-        : "Cryptography (TMC106): eClass Notification Check",
+    title: u.settings.language === "el" ? "myClass: Δοκιμαστική ειδοποίηση" : "myClass: Test notification",
     body:
       u.settings.language === "el"
-        ? "Δοκιμαστική ειδοποίηση από το myClass — οι ειδοποιήσεις σε πραγματικό χρόνο λειτουργούν κανονικά!"
-        : "Test notification from myClass — real-time alerts are working!",
-    courseCode: "TMC106",
-    courseTitle: "ΚΡΥΠΤΟΓΡΑΦΙΑ",
+        ? "Οι ειδοποιήσεις σε αυτή τη συσκευή λειτουργούν."
+        : "Notifications on this device are working.",
     date: new Date().toISOString(),
     read: false,
-    route: "/courses/TMC106?tab=announcements",
+    route: "/",
   };
   await emitNotification(u, item);
   return c.json({ notification: item });
@@ -736,6 +722,43 @@ app.post("/api/notifications/subscribe", async (c) => {
     rec.settings.notify.push = true;
   });
   return c.json({ ok: true, me: toMe(users.get(u.id)!) });
+});
+
+/* ------------------------------------------------------------------ */
+/* Calendar feed + home-screen widget                                  */
+/* ------------------------------------------------------------------ */
+
+/** Turns on (or renews: the old link stops working) the private deadlines feed. */
+app.post("/api/calendar/feed", (c) => {
+  const u = requireUser(c);
+  users.update(u.id, (rec) => {
+    rec.calendarToken = randomId(24);
+  });
+  return c.json({ me: toMe(users.get(u.id)!) });
+});
+
+app.delete("/api/calendar/feed", (c) => {
+  const u = requireUser(c);
+  users.update(u.id, (rec) => {
+    rec.calendarToken = undefined;
+  });
+  return c.json({ me: toMe(users.get(u.id)!) });
+});
+
+/** Read by calendar apps without a cookie: the secret token in the path is the only key. */
+app.get("/api/calendar/:file", (c) => {
+  const token = c.req.param("file").replace(/\.ics$/, "");
+  const owner = token.length >= 20 ? users.all().find((x) => x.calendarToken === token) : undefined;
+  if (!owner) return c.text("Not found", 404);
+  c.header("Content-Type", "text/calendar; charset=utf-8");
+  c.header("Cache-Control", "private, max-age=900");
+  return c.body(buildDeadlinesIcs(users.get(owner.id)!, publicUrl));
+});
+
+/** Data for the Windows Widgets board card (template in /widgets/deadlines.json). */
+app.get("/api/widget/deadlines", (c) => {
+  c.header("Cache-Control", "no-store");
+  return c.json(widgetData(getAuthedUser(c)));
 });
 
 app.get("/api/notifications/stream", (c) => {
@@ -867,5 +890,5 @@ if (clientDist) {
 startBackgroundPoller();
 
 serve({ fetch: app.fetch, port: env.port }, (info) => {
-  console.log(`✓ myClass server listening on http://localhost:${info.port}`);
+  console.log(`myClass server listening on http://localhost:${info.port}`);
 });

@@ -8,7 +8,7 @@ import crypto from "node:crypto";
 // turning verification off.
 if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
   console.warn(
-    "[env] WARNING: NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate checks for Gemini, Google and Web Push requests. Remove it.",
+    "[env] WARNING: NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate checks for Gemini and Web Push requests. Remove it.",
   );
 }
 
@@ -40,7 +40,7 @@ function devSecret(envName: string, file: string, gen: () => string): string {
 
 const port = Number(str("PORT", "8787"));
 
-/** Public base URL of this server (used for OAuth redirects and secure-cookie detection). */
+/** Public base URL of this server (used for secure-cookie detection). */
 export const publicUrl = str("PUBLIC_URL", `http://localhost:${port}`).replace(/\/+$/, "");
 
 export const env = {
@@ -56,16 +56,9 @@ export const env = {
   ),
   gemini: {
     apiKey: str("GEMINI_API_KEY"),
-    model: str("GEMINI_MODEL", "gemini-3.8-flash"),
-  },
-  google: {
-    clientId: str("GOOGLE_CLIENT_ID"),
-    clientSecret: str("GOOGLE_CLIENT_SECRET"),
-    redirectUri: str("GOOGLE_REDIRECT_URI", `${publicUrl}/api/ai/google/callback`),
-    scopes: str(
-      "GOOGLE_OAUTH_SCOPES",
-      "https://www.googleapis.com/auth/generative-language.retriever https://www.googleapis.com/auth/cloud-platform",
-    ),
+    model: str("GEMINI_MODEL"),
+    /** AI requests per student per hour on the shared key (0 = no limit). Own keys are never limited. */
+    hourlyLimit: ((n) => (Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 15))(Number(str("AI_HOURLY_LIMIT", "15"))),
   },
   vapid: {
     publicKey: str("VAPID_PUBLIC_KEY"),
@@ -81,7 +74,7 @@ if (env.encryptionKey.length !== 32) {
 if (isProd) {
   const problems: string[] = [];
   if (!process.env.PUBLIC_URL?.trim()) {
-    problems.push("PUBLIC_URL is not set (Google OAuth redirects will point to localhost)");
+    problems.push("PUBLIC_URL is not set (secure cookies and links will assume localhost)");
   } else if (!publicUrl.startsWith("https://")) {
     problems.push("PUBLIC_URL is not https:// (session cookies are marked Secure, so browsers may drop them)");
   }

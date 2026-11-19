@@ -1,17 +1,17 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Archive,
-  ArchiveRestore,
   ArrowUpRight,
   Bell,
   BookOpen,
   Bot,
   Calendar,
+  ChartNoAxesColumn,
   Check,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  CircleAlert,
   Clock,
   Download,
   ExternalLink,
@@ -19,21 +19,17 @@ import {
   Folder,
   FolderOpen,
   FolderUp,
-  Globe,
   House as HomeIcon,
-  Inbox,
-  KeyRound,
   LogOut,
   Mail,
+  Megaphone,
   Monitor,
   Moon,
-  Plus,
   RefreshCw,
   Search,
   Send,
   Settings,
   ShieldCheck,
-  Sparkles,
   Sun,
   Trash2,
   User,
@@ -43,6 +39,7 @@ import {
 } from "lucide-react";
 import type {
   Announcement,
+  AnnouncementTriage,
   Assignment,
   CatalogCourse,
   PortalWarning,
@@ -55,9 +52,8 @@ import type {
   Message,
   NotificationItem,
   ThemePref,
-  University,
+  UserSettings,
 } from "@myclass/shared";
-import { detectUniversityId } from "@myclass/shared";
 import { api, ensureServiceWorker, isIosNeedsHomeScreen, registerWebPush, ServerUnavailableError } from "./api";
 import { Logo } from "./Logo";
 import { safeHref, sanitizeHtml } from "./sanitize";
@@ -69,9 +65,13 @@ import {
   DocumentSummaryButton,
   DocumentSummaryPanel,
 } from "./features";
+import { StatsView } from "./stats";
+import { StudyButton, StudyPanel } from "./study";
 
-type Tab = "home" | "courses" | "inbox" | "assistant" | "settings";
-const TAB_ORDER: Tab[] = ["home", "courses", "inbox", "assistant", "settings"];
+type Tab = "home" | "courses" | "inbox" | "assistant" | "stats" | "settings";
+const TAB_ORDER: Tab[] = ["home", "courses", "inbox", "assistant", "stats", "settings"];
+/** Pages a horizontal swipe moves between: the phone's bottom bar (Settings sits in the top bar). */
+const SWIPE_ORDER: Tab[] = ["home", "courses", "inbox", "assistant", "stats"];
 type CourseSubTab = "announcements" | "documents" | "assignments" | "info";
 const COURSE_SUB_TABS: CourseSubTab[] = ["announcements", "documents", "assignments", "info"];
 
@@ -93,6 +93,27 @@ function routeFromLocation(): Route {
   };
 }
 
+type Accessibility = UserSettings["accessibility"];
+const A11Y_KEY = "myclass.a11y";
+
+/** Last accessibility settings on this device, so text size and motion apply before sign-in loads. */
+function cachedAccessibility(): Accessibility {
+  try {
+    const raw = JSON.parse(localStorage.getItem(A11Y_KEY) ?? "null") as Partial<Accessibility> | null;
+    if (raw && typeof raw.fontScale === "number") {
+      return { fontScale: raw.fontScale, reduceMotion: raw.reduceMotion ?? "system" };
+    }
+  } catch {
+    /* storage unavailable */
+  }
+  return { fontScale: 1, reduceMotion: "system" };
+}
+
+/** True when movement should be skipped (Settings > Accessibility, or the device setting). */
+export function reducedMotion(): boolean {
+  return document.documentElement.classList.contains("reduce-motion");
+}
+
 function pathForRoute(r: Route): string {
   if (r.tab === "courses" && r.course) {
     return `/courses/${encodeURIComponent(r.course)}${r.sub !== "documents" ? `?tab=${r.sub}` : ""}`;
@@ -103,81 +124,55 @@ function pathForRoute(r: Route): string {
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [booting, setBooting] = useState(true);
-  const [universities, setUniversities] = useState<University[]>([]);
-  const initialRoute = useMemo(routeFromLocation, []);
-  const [tab, setTab] = useState<Tab>(initialRoute.tab);
-  const [selectedCourseCode, setSelectedCourseCode] = useState<string | null>(initialRoute.course);
-  const [coursesInitialViewMode, setCoursesInitialViewMode] = useState<"enrolled" | "all">("enrolled");
-  const [courseSubTab, setCourseSubTab] = useState<CourseSubTab>(initialRoute.sub);
-
-  // Mobile horizontal swipe navigation state
-  const touchStartRef = useRef<{
-    x: number;
-    y: number;
-    time: number;
-    ignore: boolean;
-    locked: "x" | "y" | null;
-  } | null>(null);
-  const [swipeOffset, setSwipeOffset] = useState(0);
-  const [slideDir, setSlideDir] = useState<"left" | "right" | null>(null);
-
-  const [courses, setCourses] = useState<Course[]>([]);
-  const [courseWarnings, setCourseWarnings] = useState<PortalWarning[]>([]);
-  const [assignmentsLoading, setAssignmentsLoading] = useState(false);
-  const [focusAssignmentId, setFocusAssignmentId] = useState<string | null>(null);
-  const [catalog, setCatalog] = useState<CatalogCourse[]>([]);
-  const [departments, setDepartments] = useState<DepartmentInfo[]>([]);
-  const [activeDepartment, setActiveDepartment] = useState<string>("");
-  const [catalogLoading, setCatalogLoading] = useState(false);
-
-  const [announcements, setAnnouncements] = useState<Announcement[]>([]);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [assignments, setAssignments] = useState<Assignment[]>([]);
-  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
-  const [lastPollAt, setLastPollAt] = useState<string | undefined>();
-  const [syncing, setSyncing] = useState(false);
-  const [toast, setToast] = useState<string | null>(null);
-  const [bellOpen, setBellOpen] = useState(false);
-  const [quickChatOpen, setQuickChatOpen] = useState(false);
-
   // Fallback theme & language before login
   const [guestTheme, setGuestTheme] = useState<ThemePref>("dark");
   const [guestLang, setGuestLang] = useState<Lang>("el");
-
   const theme: ThemePref = me?.settings.theme ?? guestTheme;
   const lang: Lang = me?.settings.language ?? guestLang;
-  const tr = useCallback((k: DictKey) => t(lang, k), [lang]);
+  const [guestAccess] = useState(cachedAccessibility);
+  const access: Accessibility = me?.settings.accessibility ?? guestAccess;
 
-  const showToast = useCallback((msg: string) => {
-    setToast(msg);
-    setTimeout(() => setToast((cur) => (cur === msg ? null : cur)), 4000);
-  }, []);
+  // Text size and reduced motion on <html> (remembered on this device for the next start)
+  useEffect(() => {
+    const root = document.documentElement;
+    root.style.setProperty("--font-scale", String(access.fontScale));
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const apply = () =>
+      root.classList.toggle("reduce-motion", access.reduceMotion === "on" || (access.reduceMotion === "system" && mq.matches));
+    apply();
+    mq.addEventListener("change", apply);
+    try {
+      localStorage.setItem(A11Y_KEY, JSON.stringify(access));
+    } catch {
+      /* storage unavailable */
+    }
+    return () => mq.removeEventListener("change", apply);
+  }, [access.fontScale, access.reduceMotion]);
 
   // Apply light / dark theme class to <html>
   useEffect(() => {
     const root = document.documentElement;
     const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
     const isDark = theme === "dark" || (theme === "system" && prefersDark);
+    if (root.classList.contains("dark") === isDark) return;
+    // Turn transitions off while every color flips, then back on after the next paint
+    root.classList.add("theme-switching");
     root.classList.toggle("dark", isDark);
+    const id = requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove("theme-switching")));
+    return () => {
+      cancelAnimationFrame(id);
+      root.classList.remove("theme-switching");
+    };
   }, [theme]);
 
-  // Initial session, Service Worker registration & universities check
+  useEffect(() => {
+    document.documentElement.lang = lang;
+  }, [lang]);
+
+  // Initial session check & Service Worker registration
   useEffect(() => {
     void ensureServiceWorker();
     let cancelled = false;
-    // Load the university list independently of the session check, and retry
-    // while the API server is unreachable (e.g. still starting up).
-    void (async () => {
-      for (let attempt = 0; attempt < 30 && !cancelled; attempt++) {
-        try {
-          const uRes = await api.universities();
-          if (!cancelled) setUniversities(uRes.universities);
-          return;
-        } catch {
-          await new Promise((r) => setTimeout(r, 2000));
-        }
-      }
-    })();
     void (async () => {
       try {
         const mRes = await api.me();
@@ -193,29 +188,135 @@ export function App() {
     };
   }, []);
 
-  const activeDeptRef = useRef(activeDepartment);
-  activeDeptRef.current = activeDepartment;
+  if (booting) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[var(--bg)] text-[var(--muted)]">
+        <div className="flex items-center gap-3 text-sm">
+          <RefreshCw className="w-4 h-4 animate-spin text-[var(--accent)]" />
+          <span>myClass</span>
+        </div>
+      </div>
+    );
+  }
 
-  const loadDepartmentCatalog = useCallback(
+  if (!me) {
+    return (
+      <LoginScreen
+        lang={lang}
+        theme={theme}
+        onToggleLang={() => setGuestLang((l) => (l === "el" ? "en" : "el"))}
+        onToggleTheme={() => setGuestTheme((th) => (th === "dark" ? "light" : "dark"))}
+        onLoggedIn={(loggedInMe) => setMe(loggedInMe)}
+      />
+    );
+  }
+
+  // Keyed by user id: signing in as someone else starts from a clean slate (courses, catalog, chat…)
+  return (
+    <Workspace
+      key={me.id}
+      me={me}
+      setMe={setMe}
+      onLoggedOut={() => {
+        window.history.replaceState(null, "", "/");
+        setMe(null);
+      }}
+    />
+  );
+}
+
+/* ================================================================== */
+/* Signed-in workspace                                                 */
+/* ================================================================== */
+
+function Workspace({
+  me,
+  setMe,
+  onLoggedOut,
+}: {
+  me: Me;
+  setMe: (m: Me) => void;
+  onLoggedOut: () => void;
+}) {
+  const initialRoute = useMemo(routeFromLocation, []);
+  const [tab, setTab] = useState<Tab>(initialRoute.tab);
+  const [selectedCourseCode, setSelectedCourseCode] = useState<string | null>(initialRoute.course);
+  const [coursesInitialViewMode, setCoursesInitialViewMode] = useState<"enrolled" | "all">("enrolled");
+  const [courseSubTab, setCourseSubTab] = useState<CourseSubTab>(initialRoute.sub);
+
+  // Mobile horizontal swipe navigation state
+  const touchStartRef = useRef<{
+    x: number;
+    y: number;
+    time: number;
+    ignore: boolean;
+    locked: "x" | "y" | null;
+  } | null>(null);
+  const pageRef = useRef<HTMLDivElement>(null);
+  const swipeSamples = useRef<Array<{ x: number; t: number }>>([]);
+  const springFrame = useRef<number | null>(null);
+  const setPageOffset = (px: number) => {
+    const el = pageRef.current;
+    if (el) el.style.transform = px ? `translateX(${px}px)` : "";
+  };
+  const [slideDir, setSlideDir] = useState<"left" | "right" | null>(null);
+
+  const [courses, setCourses] = useState<Course[]>([]);
+  const [courseWarnings, setCourseWarnings] = useState<PortalWarning[]>([]);
+  const [assignmentsLoading, setAssignmentsLoading] = useState(false);
+  const [focusAssignmentId, setFocusAssignmentId] = useState<string | null>(null);
+  const [catalog, setCatalog] = useState<CatalogCourse[]>([]);
+  const [departments, setDepartments] = useState<DepartmentInfo[]>([]);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+
+  const [announcements, setAnnouncements] = useState<Announcement[]>([]);
+  const [triage, setTriage] = useState<Record<string, AnnouncementTriage>>({});
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [assignments, setAssignments] = useState<Assignment[]>([]);
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [lastPollAt, setLastPollAt] = useState<string | undefined>();
+  const [syncing, setSyncing] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const [quickChatOpen, setQuickChatOpen] = useState(false);
+
+  const theme: ThemePref = me.settings.theme;
+  const lang: Lang = me.settings.language;
+  const departmentId = me.departmentId ?? "";
+  const tr = useCallback((k: DictKey) => t(lang, k), [lang]);
+
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast((cur) => (cur === msg ? null : cur)), 4000);
+  }, []);
+
+  /** The department is part of the user's settings, so the catalog follows `me.departmentId`. */
+  const changeDepartment = useCallback(
     async (deptId: string) => {
-      setActiveDepartment(deptId);
-      setCatalogLoading(true);
+      if (!deptId || deptId === departmentId) return;
       try {
-        const catRes = await api.catalog(undefined, deptId);
-        setCatalog(catRes.catalog);
-        if (catRes.departments) setDepartments(catRes.departments);
-        if (catRes.activeDepartment) setActiveDepartment(catRes.activeDepartment);
+        const res = await api.patchSettings({ departmentId: deptId });
+        setMe(res.me);
       } catch (err) {
         showToast((err as Error).message);
-      } finally {
-        setCatalogLoading(false);
       }
     },
-    [showToast],
+    [departmentId, setMe, showToast],
   );
 
+  const loadCatalog = useCallback(async () => {
+    setCatalogLoading(true);
+    try {
+      const catRes = await api.catalog(undefined, departmentId || undefined);
+      setCatalog(catRes.catalog);
+      if (catRes.departments) setDepartments(catRes.departments);
+    } catch (err) {
+      showToast((err as Error).message);
+    } finally {
+      setCatalogLoading(false);
+    }
+  }, [departmentId, showToast]);
+
   const refreshAllData = useCallback(async () => {
-    if (!me) return;
     setSyncing(true);
     setAssignmentsLoading(true);
     // Each source updates the UI as soon as it arrives (assignments are the slowest: one request per course)
@@ -229,11 +330,6 @@ export function App() {
         setCourses(r.courses);
         setCourseWarnings(r.warnings ?? []);
       }),
-      track(api.catalog(undefined, activeDeptRef.current), (r) => {
-        setCatalog(r.catalog);
-        if (r.departments) setDepartments(r.departments);
-        if (r.activeDepartment) setActiveDepartment(r.activeDepartment);
-      }),
       track(api.announcements(), (r) => setAnnouncements(r.announcements)),
       track(api.messages(), (r) => setMessages(r.messages)),
       track(api.assignments(), (r) => setAssignments(r.assignments)).finally(() => setAssignmentsLoading(false)),
@@ -244,33 +340,62 @@ export function App() {
     ]);
     if (firstError) showToast(firstError);
     setSyncing(false);
-  }, [me, showToast]);
+  }, [showToast]);
+
+  /** Everything the Refresh button does: poll eClass now, then reload every list. */
+  const syncNow = useCallback(async () => {
+    setSyncing(true);
+    try {
+      await api.pollNow();
+      await Promise.all([refreshAllData(), loadCatalog()]);
+    } catch (err) {
+      showToast((err as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }, [refreshAllData, loadCatalog, showToast]);
 
   useEffect(() => {
-    if (me) void refreshAllData();
-  }, [me, refreshAllData]);
+    void refreshAllData();
+  }, [refreshAllData]);
+
+  useEffect(() => {
+    void loadCatalog();
+  }, [loadCatalog]);
+
+  // "Action needed" / "FYI" for announcements not classified yet (cached server-side per announcement)
+  const triageRequested = useRef(new Set<string>());
+  useEffect(() => {
+    const missing = announcements.filter((a) => !triageRequested.current.has(a.id));
+    if (!missing.length) return;
+    for (const a of missing) triageRequested.current.add(a.id);
+    api
+      .triage(missing)
+      .then((r) => setTriage((prev) => ({ ...prev, ...r.triage })))
+      .catch(() => {
+        for (const a of missing) triageRequested.current.delete(a.id);
+      });
+  }, [announcements]);
 
   // Live SSE notification stream
   useEffect(() => {
-    if (!me) return;
     const es = new EventSource("/api/notifications/stream", { withCredentials: true });
     es.addEventListener("notification", (ev) => {
       try {
         const item = JSON.parse((ev as MessageEvent).data) as NotificationItem;
         setNotifications((prev) => [item, ...prev]);
-        showToast(`🔔 ${item.title}`);
+        showToast(item.title);
       } catch {
         /* ignore */
       }
     });
     return () => es.close();
-  }, [me, showToast]);
+  }, [showToast]);
 
   // Keep the URL in sync with the current view (one history entry per navigation).
   // After a popstate the URL already matches the new state, so nothing is pushed.
   const inAppHistoryRef = useRef(0);
   useEffect(() => {
-    if (!me) return;
     const path = pathForRoute({ tab, course: selectedCourseCode, sub: courseSubTab });
     const current = window.location.pathname + window.location.search;
     if (path === current) return;
@@ -284,7 +409,7 @@ export function App() {
       window.history.pushState(null, "", path);
       inAppHistoryRef.current += 1;
     }
-  }, [me, tab, selectedCourseCode, courseSubTab]);
+  }, [tab, selectedCourseCode, courseSubTab]);
 
   /** Back inside the app; if the page was opened directly (no in-app history), go to the list. */
   const goBack = useCallback(() => {
@@ -309,25 +434,12 @@ export function App() {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
-  // Result of the Google OAuth redirect (/settings?google=connected|error)
-  useEffect(() => {
-    if (!me) return;
-    const g = new URLSearchParams(window.location.search).get("google");
-    if (!g) return;
-    showToast(
-      g === "connected"
-        ? lang === "el"
-          ? "Συνδέθηκε ο λογαριασμός Google"
-          : "Google account connected"
-        : lang === "el"
-          ? "Η σύνδεση με Google απέτυχε"
-          : "Google sign-in failed",
-    );
-    window.history.replaceState(null, "", window.location.pathname);
-  }, [me, lang, showToast]);
-
-  const unreadNotifCount = useMemo(() => notifications.filter((n) => !n.read).length, [notifications]);
   const unreadMsgCount = useMemo(() => messages.filter((m) => !m.read).length, [messages]);
+  /** Unread messages plus unread non-message notifications (a message notification is the same item as the message). */
+  const inboxBadge = useMemo(
+    () => unreadMsgCount + notifications.filter((n) => !n.read && n.kind !== "message").length,
+    [unreadMsgCount, notifications],
+  );
 
   // Resolve active course from either enrolled courses OR the full university semester catalog
   const activeCourse: Course | null = useMemo(() => {
@@ -387,13 +499,13 @@ export function App() {
       goBack();
       return;
     }
-    const idx = TAB_ORDER.indexOf(tab);
-    if (idx > 0) navigateTab(TAB_ORDER[idx - 1], "right");
+    const idx = SWIPE_ORDER.indexOf(tab);
+    if (idx > 0) navigateTab(SWIPE_ORDER[idx - 1], "right");
   };
   const goNext = () => {
-    const idx = TAB_ORDER.indexOf(tab);
-    if (selectedCourseCode === null && idx < TAB_ORDER.length - 1) {
-      navigateTab(TAB_ORDER[idx + 1], "left");
+    const idx = SWIPE_ORDER.indexOf(tab);
+    if (selectedCourseCode === null && idx >= 0 && idx < SWIPE_ORDER.length - 1) {
+      navigateTab(SWIPE_ORDER[idx + 1], "left");
     }
   };
 
@@ -418,6 +530,9 @@ export function App() {
       }
     }
     const touch = e.touches[0];
+    if (springFrame.current !== null) cancelAnimationFrame(springFrame.current);
+    springFrame.current = null;
+    swipeSamples.current = [{ x: touch.clientX, t: performance.now() }];
     touchStartRef.current = { x: touch.clientX, y: touch.clientY, time: Date.now(), ignore, locked: null };
   };
 
@@ -432,26 +547,63 @@ export function App() {
       start.locked = Math.abs(dx) > Math.abs(dy) * 1.2 ? "x" : "y";
     }
     if (start.locked !== "x") return;
-    const idx = TAB_ORDER.indexOf(tab);
+    const now = performance.now();
+    swipeSamples.current = [...swipeSamples.current.filter((p) => now - p.t < 100), { x: touch.clientX, t: now }];
+    const idx = SWIPE_ORDER.indexOf(tab);
     const atEdge =
+      idx < 0 ||
       (dx > 0 && idx === 0 && selectedCourseCode === null) ||
-      (dx < 0 && (idx === TAB_ORDER.length - 1 || selectedCourseCode !== null));
-    // Rubber-band at the first/last page
-    setSwipeOffset(atEdge ? dx * 0.15 : dx * 0.85);
+      (dx < 0 && (idx === SWIPE_ORDER.length - 1 || selectedCourseCode !== null));
+    setPageOffset(atEdge ? rubberBand(dx, window.innerWidth) : dx * 0.85);
+  };
+
+  /** Hands the page back to a critically damped spring that starts at the finger's release velocity. */
+  const springPageBack = (from: number, velocity: number) => {
+    if (reducedMotion()) {
+      setPageOffset(0);
+      return;
+    }
+    const omega = (2 * Math.PI) / 0.5; // duration 0.5 s, bounce 0
+    const t0 = performance.now();
+    const step = (now: number) => {
+      const t = (now - t0) / 1000;
+      const x = (from + (velocity + omega * from) * t) * Math.exp(-omega * t);
+      if (t > 0.05 && Math.abs(x) < 0.5) {
+        setPageOffset(0);
+        springFrame.current = null;
+        return;
+      }
+      setPageOffset(x);
+      springFrame.current = requestAnimationFrame(step);
+    };
+    springFrame.current = requestAnimationFrame(step);
   };
 
   const handleTouchEnd = (e: React.TouchEvent<HTMLElement>) => {
     const start = touchStartRef.current;
     touchStartRef.current = null;
-    setSwipeOffset(0);
     if (!start || start.ignore || start.locked !== "x" || e.changedTouches.length === 0) return;
     const dx = e.changedTouches[0].clientX - start.x;
-    const velocity = Math.abs(dx) / Math.max(1, Date.now() - start.time);
+    const samples = swipeSamples.current;
+    const first = samples[0];
+    const last = samples[samples.length - 1];
+    // px per second over the last ~100 ms of the drag
+    const releaseVelocity = first && last && last.t > first.t ? ((last.x - first.x) / (last.t - first.t)) * 1000 : 0;
+    const el = pageRef.current;
+    const current = el ? new DOMMatrixReadOnly(getComputedStyle(el).transform).m41 : 0;
+
+    const idx = SWIPE_ORDER.indexOf(tab);
+    const canGo =
+      selectedCourseCode !== null ? dx > 0 : idx >= 0 && (dx > 0 ? idx > 0 : idx < SWIPE_ORDER.length - 1);
     const far = Math.abs(dx) > window.innerWidth * 0.22;
-    const flick = velocity > 0.45 && Math.abs(dx) > 30;
-    if (!far && !flick) return;
-    if (dx > 0) goBackOrPrev();
-    else goNext();
+    const flick = Math.abs(releaseVelocity) > 450 && Math.abs(dx) > 30 && Math.sign(releaseVelocity) === Math.sign(dx);
+    if (canGo && (far || flick)) {
+      setPageOffset(0);
+      if (dx > 0) goBackOrPrev();
+      else goNext();
+      return;
+    }
+    springPageBack(current, releaseVelocity);
   };
 
   const enrolledCount = useMemo(() => courses.filter((c) => !c.archived).length, [courses]);
@@ -461,53 +613,37 @@ export function App() {
     courses: tr("navCourses"),
     inbox: tr("navInbox"),
     assistant: tr("navAssistant"),
+    stats: tr("navStats"),
     settings: tr("navSettings"),
   };
 
-  if (booting) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-[var(--bg)] text-[var(--muted)]">
-        <div className="flex items-center gap-3 text-sm">
-          <RefreshCw className="w-4 h-4 animate-spin text-[var(--accent)]" />
-          <span>myClass...</span>
-        </div>
-      </div>
-    );
-  }
-
-  if (!me) {
-    return (
-      <LoginScreen
-        universities={universities}
-        lang={lang}
-        theme={theme}
-        onToggleLang={() => setGuestLang((l) => (l === "el" ? "en" : "el"))}
-        onToggleTheme={() => setGuestTheme((th) => (th === "dark" ? "light" : "dark"))}
-        onLoggedIn={(loggedInMe) => setMe(loggedInMe)}
-      />
-    );
-  }
-
   return (
     <div className="min-h-screen flex flex-col md:flex-row bg-[var(--bg)] text-[var(--text)]">
-      {/* Desktop Minimalist Sidebar */}
-      <aside className="hidden md:flex md:w-64 md:flex-col md:fixed md:inset-y-0 border-r border-[var(--border)] bg-[var(--surface)] px-4 py-5 select-none">
-        <div className="flex items-center justify-between px-2 mb-7">
+      {/* Desktop sidebar: brand + quick actions on top, navigation, account at the bottom */}
+      <aside className="hidden md:flex md:w-60 md:flex-col md:fixed md:inset-y-0 border-r border-[var(--border)] bg-[var(--surface)] px-3 py-4 select-none z-30">
+        <div className="flex items-center justify-between gap-2 px-1.5 mb-5">
           <button
             onClick={() => navigateTab("home")}
-            className="flex items-center gap-2.5 text-left group cursor-pointer"
+            className="flex items-center gap-2 text-left cursor-pointer min-w-0"
           >
-            <Logo size={36} />
-            <div>
-              <div className="font-semibold tracking-tight text-base leading-none">myClass</div>
-              <div className="text-xs text-[var(--muted)] mt-1 truncate max-w-[140px]">
-                {me.universityName}
-              </div>
-            </div>
+            <Logo size={30} />
+            <span className="font-display text-[17px] leading-none">myClass</span>
           </button>
+          <div className="flex items-center gap-0.5">
+            <IconButton label={syncing ? tr("syncing") : tr("syncNow")} onClick={() => void syncNow()} disabled={syncing}>
+              <RefreshCw className={`w-4 h-4 ${syncing ? "animate-spin text-[var(--accent)]" : ""}`} />
+            </IconButton>
+            <NotificationsBell
+              lang={lang}
+              notifications={notifications}
+              setNotifications={setNotifications}
+              onOpenCourse={(code) => openCourse(code, "announcements")}
+              placement="sidebar"
+            />
+          </div>
         </div>
 
-        <nav className="space-y-1 flex-1">
+        <nav className="space-y-0.5 flex-1">
           <NavButton
             icon={<HomeIcon className="w-4 h-4" />}
             label={tr("navHome")}
@@ -522,9 +658,9 @@ export function App() {
             onClick={() => navigateTab("courses", null, "enrolled")}
           />
           <NavButton
-            icon={<Inbox className="w-4 h-4" />}
+            icon={<Bell className="w-4 h-4" />}
             label={tr("navInbox")}
-            badge={unreadMsgCount || undefined}
+            badge={inboxBadge || undefined}
             active={tab === "inbox"}
             onClick={() => navigateTab("inbox")}
           />
@@ -535,173 +671,86 @@ export function App() {
             onClick={() => navigateTab("assistant")}
           />
           <NavButton
-            icon={<Settings className="w-4 h-4" />}
-            label={tr("navSettings")}
-            active={tab === "settings"}
-            onClick={() => navigateTab("settings")}
+            icon={<ChartNoAxesColumn className="w-4 h-4" />}
+            label={tr("navStats")}
+            active={tab === "stats"}
+            onClick={() => navigateTab("stats")}
           />
         </nav>
 
-        {/* Bottom user card */}
-        <div className="pt-4 border-t border-[var(--border)] space-y-2">
-          <div className="px-2.5 py-2 rounded-xl bg-[var(--surface-2)] flex items-center justify-between gap-2">
-            <div className="min-w-0">
-              <div className="text-xs font-medium truncate">{me.displayName}</div>
-              <div className="text-xs text-[var(--muted)] truncate">{me.username}</div>
+        {/* Account: name, theme and settings */}
+        <div
+          className={`mt-3 px-2 py-2 rounded-xl flex items-center gap-1 ${
+            tab === "settings" ? "bg-[var(--accent-soft)]" : "bg-[var(--surface-2)]"
+          }`}
+        >
+          <div className="min-w-0 flex-1 px-0.5">
+            <div className="text-[13px] font-medium truncate leading-tight" title={me.displayName}>
+              {me.displayName}
             </div>
-            <button
-              title={tr("themeLabel")}
-              onClick={async () => {
-                const next = theme === "dark" ? "light" : "dark";
-                const res = await api.patchSettings({ theme: next });
-                setMe(res.me);
-              }}
-              className="p-1.5 rounded-lg hover:bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--text)] cursor-pointer"
-            >
-              {theme === "dark" ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-            </button>
+            <div className="text-xs text-[var(--muted)] truncate leading-tight mt-0.5">{me.username}</div>
           </div>
+          <IconButton
+            label={tr("themeLabel")}
+            tooltipSide="top"
+            onClick={async () => {
+              const res = await api.patchSettings({ theme: theme === "dark" ? "light" : "dark" });
+              setMe(res.me);
+            }}
+          >
+            {theme === "dark" ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          </IconButton>
+          <IconButton
+            label={tr("navSettings")}
+            tooltipSide="top"
+            active={tab === "settings"}
+            onClick={() => navigateTab("settings")}
+          >
+            <Settings className="w-4 h-4" />
+          </IconButton>
         </div>
       </aside>
 
       {/* Main Content Wrapper */}
-      <div className="flex-1 md:pl-64 flex flex-col min-h-screen pb-24 md:pb-0">
-        {/* Top bar */}
-        <header className="sticky top-0 z-20 backdrop-blur-md bg-[var(--bg)]/85 border-b border-[var(--border)] px-4 md:px-8 py-3 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2.5 min-w-0">
+      <div className="flex-1 min-w-0 md:pl-60 flex flex-col min-h-screen pb-24 md:pb-0">
+        {/* Phone top bar (desktop has everything in the sidebar) */}
+        <header className="md:hidden sticky top-0 z-20 backdrop-blur-md bg-[var(--bg)]/85 border-b border-[var(--border)] px-4 py-2.5 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 min-w-0">
             {activeCourse ? (
               <button
                 onClick={goBack}
                 aria-label={tr("back")}
-                className="md:hidden -ml-1.5 p-1.5 rounded-lg text-[var(--muted)] hover:text-[var(--text)] cursor-pointer"
+                className="-ml-1.5 p-1.5 rounded-lg text-[var(--muted)] hover:text-[var(--text)] cursor-pointer"
               >
                 <ChevronLeft className="w-5 h-5" />
               </button>
             ) : (
-              <Logo size={30} className="md:hidden rounded-lg" />
+              <Logo size={26} className="rounded-lg" />
             )}
-            <div className="truncate">
-              <span className="md:hidden text-base font-semibold tracking-tight">
-                {activeCourse ? activeCourse.title : tabLabels[tab]}
-              </span>
-              <span className="hidden md:inline text-sm">
-                <span className="text-[var(--muted)]">{tr("welcomeBack")} </span>
-                <span className="font-medium">{me.displayName}</span>
-              </span>
-            </div>
+            <span className="truncate font-display text-base">
+              {activeCourse ? activeCourse.title : tabLabels[tab]}
+            </span>
           </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              onClick={async () => {
-                setSyncing(true);
-                try {
-                  await api.pollNow();
-                  await refreshAllData();
-                  showToast(lang === "el" ? "Συγχρονίστηκε με το eClass" : "Synced with eClass");
-                } finally {
-                  setSyncing(false);
-                }
-              }}
-              disabled={syncing}
-              className="inline-flex items-center gap-1.5 px-3 py-2 md:py-1.5 rounded-lg text-xs font-medium border border-[var(--border)] bg-[var(--surface)] hover:bg-[var(--surface-2)] transition cursor-pointer disabled:opacity-50"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${syncing ? "animate-spin text-[var(--accent)]" : ""}`} />
-              <span className="hidden sm:inline">{syncing ? tr("syncing") : tr("syncNow")}</span>
-            </button>
-
-            {/* Notifications bell */}
-            <div className="relative">
-              <button
-                onClick={() => setBellOpen((o) => !o)}
-                className="relative p-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] hover:bg-[var(--surface-2)] transition cursor-pointer"
-                aria-label={tr("notificationsBell")}
-              >
-                <Bell className="w-4 h-4" />
-                {unreadNotifCount > 0 && (
-                  <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-[var(--accent)] text-white text-[11px] font-bold flex items-center justify-center">
-                    {unreadNotifCount}
-                  </span>
-                )}
-              </button>
-
-              {bellOpen && (
-                <div className="absolute right-0 mt-2 w-80 sm:w-96 rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-xl p-3 z-40">
-                  <div className="flex items-center justify-between pb-2 mb-2 border-b border-[var(--border)]">
-                    <span className="text-xs font-semibold">{tr("notificationsBell")}</span>
-                    <button
-                      onClick={async () => {
-                        const res = await api.markAllNotificationsRead();
-                        if (res.notifications) {
-                          setNotifications(res.notifications);
-                        } else {
-                          setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
-                        }
-                      }}
-                      className="text-xs text-[var(--accent)] hover:underline cursor-pointer"
-                    >
-                      {tr("markAllRead")}
-                    </button>
-                  </div>
-                  <div className="max-h-80 overflow-y-auto space-y-1.5">
-                    {notifications.length === 0 ? (
-                      <div className="text-xs text-[var(--muted)] py-6 text-center">{tr("noItems")}</div>
-                    ) : (
-                      notifications.slice(0, 12).map((n) => (
-                        <div
-                          key={n.id}
-                          onClick={async () => {
-                            setBellOpen(false);
-                            // Remove notification once opened
-                            setNotifications((prev) => prev.filter((item) => item.id !== n.id));
-                            if (n.courseCode) openCourse(n.courseCode, "announcements");
-                            try {
-                              const res = await api.openNotification(n.id, true);
-                              setNotifications(res.notifications);
-                            } catch {
-                              /* ignore */
-                            }
-                          }}
-                          className={`p-2.5 rounded-xl text-xs cursor-pointer transition group ${
-                            n.read ? "opacity-65 hover:bg-[var(--surface-2)]" : "bg-[var(--surface-2)]"
-                          }`}
-                        >
-                          <div className="font-medium flex items-center justify-between gap-2">
-                            <span className="truncate">{n.title}</span>
-                            <div className="flex items-center gap-1.5 shrink-0">
-                              {!n.read && <span className="w-2 h-2 rounded-full bg-[var(--accent)]" />}
-                              <button
-                                title={lang === "el" ? "Απόρριψη" : "Dismiss"}
-                                onClick={async (e) => {
-                                  e.stopPropagation();
-                                  setNotifications((prev) => prev.filter((item) => item.id !== n.id));
-                                  try {
-                                    const res = await api.openNotification(n.id, true);
-                                    setNotifications(res.notifications);
-                                  } catch {
-                                    /* ignore */
-                                  }
-                                }}
-                                className="p-0.5 rounded text-[var(--muted)] hover:text-[var(--text)] cursor-pointer"
-                              >
-                                <X className="w-3 h-3" />
-                              </button>
-                            </div>
-                          </div>
-                          <div className="text-xs text-[var(--muted)] line-clamp-2 mt-0.5">{n.body}</div>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
+          <div className="flex items-center gap-0.5">
+            <IconButton label={syncing ? tr("syncing") : tr("syncNow")} onClick={() => void syncNow()} disabled={syncing}>
+              <RefreshCw className={`w-4 h-4 ${syncing ? "animate-spin text-[var(--accent)]" : ""}`} />
+            </IconButton>
+            <NotificationsBell
+              lang={lang}
+              notifications={notifications}
+              setNotifications={setNotifications}
+              onOpenCourse={(code) => openCourse(code, "announcements")}
+              placement="header"
+            />
+            <IconButton label={tr("navSettings")} active={tab === "settings"} onClick={() => navigateTab("settings")}>
+              <Settings className="w-4 h-4" />
+            </IconButton>
           </div>
         </header>
 
         {/* Toast banner */}
         {toast && (
-          <div className="fixed bottom-24 md:bottom-6 right-4 md:right-6 z-50 px-4 py-2.5 rounded-xl bg-[var(--surface)] border border-[var(--accent)]/40 shadow-lg text-xs font-medium flex items-center gap-2">
+          <div className="enter fixed bottom-24 md:bottom-6 right-4 md:right-6 z-50 px-4 py-2.5 rounded-xl bg-[var(--surface-2)] border border-[var(--border)] shadow-lg shadow-black/10 text-xs font-medium flex items-center gap-2">
             <span>{toast}</span>
             <button onClick={() => setToast(null)} className="text-[var(--muted)] hover:text-[var(--text)]">
               <X className="w-3.5 h-3.5" />
@@ -714,21 +763,21 @@ export function App() {
           onTouchStart={handleTouchStart}
           onTouchMove={handleTouchMove}
           onTouchEnd={handleTouchEnd}
-          className="flex-1 px-4 sm:px-5 md:px-8 py-4 md:py-6 max-w-6xl w-full mx-auto overflow-x-hidden touch-pan-y"
+          className="flex-1 flex flex-col px-4 sm:px-5 md:px-8 py-4 md:py-5 max-w-6xl w-full mx-auto overflow-x-hidden touch-pan-y"
         >
           <div
+            ref={pageRef}
             key={`${tab}-${selectedCourseCode ?? "root"}`}
-            className={
+            className={[
+              (tab === "courses" && !activeCourse) || tab === "inbox" ? "flex-1 flex flex-col" : "",
               slideDir === "left"
                 ? "animate-slide-left"
                 : slideDir === "right"
                   ? "animate-slide-right"
-                  : undefined
-            }
-            style={{
-              transform: swipeOffset !== 0 ? `translateX(${swipeOffset}px)` : undefined,
-              transition: swipeOffset !== 0 ? "none" : "transform 200ms cubic-bezier(0.22, 1, 0.36, 1)",
-            }}
+                  : "",
+            ]
+              .filter(Boolean)
+              .join(" ") || undefined}
           >
             {tab === "home" && (
               <HomeView
@@ -736,6 +785,7 @@ export function App() {
                 courses={courses}
                 catalogCount={catalog.length}
                 announcements={announcements}
+                triage={triage}
                 assignments={assignments}
                 assignmentsLoading={assignmentsLoading}
                 messages={messages}
@@ -754,14 +804,16 @@ export function App() {
                 courses={courses}
                 catalog={catalog}
                 departments={departments}
-                activeDepartment={activeDepartment}
+                activeDepartment={departmentId}
                 catalogLoading={catalogLoading}
                 warnings={courseWarnings}
                 syncing={syncing}
                 initialViewMode={coursesInitialViewMode}
-                onChangeDepartment={loadDepartmentCatalog}
+                onChangeDepartment={changeDepartment}
                 onSelectCourse={(code, sub) => openCourse(code, sub)}
-                onChanged={refreshAllData}
+                onChanged={async () => {
+                  await Promise.all([refreshAllData(), loadCatalog()]);
+                }}
                 showToast={showToast}
               />
             )}
@@ -773,6 +825,8 @@ export function App() {
                 subTab={courseSubTab}
                 onChangeSubTab={setCourseSubTab}
                 announcements={announcements.filter((a) => a.courseCode === activeCourse.code)}
+                triage={triage}
+                onMeChanged={setMe}
                 assignments={assignments.filter((a) => a.courseCode === activeCourse.code)}
                 focusAssignmentId={focusAssignmentId}
                 onOpenInbox={() => navigateTab("inbox", "left")}
@@ -784,23 +838,35 @@ export function App() {
               />
             )}
 
-            {tab === "inbox" && <InboxView lang={lang} messages={messages} />}
+            {tab === "inbox" && (
+              <InboxView
+                lang={lang}
+                messages={messages}
+                announcements={announcements}
+                triage={triage}
+                notifications={notifications}
+                setNotifications={setNotifications}
+                onOpenNotification={(n) => {
+                  if (!n.courseCode) return;
+                  openCourse(n.courseCode, n.kind === "assignment" || n.kind === "deadline" ? "assignments" : "announcements");
+                }}
+                onOpenAnnouncement={(a) => openCourse(a.courseCode, "announcements")}
+              />
+            )}
 
             {tab === "assistant" && (
               <AssistantView lang={lang} onActionCompleted={refreshAllData} />
             )}
 
+            {tab === "stats" && <StatsView lang={lang} />}
+
             {tab === "settings" && (
               <SettingsView
                 me={me}
                 lang={lang}
+                departments={departments}
                 onUpdatedMe={setMe}
-                onLoggedOut={() => {
-                  window.history.replaceState(null, "", "/");
-                  setTab("home");
-                  setSelectedCourseCode(null);
-                  setMe(null);
-                }}
+                onLoggedOut={onLoggedOut}
                 showToast={showToast}
               />
             )}
@@ -813,16 +879,16 @@ export function App() {
         <>
           <button
             onClick={() => setQuickChatOpen((o) => !o)}
-            className="hidden md:inline-flex fixed bottom-6 right-6 z-30 items-center gap-2 px-3.5 py-2.5 rounded-full bg-[var(--accent)] text-white dark:text-[#0c0a14] font-medium text-xs shadow-lg hover:opacity-95 transition cursor-pointer"
+            className="hidden md:inline-flex fixed bottom-6 right-6 z-30 items-center gap-2 px-4 h-10 rounded-full bg-[var(--accent)] text-[var(--on-accent)] font-medium text-xs hover:bg-[var(--accent-hover)] cursor-pointer"
           >
             <Bot className="w-4 h-4" />
             <span>{tr("navAssistant")}</span>
           </button>
           {quickChatOpen && (
-            <div className="hidden md:flex fixed bottom-20 right-6 z-40 w-[400px] h-[460px] rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-2xl flex-col overflow-hidden">
+            <div className="enter origin-bottom-right hidden md:flex fixed bottom-20 right-6 z-40 w-[400px] h-[460px] rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-lg shadow-black/15 flex-col overflow-hidden">
               <div className="px-4 py-3 border-b border-[var(--border)] flex items-center justify-between bg-[var(--surface-2)]">
                 <div className="flex items-center gap-2 text-xs font-semibold">
-                  <Bot className="w-4 h-4 text-[var(--accent)]" />
+                  <Bot className="w-4 h-4 text-[var(--muted)]" />
                   <span>{tr("assistantTitle")}</span>
                 </div>
                 <div className="flex items-center gap-1">
@@ -871,9 +937,9 @@ export function App() {
           onClick={() => navigateTab("courses", null, "enrolled")}
         />
         <MobileTab
-          icon={<Inbox className="w-5 h-5" />}
+          icon={<Bell className="w-5 h-5" />}
           label={tr("navInbox")}
-          badge={unreadMsgCount || undefined}
+          badge={inboxBadge || undefined}
           active={tab === "inbox"}
           onClick={() => navigateTab("inbox")}
         />
@@ -884,10 +950,10 @@ export function App() {
           onClick={() => navigateTab("assistant")}
         />
         <MobileTab
-          icon={<Settings className="w-5 h-5" />}
-          label={tr("navSettings")}
-          active={tab === "settings"}
-          onClick={() => navigateTab("settings")}
+          icon={<ChartNoAxesColumn className="w-5 h-5" />}
+          label={tr("navStats")}
+          active={tab === "stats"}
+          onClick={() => navigateTab("stats")}
         />
       </nav>
     </div>
@@ -895,28 +961,208 @@ export function App() {
 }
 
 /* ================================================================== */
+/* Notifications bell (sidebar on desktop, top bar on phones)          */
+/* ================================================================== */
+
+function NotificationsBell({
+  lang,
+  notifications,
+  setNotifications,
+  onOpenCourse,
+  placement,
+}: {
+  lang: Lang;
+  notifications: NotificationItem[];
+  setNotifications: React.Dispatch<React.SetStateAction<NotificationItem[]>>;
+  onOpenCourse: (code: string) => void;
+  placement: "sidebar" | "header";
+}) {
+  const tr = (k: DictKey) => t(lang, k);
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const unread = notifications.filter((n) => !n.read).length;
+
+  // Close when clicking anywhere else
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  const dismiss = async (id: string) => {
+    setNotifications((prev) => prev.filter((item) => item.id !== id));
+    try {
+      const res = await api.openNotification(id, true);
+      setNotifications(res.notifications);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  return (
+    <div className="relative" ref={ref}>
+      <IconButton label={tr("notificationsBell")} onClick={() => setOpen((o) => !o)} active={open}>
+        <Bell className="w-4 h-4" />
+        {unread > 0 && (
+          <span className="absolute -top-0.5 -right-0.5 min-w-4 h-4 px-1 rounded-full bg-[var(--accent)] text-[var(--on-accent)] text-[0.6875rem] font-semibold tabular-nums flex items-center justify-center">
+            {unread}
+          </span>
+        )}
+      </IconButton>
+
+      {open && (
+        <div
+          className={`enter absolute mt-2 w-80 sm:w-96 rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-lg shadow-black/10 p-3 z-50 ${
+            placement === "sidebar" ? "left-0 origin-top-left" : "right-0 origin-top-right"
+          }`}
+        >
+          <div className="flex items-center justify-between pb-2 mb-2 border-b border-[var(--border)]">
+            <span className="text-sm font-semibold">{tr("notificationsBell")}</span>
+            {notifications.length > 0 && (
+              <button
+                onClick={async () => {
+                  const res = await api.markAllNotificationsRead();
+                  setNotifications(res.notifications ?? []);
+                }}
+                className="text-xs text-[var(--accent)] hover:underline cursor-pointer"
+              >
+                {tr("markAllRead")}
+              </button>
+            )}
+          </div>
+          <div className="max-h-96 overflow-y-auto space-y-1.5">
+            {notifications.length === 0 ? (
+              <div className="text-sm text-[var(--muted)] py-6 text-center">{tr("noItems")}</div>
+            ) : (
+              notifications.slice(0, 20).map((n) => (
+                <div
+                  key={n.id}
+                  onClick={() => {
+                    setOpen(false);
+                    if (n.courseCode) onOpenCourse(n.courseCode);
+                    void dismiss(n.id);
+                  }}
+                  className={`p-2.5 rounded-xl cursor-pointer transition-colors ${
+                    n.read ? "opacity-65 hover:bg-[var(--surface-2)]" : "bg-[var(--surface-2)]"
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="text-sm font-medium leading-snug">{n.title}</span>
+                    <button
+                      title={lang === "el" ? "Απόρριψη" : "Dismiss"}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void dismiss(n.id);
+                      }}
+                      className="p-0.5 rounded text-[var(--muted)] hover:text-[var(--text)] cursor-pointer shrink-0"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  <div className="text-xs text-[var(--muted)] line-clamp-2 mt-0.5">{n.body}</div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Pages rubber-band past the first/last tab: the further you pull, the more it resists. */
+function rubberBand(dx: number, width: number): number {
+  const c = 0.55;
+  return Math.sign(dx) * (1 - 1 / ((Math.abs(dx) * c) / width + 1)) * width;
+}
+
+/** Shared tooltip timing: only the first tooltip waits; while one was shown recently, the next opens at once. */
+const TOOLTIP_DELAY_MS = 500;
+const TOOLTIP_WARM_MS = 600;
+let tooltipWarmUntil = 0;
+
+function IconButton({
+  label,
+  onClick,
+  children,
+  disabled,
+  active,
+  tooltipSide = "bottom",
+}: {
+  label: string;
+  onClick: () => void;
+  children: React.ReactNode;
+  disabled?: boolean;
+  active?: boolean;
+  tooltipSide?: "top" | "bottom";
+}) {
+  const [tip, setTip] = useState<"hidden" | "delayed" | "instant">("hidden");
+  const timer = useRef<number | null>(null);
+  const clear = () => {
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = null;
+  };
+  useEffect(() => clear, []);
+
+  const show = (e: React.PointerEvent) => {
+    if (e.pointerType !== "mouse") return;
+    clear();
+    if (Date.now() < tooltipWarmUntil) setTip("instant");
+    else timer.current = window.setTimeout(() => setTip("delayed"), TOOLTIP_DELAY_MS);
+  };
+  const hide = () => {
+    clear();
+    setTip((cur) => {
+      if (cur !== "hidden") tooltipWarmUntil = Date.now() + TOOLTIP_WARM_MS;
+      return "hidden";
+    });
+  };
+
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      onClick={() => {
+        hide();
+        onClick();
+      }}
+      onPointerEnter={show}
+      onPointerLeave={hide}
+      disabled={disabled}
+      className={`relative p-2 rounded-lg transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-default ${
+        active
+          ? "text-[var(--accent)] bg-[var(--accent-soft)]"
+          : "text-[var(--muted)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]"
+      }`}
+    >
+      {children}
+      {tip !== "hidden" && (
+        <span
+          role="tooltip"
+          className={`tooltip left-1/2 -translate-x-1/2 ${tooltipSide === "top" ? "bottom-full mb-2" : "top-full mt-2"}`}
+          style={tip === "instant" ? { animation: "none" } : undefined}
+        >
+          {label}
+        </span>
+      )}
+    </button>
+  );
+}
+
+/* ================================================================== */
 /* Login Screen                                                        */
 /* ================================================================== */
 
-const LAST_UNI_KEY = "myclass:lastUniversity";
-
-function readLastUniversity(): string {
-  try {
-    return localStorage.getItem(LAST_UNI_KEY) ?? "";
-  } catch {
-    return "";
-  }
-}
-
 function LoginScreen({
-  universities,
   lang,
   theme,
   onToggleLang,
   onToggleTheme,
   onLoggedIn,
 }: {
-  universities: University[];
   lang: Lang;
   theme: ThemePref;
   onToggleLang: () => void;
@@ -924,49 +1170,38 @@ function LoginScreen({
   onLoggedIn: (me: Me) => void;
 }) {
   const tr = (k: DictKey) => t(lang, k);
-  const [universityId, setUniversityId] = useState<string>(readLastUniversity);
-  // Once the user picks a university by hand, stop auto-filling it from the username.
-  const [pickedByHand, setPickedByHand] = useState<boolean>(() => readLastUniversity() !== "");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const sortedUniversities = useMemo(
-    () =>
-      [...universities].sort((a, b) =>
-        (lang === "el" ? a.name : a.nameEn).localeCompare(lang === "el" ? b.name : b.nameEn, lang),
-      ),
-    [universities, lang],
-  );
-
-  const onUsernameChange = (value: string) => {
-    setUsername(value);
-    if (!pickedByHand) {
-      const detected = detectUniversityId(value);
-      if (detected && universities.some((u) => u.id === detected)) setUniversityId(detected);
-    }
+  const [badCredentials, setBadCredentials] = useState(false);
+  const passwordRef = useRef<HTMLInputElement>(null);
+  /** Wrong password: shake the field (it also turns red). Restarts on every wrong attempt. */
+  const shakePassword = () => {
+    const el = passwordRef.current;
+    if (!el || reducedMotion()) return;
+    el.animate(
+      [0, -10, 10, -6, 6, -3, 0].map((px) => ({ transform: `translateX(${px}px)` })),
+      { duration: 360, easing: "ease-out" },
+    );
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    if (!universityId) {
-      setError(tr("chooseUniversity"));
-      return;
-    }
+    setBadCredentials(false);
     setLoading(true);
     try {
-      const res = await api.login({ universityId, username: username.trim(), password, remember });
-      try {
-        localStorage.setItem(LAST_UNI_KEY, universityId);
-      } catch {
-        /* storage unavailable */
-      }
+      const res = await api.login({ username: username.trim(), password, remember });
       onLoggedIn(res.me);
     } catch (err) {
-      setError(err instanceof ServerUnavailableError ? tr("serverUnreachable") : (err as Error).message);
+      const unreachable = err instanceof ServerUnavailableError;
+      setError(unreachable ? tr("serverUnreachable") : (err as Error).message);
+      if (!unreachable) {
+        setBadCredentials(true);
+        shakePassword();
+      }
     } finally {
       setLoading(false);
     }
@@ -980,7 +1215,7 @@ function LoginScreen({
       <div className="max-w-md w-full mx-auto flex items-center justify-between">
         <div className="flex items-center gap-2.5">
           <Logo size={36} />
-          <span className="font-semibold tracking-tight text-base">myClass</span>
+          <span className="font-display text-lg leading-none">myClass</span>
         </div>
         <div className="flex items-center gap-1.5">
           <button
@@ -1006,30 +1241,6 @@ function LoginScreen({
 
           <form onSubmit={handleSubmit} className="space-y-4 mt-6">
             <div>
-              <label htmlFor="login-university" className="block text-xs font-medium mb-1.5">
-                {tr("universityLabel")}
-              </label>
-              <select
-                id="login-university"
-                value={universityId}
-                onChange={(e) => {
-                  setUniversityId(e.target.value);
-                  setPickedByHand(true);
-                }}
-                className={`${inputClass} cursor-pointer`}
-              >
-                <option value="" disabled>
-                  {tr("chooseUniversity")}
-                </option>
-                {sortedUniversities.map((u) => (
-                  <option key={u.id} value={u.id}>
-                    {lang === "el" ? u.name : u.nameEn}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
               <label htmlFor="login-username" className="block text-xs font-medium mb-1.5">
                 {tr("usernameLabel")}
               </label>
@@ -1041,7 +1252,7 @@ function LoginScreen({
                 autoCapitalize="none"
                 spellCheck={false}
                 value={username}
-                onChange={(e) => onUsernameChange(e.target.value)}
+                onChange={(e) => setUsername(e.target.value)}
                 className={inputClass}
               />
             </div>
@@ -1055,9 +1266,14 @@ function LoginScreen({
                 type="password"
                 required
                 autoComplete="current-password"
+                ref={passwordRef}
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className={inputClass}
+                aria-invalid={badCredentials || undefined}
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  setBadCredentials(false);
+                }}
+                className={`${inputClass} ${badCredentials ? "border-[var(--danger)] focus:border-[var(--danger)]" : ""}`}
               />
             </div>
 
@@ -1072,7 +1288,7 @@ function LoginScreen({
             </label>
 
             {error && (
-              <div role="alert" className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
+              <div role="alert" className="p-3 rounded-xl bg-[var(--danger-soft)] text-[var(--danger)] text-sm">
                 {error}
               </div>
             )}
@@ -1080,7 +1296,7 @@ function LoginScreen({
             <button
               type="submit"
               disabled={loading}
-              className="w-full py-3 rounded-xl bg-[var(--accent)] text-white dark:text-[#0c0a14] font-semibold text-sm hover:opacity-95 transition cursor-pointer disabled:opacity-50"
+              className="w-full py-3 rounded-xl bg-[var(--accent)] text-[var(--on-accent)] font-medium text-sm hover:bg-[var(--accent-hover)] cursor-pointer disabled:opacity-50"
             >
               {loading ? tr("signingIn") : tr("signInBtn")}
             </button>
@@ -1100,6 +1316,7 @@ function HomeView({
   courses,
   catalogCount,
   announcements,
+  triage,
   assignments,
   assignmentsLoading,
   messages,
@@ -1114,6 +1331,7 @@ function HomeView({
   courses: Course[];
   catalogCount: number;
   announcements: Announcement[];
+  triage: Record<string, AnnouncementTriage>;
   assignments: Assignment[];
   assignmentsLoading?: boolean;
   messages: Message[];
@@ -1136,6 +1354,19 @@ function HomeView({
       !a.submitted && a.deadline && new Date(a.deadline).getTime() >= now && new Date(a.deadline).getTime() - now < 7 * 86_400_000,
   );
   const unreadMessages = messages.filter((m) => !m.read);
+  const [annFilter, setAnnFilter] = useState<"all" | "action" | "fyi">("all");
+  const actionCount = announcements.filter((a) => triage[a.id]?.label === "action").length;
+  const shownAnnouncements = (
+    annFilter === "all" ? announcements : announcements.filter((a) => triage[a.id]?.label === annFilter)
+  ).slice(0, 8);
+
+  // Opened from the "Deadlines" app shortcut: bring the calendar into view
+  const calendarRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("view") === "calendar") {
+      calendarRef.current?.scrollIntoView({ block: "start" });
+    }
+  }, []);
 
   const chip =
     "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-[var(--surface)] border border-[var(--border)] hover:border-[var(--accent)] cursor-pointer";
@@ -1145,7 +1376,7 @@ function HomeView({
       {/* Quick stats */}
       <div className="flex flex-wrap items-center gap-2">
         <button onClick={onOpenEnrolledCourses} className={chip}>
-          <BookOpen className="w-3.5 h-3.5 text-[var(--accent)]" />
+          <BookOpen className="w-3.5 h-3.5 text-[var(--muted)]" />
           {activeCourses.length} {lang === "el" ? "μαθήματα" : "courses"}
         </button>
         <span className={chip.replace("hover:border-[var(--accent)] cursor-pointer", "")}>
@@ -1154,12 +1385,12 @@ function HomeView({
         </span>
         {unreadMessages.length > 0 && (
           <button onClick={onOpenInbox} className={chip}>
-            <Mail className="w-3.5 h-3.5 text-[var(--accent)]" />
+            <Mail className="w-3.5 h-3.5 text-[var(--muted)]" />
             {unreadMessages.length} {lang === "el" ? "νέα μηνύματα" : "new messages"}
           </button>
         )}
         <button onClick={onOpenAssistant} className={chip}>
-          <Sparkles className="w-3.5 h-3.5 text-[var(--accent)]" />
+          <Bot className="w-3.5 h-3.5 text-[var(--muted)]" />
           {lang === "el" ? "Ρώτα τον βοηθό" : "Ask the assistant"}
         </button>
         {lastPollAt && (
@@ -1175,7 +1406,7 @@ function HomeView({
 
       <div className="grid grid-cols-1 xl:grid-cols-5 gap-5">
         {/* Calendar first on phones (deadlines are the most actionable), right column on desktop */}
-        <div className="xl:col-span-2 xl:order-2 space-y-5">
+        <div ref={calendarRef} className="xl:col-span-2 xl:order-2 space-y-5 scroll-mt-4">
           <DeadlineCalendar
             lang={lang}
             assignments={assignments}
@@ -1186,14 +1417,14 @@ function HomeView({
           {unreadMessages.length > 0 && (
             <section className="space-y-2">
               <h2 className="text-sm font-semibold flex items-center gap-2">
-                <Mail className="w-4 h-4 text-[var(--accent)]" />
+                <Mail className="w-4 h-4 text-[var(--muted)]" />
                 <span>{tr("unreadMessages")}</span>
               </h2>
               {unreadMessages.slice(0, 4).map((m) => (
                 <button
                   key={m.id}
                   onClick={onOpenInbox}
-                  className="w-full text-left p-3.5 rounded-2xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50 transition cursor-pointer"
+                  className="w-full text-left p-3.5 rounded-2xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50 transition-colors cursor-pointer"
                 >
                   <div className="text-sm font-medium truncate">{m.subject}</div>
                   <div className="text-xs text-[var(--muted)] mt-0.5 truncate">
@@ -1206,19 +1437,43 @@ function HomeView({
         </div>
 
         <section className="xl:col-span-3 xl:order-1 space-y-3">
-          <h2 className="text-sm font-semibold flex items-center gap-2">
-            <Bell className="w-4 h-4 text-[var(--accent)]" />
-            <span>{tr("recentAnnouncements")}</span>
-          </h2>
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <h2 className="text-sm font-semibold flex items-center gap-2">
+              <Bell className="w-4 h-4 text-[var(--muted)]" />
+              <span>{tr("recentAnnouncements")}</span>
+            </h2>
+            {announcements.length > 0 && (
+              <Segmented
+                value={annFilter}
+                onChange={setAnnFilter}
+                options={[
+                  { value: "all", label: lang === "el" ? "Όλες" : "All" },
+                  {
+                    value: "action",
+                    label: `${lang === "el" ? "Χρειάζεται ενέργεια" : "Action needed"}${actionCount ? ` ${actionCount}` : ""}`,
+                  },
+                  { value: "fyi", label: lang === "el" ? "Για ενημέρωση" : "FYI" },
+                ]}
+              />
+            )}
+          </div>
           <div className="space-y-2.5">
-            {announcements.length === 0 ? (
-              <EmptyCard text={tr("noItems")} />
+            {shownAnnouncements.length === 0 ? (
+              <EmptyCard
+                text={
+                  annFilter === "action"
+                    ? lang === "el"
+                      ? "Καμία ανακοίνωση δεν ζητά κάτι από σένα."
+                      : "No announcement asks anything of you."
+                    : tr("noItems")
+                }
+              />
             ) : (
-              announcements.slice(0, 8).map((a) => (
+              shownAnnouncements.map((a) => (
                 <button
                   key={a.id}
                   onClick={() => onOpenCourse(a.courseCode, "announcements")}
-                  className="w-full text-left p-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50 transition cursor-pointer"
+                  className="w-full text-left p-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50 transition-colors cursor-pointer"
                 >
                   <div className="flex items-center justify-between gap-2 text-xs text-[var(--muted)] mb-1">
                     <span className="font-medium text-[var(--accent)] truncate">{a.courseTitle ?? a.courseCode}</span>
@@ -1230,6 +1485,7 @@ function HomeView({
                     </span>
                   </div>
                   <div className="text-sm font-semibold leading-snug">{a.title}</div>
+                  <TriageTag lang={lang} triage={triage[a.id]} />
                   <p className="text-sm text-[var(--muted)] mt-1 line-clamp-2 leading-relaxed">{a.contentText}</p>
                 </button>
               ))
@@ -1241,7 +1497,7 @@ function HomeView({
               onClick={onOpenAllCourses}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)] cursor-pointer"
             >
-              <FolderOpen className="w-3.5 h-3.5 text-[var(--accent)]" />
+              <FolderOpen className="w-3.5 h-3.5 text-[var(--muted)]" />
               {tr("coursesTitle")}
               {catalogCount > 0 && <span className="text-[var(--muted)]">{catalogCount}</span>}
             </button>
@@ -1249,7 +1505,7 @@ function HomeView({
               href="/api/documents/zip-all"
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]"
             >
-              <Download className="w-3.5 h-3.5 text-[var(--accent)]" />
+              <Download className="w-3.5 h-3.5 text-[var(--muted)]" />
               {tr("downloadAllCourses")}
             </a>
           </div>
@@ -1284,6 +1540,9 @@ function CoursesView({
   lang,
   courses,
   catalog,
+  departments = [],
+  activeDepartment = "",
+  onChangeDepartment = async () => {},
   catalogLoading,
   warnings = [],
   syncing = false,
@@ -1399,6 +1658,14 @@ function CoursesView({
     }
     return [...map.entries()].sort((a, b) => a[0] - b[0]);
   }, [filteredSubjects]);
+  const visibleRowCount = filteredSubjects.length;
+
+  // A semester filter that no longer exists (e.g. after switching department) would show an empty page
+  useEffect(() => {
+    if (selectedSemester !== "all" && !semesterCounts.has(selectedSemester) && sourceSubjects.length > 0) {
+      setSelectedSemester("all");
+    }
+  }, [selectedSemester, semesterCounts, sourceSubjects.length]);
 
   const toggleSemesterAccordion = (semIndex: number) => {
     setCollapsedSemesters((prev) => {
@@ -1413,10 +1680,10 @@ function CoursesView({
   };
 
   return (
-    <div className="space-y-5">
-      {/* Header: My courses / All switch + download */}
-      <div className="flex items-center justify-between gap-2">
-        <div className="inline-flex rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1">
+    <div className="flex-1 flex flex-col gap-4">
+      {/* One compact toolbar: My courses / All, search, department, semester, actions */}
+      <div className="flex flex-col xl:flex-row xl:items-center gap-2">
+        <div className="inline-flex self-start rounded-xl border border-[var(--border)] bg-[var(--surface)] p-0.5 shrink-0">
           {(
             [
               ["enrolled", tr("viewEnrolledOnly"), enrolledCourses.length],
@@ -1429,9 +1696,9 @@ function CoursesView({
                 setViewMode(mode);
                 setSelectedSemester("all");
               }}
-              className={`px-3.5 py-2 rounded-lg text-sm font-medium transition cursor-pointer ${
+              className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
                 viewMode === mode
-                  ? "bg-[var(--accent)] text-white dark:text-[#0c0a14]"
+                  ? "bg-[var(--accent)] text-[var(--on-accent)]"
                   : "text-[var(--muted)] hover:text-[var(--text)]"
               }`}
             >
@@ -1441,48 +1708,14 @@ function CoursesView({
           ))}
         </div>
 
-        <div className="flex items-center gap-1.5">
-          {groupedBySemester.length > 1 && (
-            <button
-              onClick={() => {
-                const allCollapsed = groupedBySemester.every(([idx]) => collapsedSemesters.has(idx));
-                setCollapsedSemesters(allCollapsed ? new Set() : new Set(groupedBySemester.map(([idx]) => idx)));
-              }}
-              title={
-                groupedBySemester.every(([idx]) => collapsedSemesters.has(idx))
-                  ? lang === "el" ? "Ανάπτυξη όλων" : "Expand all"
-                  : lang === "el" ? "Σύμπτυξη όλων" : "Collapse all"
-              }
-              className="p-2.5 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--text)] cursor-pointer"
-            >
-              <ChevronDown
-                className={`w-4 h-4 transition ${
-                  groupedBySemester.every(([idx]) => collapsedSemesters.has(idx)) ? "" : "rotate-180"
-                }`}
-              />
-            </button>
-          )}
-          <a
-            href="/api/documents/zip-all"
-            title={tr("downloadAllCourses")}
-            className="p-2.5 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--accent)] hover:border-[var(--accent)]"
-          >
-            <Download className="w-4 h-4" />
-          </a>
-        </div>
-      </div>
-
-      {/* Minimalist Search + Semester Folder Dropdown Bar */}
-      <div className="p-3 sm:p-3.5 rounded-2xl border border-[var(--border)] bg-[var(--surface)] grid grid-cols-1 sm:grid-cols-12 gap-2.5">
-        {/* Search Input */}
-        <div className="relative sm:col-span-7">
+        <div className="relative flex-1 min-w-0">
           <Search className="w-4 h-4 text-[var(--muted)] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
           <input
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder={tr("searchCatalogPlaceholder")}
-            className="w-full pl-9 pr-8 py-2 rounded-xl text-xs border border-[var(--border)] bg-[var(--surface-2)] focus:outline-none focus:border-[var(--accent)]"
+            className="w-full pl-9 pr-8 py-2 rounded-xl text-sm border border-[var(--border)] bg-[var(--surface)] focus:outline-none focus:border-[var(--accent)]"
           />
           {searchQuery && (
             <button
@@ -1494,42 +1727,88 @@ function CoursesView({
           )}
         </div>
 
-        {/* Minimalist Semester Folder Dropdown List */}
-        <div className="relative sm:col-span-5">
-          <Folder className="w-3.5 h-3.5 text-[var(--accent)] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-          <select
-            aria-label={lang === "el" ? "Επιλογή Εξαμήνου" : "Select Semester"}
-            value={selectedSemester === "all" ? "all" : String(selectedSemester)}
-            onChange={(e) => {
-              const val = e.target.value;
-              if (val === "all") {
-                setSelectedSemester("all");
-              } else {
-                const num = Number(val);
-                setSelectedSemester(num);
-                setCollapsedSemesters((prev) => {
-                  const next = new Set(prev);
-                  next.delete(num);
-                  return next;
-                });
+        <div className="flex items-center gap-2">
+          {viewMode === "all" && departments.length > 0 && (
+            <div className="relative flex-1 xl:flex-none xl:w-60 min-w-0">
+              <select
+                aria-label={tr("departmentLabel")}
+                value={activeDepartment}
+                onChange={(e) => void onChangeDepartment(e.target.value)}
+                className="w-full pl-3 pr-8 py-2 rounded-xl text-sm border border-[var(--border)] bg-[var(--surface)] text-[var(--text)] focus:outline-none focus:border-[var(--accent)] cursor-pointer appearance-none truncate"
+              >
+                {departments.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {lang === "el" ? d.name : d.nameEn}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown className="w-3.5 h-3.5 text-[var(--muted)] absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            </div>
+          )}
+
+          <div className="relative flex-1 xl:flex-none xl:w-48 min-w-0">
+            <select
+              aria-label={lang === "el" ? "Εξάμηνο" : "Semester"}
+              value={selectedSemester === "all" ? "all" : String(selectedSemester)}
+              onChange={(e) => {
+                const val = e.target.value;
+                if (val === "all") {
+                  setSelectedSemester("all");
+                } else {
+                  const num = Number(val);
+                  setSelectedSemester(num);
+                  setCollapsedSemesters((prev) => {
+                    const next = new Set(prev);
+                    next.delete(num);
+                    return next;
+                  });
+                }
+              }}
+              className="w-full pl-3 pr-8 py-2 rounded-xl text-sm border border-[var(--border)] bg-[var(--surface)] text-[var(--text)] focus:outline-none focus:border-[var(--accent)] cursor-pointer appearance-none"
+            >
+              <option value="all">
+                {tr("allSemestersFilter")} ({sourceSubjects.length})
+              </option>
+              {SEMESTER_META.map((sem) => {
+                const count = semesterCounts.get(sem.index) ?? 0;
+                if (count === 0) return null;
+                return (
+                  <option key={sem.index} value={sem.index}>
+                    {lang === "el" ? sem.labelEl : sem.labelEn} · {count}
+                  </option>
+                );
+              })}
+            </select>
+            <ChevronDown className="w-3.5 h-3.5 text-[var(--muted)] absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          </div>
+
+          {groupedBySemester.length > 1 && (
+            <button
+              onClick={() => {
+                const allCollapsed = groupedBySemester.every(([idx]) => collapsedSemesters.has(idx));
+                setCollapsedSemesters(allCollapsed ? new Set() : new Set(groupedBySemester.map(([idx]) => idx)));
+              }}
+              title={
+                groupedBySemester.every(([idx]) => collapsedSemesters.has(idx))
+                  ? lang === "el" ? "Ανάπτυξη όλων" : "Expand all"
+                  : lang === "el" ? "Σύμπτυξη όλων" : "Collapse all"
               }
-            }}
-            className="w-full pl-8 pr-8 py-2 rounded-xl text-xs font-medium border border-[var(--border)] bg-[var(--surface-2)] text-[var(--text)] focus:outline-none focus:border-[var(--accent)] cursor-pointer appearance-none"
+              className="p-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--text)] cursor-pointer shrink-0"
+            >
+              <ChevronDown
+                className={`w-4 h-4 transition-colors ${
+                  groupedBySemester.every(([idx]) => collapsedSemesters.has(idx)) ? "" : "rotate-180"
+                }`}
+              />
+            </button>
+          )}
+          <a
+            href="/api/documents/zip-all"
+            title={tr("downloadAllCourses")}
+            className="p-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--accent)] hover:border-[var(--accent)] shrink-0"
           >
-            <option value="all">
-              {tr("allSemestersFilter")} ({sourceSubjects.length})
-            </option>
-            {SEMESTER_META.map((sem) => {
-              const count = semesterCounts.get(sem.index) ?? 0;
-              if (count === 0) return null;
-              return (
-                <option key={sem.index} value={sem.index}>
-                  {lang === "el" ? sem.labelEl : sem.labelEn} ({sem.folder}) · {count}
-                </option>
-              );
-            })}
-          </select>
-          <ChevronDown className="w-3.5 h-3.5 text-[var(--muted)] absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <Download className="w-4 h-4" />
+          </a>
         </div>
       </div>
 
@@ -1561,7 +1840,7 @@ function CoursesView({
               {warnings.map((w) => (
                 <p
                   key={w.portal}
-                  className="text-xs rounded-lg px-3 py-2 bg-amber-500/10 text-[var(--warn)] border border-amber-500/20"
+                  className="text-xs rounded-lg px-3 py-2 bg-[var(--warn-soft)] text-[var(--warn)]"
                 >
                   <span className="font-semibold">{w.portal}:</span> {w.message}
                 </p>
@@ -1581,17 +1860,20 @@ function CoursesView({
           )}
         </div>
       ) : (
-        <div className="space-y-3">
+        <div className="flex-1 flex flex-col gap-3">
           {groupedBySemester.map(([semIndex, list]) => {
             const meta =
               SEMESTER_META.find((m) => m.index === semIndex) ??
               SEMESTER_META[SEMESTER_META.length - 1];
             const isOpen = !collapsedSemesters.has(semIndex);
+            // Stretch open sections to the page height (weighted by row count); skip for tiny lists
+            const fill = isOpen && visibleRowCount >= 4;
 
             return (
               <section
                 key={semIndex}
-                className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden transition"
+                style={fill ? { flexGrow: list.length + 1 } : undefined}
+                className="flex flex-col rounded-2xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden transition-colors"
               >
                 {/* Minimalist Collapsible Semester Dropdown Header */}
                 <div
@@ -1604,26 +1886,15 @@ function CoursesView({
                       toggleSemesterAccordion(semIndex);
                     }
                   }}
-                  className="px-4 py-3 flex items-center justify-between gap-3 bg-[var(--surface)] hover:bg-[var(--surface-2)]/70 transition cursor-pointer select-none"
+                  className="px-4 py-2.5 flex items-center justify-between gap-3 bg-[var(--surface)] hover:bg-[var(--surface-2)]/70 transition-colors cursor-pointer select-none"
                 >
                   <div className="flex items-center gap-2.5 min-w-0">
-                    <div className="w-7 h-7 rounded-lg bg-[var(--accent-soft)] text-[var(--accent)] flex items-center justify-center shrink-0">
-                      {isOpen ? (
-                        <ChevronDown className="w-4 h-4" />
-                      ) : (
-                        <ChevronRight className="w-4 h-4" />
-                      )}
-                    </div>
-                    <div className="flex items-center gap-2 flex-wrap min-w-0">
-                      <span className="text-xs sm:text-sm font-semibold tracking-tight truncate">
-                        {lang === "el" ? meta.labelEl : meta.labelEn}
-                      </span>
-                      <span className="text-xs text-[var(--muted)] font-mono hidden xs:inline">
-                        ({meta.folder})
-                      </span>
-                      <span className="text-[11px] px-2 py-0.5 rounded-full bg-[var(--surface-2)] text-[var(--muted)] font-medium">
-                        {list.length}
-                      </span>
+                    <ChevronRight
+                      className={`w-4 h-4 text-[var(--muted)] shrink-0 transition-transform duration-200 ${isOpen ? "rotate-90" : ""}`}
+                    />
+                    <div className="flex items-baseline gap-2 min-w-0">
+                      <span className="text-sm font-medium truncate">{lang === "el" ? meta.labelEl : meta.labelEn}</span>
+                      <span className="text-xs text-[var(--muted)] tabular-nums">{list.length}</span>
                     </div>
                   </div>
 
@@ -1631,45 +1902,43 @@ function CoursesView({
                     href={`/api/documents/zip-all?semester=${semIndex}`}
                     onClick={(e) => e.stopPropagation()}
                     title={`${tr("downloadSemesterZip")} (${meta.folder}.zip)`}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] text-[var(--muted)] hover:text-[var(--accent)] transition shrink-0"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors shrink-0"
                   >
                     <Download className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">{meta.folder}.zip</span>
+                    <span className="hidden sm:inline">.zip</span>
                   </a>
                 </div>
 
                 {/* Expandable Minimalist Course List */}
-                {isOpen && (
-                  <div className="border-t border-[var(--border)] divide-y divide-[var(--border)]">
+                <div className={`accordion ${fill ? "flex-1 flex flex-col" : ""}`} data-open={isOpen} inert={!isOpen}>
+                  <div className={`border-t border-[var(--border)] divide-y divide-[var(--border)] ${fill ? "flex-1 flex flex-col" : ""}`}>
                     {list.map((c) => {
                       const isBusy = busyCode === c.code;
                       return (
                         <div
                           key={c.code}
-                          className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-[var(--surface-2)]/40 transition"
+                          className={`px-4 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 sm:gap-3 hover:bg-[var(--surface-2)]/40 transition-colors ${fill ? "flex-1" : ""}`}
                         >
                           {/* Left: Subject Code, Title & Professor */}
                           <div
                             onClick={() => onSelectCourse(c.code, "documents")}
                             className="min-w-0 flex-1 cursor-pointer group"
                           >
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <span className="text-[11px] font-semibold px-1.5 py-0.5 rounded bg-[var(--accent-soft)] text-[var(--accent)] font-mono">
-                                {c.publicCode ?? c.code}
-                              </span>
-                              <h3 className="text-xs sm:text-sm font-semibold group-hover:text-[var(--accent)] transition truncate">
+                            <div className="flex items-baseline gap-2 flex-wrap">
+                              <span className="text-xs text-[var(--muted)] font-mono">{c.publicCode ?? c.code}</span>
+                              <h3 className="text-sm font-medium group-hover:text-[var(--accent-text)] transition-colors truncate">
                                 {c.title}
                               </h3>
                               {c.enrolled && (
-                                <span className="text-[11px] px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 font-medium inline-flex items-center gap-1">
+                                <span className="text-[0.6875rem] px-1.5 py-0.5 rounded-full bg-[var(--ok-soft)] text-[var(--ok)] font-medium inline-flex items-center gap-1">
                                   <CheckCircle2 className="w-2.5 h-2.5" />
                                   <span className="hidden sm:inline">{tr("enrolledBadge")}</span>
                                 </span>
                               )}
                             </div>
 
-                            <div className="mt-1 flex items-center gap-2 text-xs text-[var(--muted)]">
-                              <User className="w-3 h-3 text-[var(--accent)] shrink-0" />
+                            <div className="mt-0.5 flex items-center gap-1.5 text-xs text-[var(--muted)]">
+                              <User className="w-3 h-3 shrink-0" />
                               <span className="truncate">
                                 {c.professor ||
                                   (lang === "el" ? "Διδάσκων Τμήματος" : "Department Instructor")}
@@ -1690,7 +1959,7 @@ function CoursesView({
                             <a
                               href={`/api/courses/${encodeURIComponent(c.code)}/documents/zip`}
                               title={tr("downloadCourseZip")}
-                              className="p-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] text-[var(--muted)] hover:text-[var(--accent)] transition"
+                              className="p-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
                             >
                               <Download className="w-3.5 h-3.5" />
                             </a>
@@ -1721,7 +1990,7 @@ function CoursesView({
                                     setBusyCode(null);
                                   }
                                 }}
-                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium hover:bg-red-500/10 text-[var(--muted)] hover:text-red-400 cursor-pointer disabled:opacity-50"
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium hover:bg-[var(--danger-soft)] text-[var(--muted)] hover:text-[var(--danger)] cursor-pointer disabled:opacity-50"
                               >
                                 <UserMinus className="w-3.5 h-3.5" />
                                 <span>{lang === "el" ? "Απεγγραφή" : "Leave"}</span>
@@ -1743,7 +2012,7 @@ function CoursesView({
                                     setBusyCode(null);
                                   }
                                 }}
-                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--surface-2)] hover:bg-[var(--accent)] hover:text-white dark:hover:text-[#0c0a14] transition cursor-pointer disabled:opacity-40"
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--surface-2)] hover:bg-[var(--accent)] hover:text-[var(--on-accent)] transition-colors cursor-pointer disabled:opacity-40"
                               >
                                 <UserPlus className="w-3.5 h-3.5" />
                                 <span>{tr("enrollBtn")}</span>
@@ -1754,7 +2023,7 @@ function CoursesView({
                       );
                     })}
                   </div>
-                )}
+                </div>
               </section>
             );
           })}
@@ -1775,6 +2044,8 @@ function CourseDetailView({
   subTab,
   onChangeSubTab,
   announcements,
+  triage,
+  onMeChanged,
   assignments,
   focusAssignmentId,
   onOpenInbox,
@@ -1784,6 +2055,8 @@ function CourseDetailView({
 }: {
   lang: Lang;
   course: Course;
+  triage: Record<string, AnnouncementTriage>;
+  onMeChanged: (m: Me) => void;
   subTab: "announcements" | "documents" | "assignments" | "info";
   onChangeSubTab: (t: "announcements" | "documents" | "assignments" | "info") => void;
   announcements: Announcement[];
@@ -1802,12 +2075,14 @@ function CourseDetailView({
   const [annLoading, setAnnLoading] = useState(false);
   const [openAssignmentId, setOpenAssignmentId] = useState<string | null>(focusAssignmentId ?? null);
   const [summaryPath, setSummaryPath] = useState<string | null>(null);
+  const [studyPath, setStudyPath] = useState<string | null>(null);
   const [courseAssignments, setCourseAssignments] = useState<Assignment[]>(assignments);
   const [asgLoading, setAsgLoading] = useState(false);
 
   useEffect(() => {
     setDir("/");
     setSummaryPath(null);
+    setStudyPath(null);
   }, [course.code]);
 
   useEffect(() => {
@@ -1862,17 +2137,18 @@ function CourseDetailView({
   }, [dir]);
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <button
-            onClick={onBack}
-            className="hidden md:inline-flex text-xs text-[var(--muted)] hover:text-[var(--accent)] mb-1 items-center gap-1 cursor-pointer"
-          >
-            <ChevronLeft className="w-3.5 h-3.5" />
-            {tr("back")}
-          </button>
+    <div className="space-y-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={onBack}
+              aria-label={tr("back")}
+              title={tr("back")}
+              className="hidden md:inline-flex -ml-1.5 p-1 rounded-lg text-[var(--muted)] hover:text-[var(--accent)] hover:bg-[var(--surface-2)] cursor-pointer"
+            >
+              <ChevronLeft className="w-5 h-5" />
+            </button>
             <span className="text-xs font-semibold px-2 py-0.5 rounded bg-[var(--accent-soft)] text-[var(--accent)] font-mono">
               {course.publicCode ?? course.code}
             </span>
@@ -1881,7 +2157,7 @@ function CourseDetailView({
           <div className="flex items-center gap-3 text-xs text-[var(--muted)] mt-1">
             {course.professor && (
               <span className="inline-flex items-center gap-1">
-                <User className="w-3.5 h-3.5 text-[var(--accent)]" />
+                <User className="w-3.5 h-3.5 text-[var(--muted)]" />
                 <span>{course.professor}</span>
               </span>
             )}
@@ -1892,7 +2168,7 @@ function CourseDetailView({
         <div className="flex flex-wrap items-center gap-2">
           <a
             href={`/api/courses/${encodeURIComponent(course.code)}/documents/zip`}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-[var(--accent)] text-white dark:text-[#0c0a14] hover:opacity-95 shadow-xs"
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-[var(--accent)] text-[var(--on-accent)] hover:opacity-95 shadow-xs"
           >
             <Download className="w-4 h-4" />
             <span>{tr("downloadCourseZip")}</span>
@@ -1915,7 +2191,7 @@ function CourseDetailView({
                 );
                 await onEnrolledOrUnenrolled();
               }}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium bg-red-500/15 text-red-400 hover:bg-red-500/25 cursor-pointer"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium bg-[var(--danger-soft)] text-[var(--danger)] hover:bg-[var(--danger)]/20 cursor-pointer"
             >
               <UserMinus className="w-3.5 h-3.5" />
               <span>{tr("unenrollCourse")}</span>
@@ -1951,7 +2227,7 @@ function CourseDetailView({
           <button
             key={key}
             onClick={() => onChangeSubTab(key)}
-            className={`px-4 py-2.5 text-xs font-medium border-b-2 -mb-px transition cursor-pointer ${
+            className={`px-4 py-2.5 text-xs font-medium border-b-2 -mb-px transition-colors cursor-pointer ${
               subTab === key
                 ? "border-[var(--accent)] text-[var(--accent)]"
                 : "border-transparent text-[var(--muted)] hover:text-[var(--text)]"
@@ -1989,6 +2265,7 @@ function CourseDetailView({
                   )}
                 </div>
                 <h3 className="text-sm font-semibold">{a.title}</h3>
+                <TriageTag lang={lang} triage={triage[a.id]} />
                 <div
                   className="rich-text text-sm text-[var(--text)]/90"
                   dangerouslySetInnerHTML={{ __html: sanitizeHtml(a.contentHtml || a.contentText) }}
@@ -2025,7 +2302,7 @@ function CourseDetailView({
               {docs.map((node) => (
                 <div key={node.path}>
                 <div
-                  className="px-4 py-3 flex items-center justify-between gap-3 hover:bg-[var(--surface-2)]/60 transition"
+                  className="px-4 py-3 flex items-center justify-between gap-3 hover:bg-[var(--surface-2)]/60 transition-colors"
                 >
                   <div
                     onClick={() => {
@@ -2034,9 +2311,9 @@ function CourseDetailView({
                     className={`flex items-center gap-3 min-w-0 ${node.isDir ? "cursor-pointer" : ""}`}
                   >
                     {node.isDir ? (
-                      <Folder className="w-4 h-4 text-amber-400 shrink-0" />
+                      <Folder className="w-4 h-4 text-[var(--warn)] shrink-0" />
                     ) : (
-                      <FileText className="w-4 h-4 text-[var(--accent)] shrink-0" />
+                      <FileText className="w-4 h-4 text-[var(--muted)] shrink-0" />
                     )}
                     <div className="min-w-0">
                       <div className="text-xs font-medium truncate">{node.name}</div>
@@ -2056,7 +2333,7 @@ function CourseDetailView({
                       onClick={() => setDir(node.path)}
                       className="text-xs text-[var(--accent)] hover:underline cursor-pointer shrink-0"
                     >
-                      {lang === "el" ? "Άνοιγμα →" : "Open →"}
+                      {lang === "el" ? "Άνοιγμα" : "Open"}
                     </button>
                   ) : (
                     <div className="flex items-center gap-1.5 shrink-0">
@@ -2065,7 +2342,18 @@ function CourseDetailView({
                         courseCode={course.code}
                         path={node.path}
                         open={summaryPath === node.path}
-                        onToggle={() => setSummaryPath(summaryPath === node.path ? null : node.path)}
+                        onToggle={() => {
+                          setStudyPath(null);
+                          setSummaryPath(summaryPath === node.path ? null : node.path);
+                        }}
+                      />
+                      <StudyButton
+                        lang={lang}
+                        open={studyPath === node.path}
+                        onToggle={() => {
+                          setSummaryPath(null);
+                          setStudyPath(studyPath === node.path ? null : node.path);
+                        }}
                       />
                       <a
                         href={node.downloadUrl}
@@ -2078,6 +2366,14 @@ function CourseDetailView({
                     </div>
                   )}
                 </div>
+                {studyPath === node.path && (
+                  <StudyPanel
+                    lang={lang}
+                    courseCode={course.code}
+                    path={node.path}
+                    onMeChanged={onMeChanged}
+                  />
+                )}
                 {summaryPath === node.path && (
                   <DocumentSummaryPanel lang={lang} courseCode={course.code} path={node.path} />
                 )}
@@ -2112,7 +2408,7 @@ function CourseDetailView({
                 <button
                   key={asg.id}
                   onClick={() => setOpenAssignmentId(asg.id)}
-                  className="w-full text-left p-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50 transition flex items-center justify-between gap-4 cursor-pointer"
+                  className="w-full text-left p-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50 transition-colors flex items-center justify-between gap-4 cursor-pointer"
                 >
                   <div className="min-w-0">
                     <div className="text-sm font-semibold leading-snug">{asg.title}</div>
@@ -2136,7 +2432,7 @@ function CourseDetailView({
                   <span className="flex items-center gap-2 shrink-0">
                     <span
                       className={`px-2.5 py-1 rounded-full text-xs font-medium ${
-                        asg.submitted ? "bg-emerald-500/15 text-[var(--ok)]" : "bg-amber-500/15 text-[var(--warn)]"
+                        asg.submitted ? "bg-[var(--ok-soft)] text-[var(--ok)]" : "bg-[var(--warn-soft)] text-[var(--warn)]"
                       }`}
                     >
                       {asg.submitted ? tr("submitted") : tr("pending")}
@@ -2219,12 +2515,129 @@ function CourseDetailView({
 /* Inbox View                                                          */
 /* ================================================================== */
 
-function InboxView({ lang, messages }: { lang: Lang; messages: Message[] }) {
+/** "14:05" for today, "25 Νοε" otherwise. */
+function shortDate(iso: string, lang: Lang): string {
+  const d = new Date(iso);
+  const locale = lang === "el" ? "el-GR" : "en-US";
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" })
+    : d.toLocaleDateString(locale, { day: "numeric", month: "short" });
+}
+
+function SectionTitle({
+  icon,
+  title,
+  count,
+  action,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  count?: number;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-2 mb-2 shrink-0">
+      <h2 className="text-sm font-semibold flex items-center gap-2">
+        <span className="text-[var(--muted)]">{icon}</span>
+        <span>{title}</span>
+        {!!count && <span className="text-xs font-normal text-[var(--muted)] tabular-nums">{count}</span>}
+      </h2>
+      {action}
+    </div>
+  );
+}
+
+/** One row of the Inbox feed: an eClass announcement, or a myClass notification. */
+type FeedItem =
+  | { type: "ann"; key: string; date: string; a: Announcement; notif?: NotificationItem }
+  | { type: "notif"; key: string; date: string; n: NotificationItem };
+
+const FEED_PAGE = 40;
+
+function feedIcon(kind: NotificationItem["kind"] | "ann") {
+  const cls = "w-3.5 h-3.5";
+  switch (kind) {
+    case "ann":
+    case "announcement":
+      return <Megaphone className={cls} />;
+    case "message":
+      return <Mail className={cls} />;
+    case "assignment":
+      return <FileText className={cls} />;
+    case "deadline":
+      return <Clock className={cls} />;
+    default:
+      return <Bell className={cls} />;
+  }
+}
+
+function InboxView({
+  lang,
+  messages,
+  announcements,
+  triage,
+  notifications,
+  setNotifications,
+  onOpenNotification,
+  onOpenAnnouncement,
+}: {
+  lang: Lang;
+  messages: Message[];
+  announcements: Announcement[];
+  triage: Record<string, AnnouncementTriage>;
+  notifications: NotificationItem[];
+  setNotifications: React.Dispatch<React.SetStateAction<NotificationItem[]>>;
+  onOpenNotification: (n: NotificationItem) => void;
+  onOpenAnnouncement: (a: Announcement) => void;
+}) {
   const tr = (k: DictKey) => t(lang, k);
+  const el = lang === "el";
   const [selected, setSelected] = useState<Message | null>(messages[0] ?? null);
+  /** Phones and narrow windows show the list or the open message, one at a time. */
+  const [readerOpen, setReaderOpen] = useState(false);
+  const messagesRef = useRef<HTMLElement>(null);
+  const unreadNotifs = notifications.filter((n) => !n.read).length;
+  const unreadMsgs = messages.filter((m) => !m.read).length;
+  const [feedFilter, setFeedFilter] = useState<"all" | "announcements" | "action">("all");
+  const [feedLimit, setFeedLimit] = useState(FEED_PAGE);
+
+  /*
+   * Announcements and notifications in one list, newest first. A notification about an
+   * announcement folds into that announcement's row (same course and date) and gives it
+   * the unread dot, so nothing shows twice.
+   */
+  const feed = useMemo(() => {
+    const annByKey = new Map<string, FeedItem & { type: "ann" }>();
+    const items: FeedItem[] = [];
+    for (const a of announcements) {
+      const item = { type: "ann" as const, key: `a-${a.id}`, date: a.date, a };
+      annByKey.set(`${a.courseCode}|${a.date}`, item);
+      items.push(item);
+    }
+    for (const n of notifications) {
+      const match = n.kind === "announcement" && n.courseCode ? annByKey.get(`${n.courseCode}|${n.date}`) : undefined;
+      if (match && !match.notif) match.notif = n;
+      else items.push({ type: "notif", key: `n-${n.id}`, date: n.date, n });
+    }
+    return items.sort((x, y) => new Date(y.date).getTime() - new Date(x.date).getTime());
+  }, [announcements, notifications]);
+
+  const needsAction = (item: FeedItem) =>
+    item.type === "ann"
+      ? triage[item.a.id]?.label === "action"
+      : item.n.triage === "action" || item.n.kind === "deadline";
+  const actionCount = feed.filter(needsAction).length;
+  const filteredFeed =
+    feedFilter === "all"
+      ? feed
+      : feedFilter === "action"
+        ? feed.filter(needsAction)
+        : feed.filter((i) => i.type === "ann" || i.n.kind === "announcement");
+  const shownFeed = filteredFeed.slice(0, feedLimit);
 
   const selectMsg = async (m: Message) => {
     setSelected(m);
+    setReaderOpen(true);
     if (!m.bodyHtml) {
       try {
         const res = await api.message(m.id);
@@ -2235,63 +2648,226 @@ function InboxView({ lang, messages }: { lang: Lang; messages: Message[] }) {
     }
   };
 
+  const dismiss = async (id: string) => {
+    setNotifications((prev) => prev.filter((item) => item.id !== id));
+    try {
+      const res = await api.openNotification(id, true);
+      setNotifications(res.notifications);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const openNotif = (n: NotificationItem) => {
+    void dismiss(n.id);
+    if (n.kind === "message") {
+      messagesRef.current?.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+    } else {
+      onOpenNotification(n);
+    }
+  };
+
+  const panel = "rounded-2xl border border-[var(--border)] bg-[var(--surface)]";
+
   return (
-    <div className="space-y-4">
-      <h1 className="text-lg font-semibold tracking-tight">{tr("inboxTitle")}</h1>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] divide-y divide-[var(--border)] overflow-hidden">
-          {messages.length === 0 ? (
-            <div className="p-6 text-xs text-[var(--muted)] text-center">{tr("noItems")}</div>
-          ) : (
-            messages.map((m) => (
-              <div
-                key={m.id}
-                onClick={() => void selectMsg(m)}
-                className={`p-4 cursor-pointer transition ${
-                  selected?.id === m.id ? "bg-[var(--surface-2)]" : "hover:bg-[var(--surface-2)]/50"
-                }`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold truncate">{m.sender}</span>
-                  {!m.read && <span className="w-2 h-2 rounded-full bg-[var(--accent)]" />}
-                </div>
-                <div className="text-xs font-medium mt-0.5 truncate">{m.subject}</div>
-                <div className="text-xs text-[var(--muted)] mt-0.5 truncate">
-                  {m.courseTitle ?? "eClass"}
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-
-        <div className="lg:col-span-2 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 min-h-[300px]">
-          {!selected ? (
-            <div className="h-full flex items-center justify-center text-xs text-[var(--muted)]">
-              {tr("selectMessage")}
-            </div>
-          ) : (
-            <div className="space-y-3">
-              <div className="pb-3 border-b border-[var(--border)]">
-                <div className="text-xs text-[var(--accent)] font-medium">
-                  {selected.courseTitle ?? "eClass"}
-                </div>
-                <h2 className="text-base font-semibold mt-0.5">{selected.subject}</h2>
-                <div className="text-xs text-[var(--muted)] mt-1">
-                  {selected.sender} ·{" "}
-                  {new Date(selected.date).toLocaleString(lang === "el" ? "el-GR" : "en-US")}
-                </div>
-              </div>
-              <div
-                className="text-xs leading-relaxed space-y-2"
-                dangerouslySetInnerHTML={{
-                  __html: sanitizeHtml(selected.bodyHtml || selected.preview || ""),
+    <div className="flex-1 flex flex-col gap-6 md:gap-5 md:h-[calc(100dvh-2.5rem)] md:min-h-0">
+      {/* Notifications and announcements in one feed, capped so messages always keep room below */}
+      <section className="flex flex-col min-h-0 shrink-0 md:max-h-[45%]">
+        <SectionTitle
+          icon={<Bell className="w-4 h-4" />}
+          title={el ? "Ειδοποιήσεις και ανακοινώσεις" : "Notifications and announcements"}
+          count={unreadNotifs}
+          action={
+            notifications.some((n) => !n.read) && (
+              <button
+                onClick={async () => {
+                  const res = await api.markAllNotificationsRead();
+                  setNotifications(res.notifications ?? []);
                 }}
-              />
+                className="text-xs text-[var(--muted)] hover:text-[var(--text)] cursor-pointer"
+              >
+                {tr("markAllRead")}
+              </button>
+            )
+          }
+        />
+        {feed.length > 0 && (
+          <div className="mb-2 shrink-0 overflow-x-auto">
+            <Segmented
+              value={feedFilter}
+              onChange={(v) => {
+                setFeedFilter(v);
+                setFeedLimit(FEED_PAGE);
+              }}
+              options={[
+                { value: "all", label: el ? "Όλα" : "All" },
+                { value: "announcements", label: el ? "Ανακοινώσεις" : "Announcements" },
+                {
+                  value: "action",
+                  label: `${el ? "Χρειάζεται ενέργεια" : "Action needed"}${actionCount ? ` ${actionCount}` : ""}`,
+                },
+              ]}
+            />
+          </div>
+        )}
+        <div className={`${panel} min-h-0 max-h-[55vh] md:max-h-none overflow-y-auto divide-y divide-[var(--border)]`}>
+          {shownFeed.length === 0 ? (
+            <div className="p-5 text-xs text-[var(--muted)] text-center">
+              {feedFilter === "action"
+                ? el
+                  ? "Τίποτα δεν ζητά κάτι από σένα."
+                  : "Nothing asks anything of you."
+                : tr("noItems")}
             </div>
+          ) : (
+            shownFeed.map((item) => {
+              const n = item.type === "notif" ? item.n : item.notif;
+              const unread = !!n && !n.read;
+              const open = () => {
+                if (item.type === "notif") return openNotif(item.n);
+                if (item.notif) void dismiss(item.notif.id);
+                onOpenAnnouncement(item.a);
+              };
+              const title = item.type === "ann" ? item.a.title : item.n.title;
+              const courseTitle = item.type === "ann" ? (item.a.courseTitle ?? item.a.courseCode) : item.n.courseTitle;
+              const body = item.type === "ann" ? item.a.contentText : item.n.body;
+              const tag: AnnouncementTriage | undefined =
+                item.type === "ann" ? triage[item.a.id] : item.n.triage ? { label: item.n.triage } : undefined;
+              return (
+                <div
+                  key={item.key}
+                  role="button"
+                  tabIndex={0}
+                  onClick={open}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") open();
+                  }}
+                  className="group flex items-start gap-3 pl-3 pr-2 py-3 cursor-pointer transition-colors hover:bg-[var(--surface-2)]/60"
+                >
+                  <span className="relative mt-0.5 shrink-0 w-7 h-7 rounded-lg bg-[var(--surface-2)] text-[var(--muted)] inline-flex items-center justify-center">
+                    {feedIcon(item.type === "ann" ? "ann" : item.n.kind)}
+                    {unread && (
+                      <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-[var(--accent)] ring-2 ring-[var(--surface)]" />
+                    )}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline justify-between gap-3">
+                      <span className={`text-sm truncate ${unread ? "font-semibold" : "font-medium"}`}>{title}</span>
+                      <span className="text-xs text-[var(--muted)] shrink-0 tabular-nums">
+                        {shortDate(item.date, lang)}
+                      </span>
+                    </div>
+                    <div className="text-xs text-[var(--muted)] truncate mt-0.5">
+                      {courseTitle && <span className="text-[var(--accent)]">{courseTitle} · </span>}
+                      {body}
+                    </div>
+                    <TriageTag lang={lang} triage={tag} />
+                  </div>
+                  {item.type === "notif" ? (
+                    <button
+                      aria-label={el ? "Απόρριψη" : "Dismiss"}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void dismiss(item.n.id);
+                      }}
+                      className="p-1 rounded-md text-[var(--muted)] hover:text-[var(--text)] cursor-pointer shrink-0 md:opacity-0 md:group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  ) : (
+                    <span className="w-[22px] shrink-0" />
+                  )}
+                </div>
+              );
+            })
+          )}
+          {filteredFeed.length > shownFeed.length && (
+            <button
+              onClick={() => setFeedLimit((l) => l + FEED_PAGE)}
+              className="w-full py-2.5 text-xs font-medium text-[var(--muted)] hover:text-[var(--text)] cursor-pointer"
+            >
+              {el ? "Περισσότερα" : "Show more"} ({filteredFeed.length - shownFeed.length})
+            </button>
           )}
         </div>
-      </div>
+      </section>
+
+      {/* Messages: list + reader side by side on wide screens, one at a time on phones */}
+      <section ref={messagesRef} className="flex-1 flex flex-col min-h-0 scroll-mt-16 md:scroll-mt-0">
+        <SectionTitle icon={<Mail className="w-4 h-4" />} title={tr("messagesSection")} count={unreadMsgs} />
+        <div className="flex-1 min-h-0 grid grid-cols-1 md:grid-rows-[minmax(0,1fr)] lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-4">
+          <div
+            className={`${panel} min-h-0 overflow-y-auto divide-y divide-[var(--border)] ${
+              readerOpen ? "hidden lg:block" : ""
+            }`}
+          >
+            {messages.length === 0 ? (
+              <div className="p-5 text-xs text-[var(--muted)] text-center">{tr("noItems")}</div>
+            ) : (
+              messages.map((m) => (
+                <div
+                  key={m.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => void selectMsg(m)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void selectMsg(m);
+                  }}
+                  className={`px-4 py-3 cursor-pointer transition-colors ${
+                    selected?.id === m.id ? "lg:bg-[var(--surface-2)]" : ""
+                  } hover:bg-[var(--surface-2)]/60`}
+                >
+                  <div className="flex items-baseline justify-between gap-3">
+                    <span className={`text-sm truncate ${m.read ? "" : "font-semibold"}`}>{m.sender}</span>
+                    <span className="flex items-center gap-2 shrink-0">
+                      <span className="text-xs text-[var(--muted)] tabular-nums">{shortDate(m.date, lang)}</span>
+                      {!m.read && <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)]" />}
+                    </span>
+                  </div>
+                  <div className="text-sm mt-0.5 truncate">{m.subject}</div>
+                  <div className="text-xs text-[var(--muted)] mt-0.5 truncate">{m.courseTitle ?? "eClass"}</div>
+                </div>
+              ))
+            )}
+          </div>
+
+          <div
+            className={`${panel} min-h-0 overflow-y-auto p-5 ${readerOpen ? "" : "hidden lg:block"} ${
+              selected ? "" : "lg:flex lg:items-center lg:justify-center"
+            }`}
+          >
+            {!selected ? (
+              <div className="text-xs text-[var(--muted)]">{tr("selectMessage")}</div>
+            ) : (
+              <div className="space-y-3">
+                <button
+                  onClick={() => setReaderOpen(false)}
+                  className="lg:hidden -ml-1 inline-flex items-center gap-1 text-xs text-[var(--muted)] hover:text-[var(--text)] cursor-pointer"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                  {tr("messagesSection")}
+                </button>
+                <div className="pb-3 border-b border-[var(--border)]">
+                  <div className="text-xs text-[var(--accent)] font-medium">
+                    {selected.courseTitle ?? "eClass"}
+                  </div>
+                  <h2 className="text-base font-semibold mt-0.5">{selected.subject}</h2>
+                  <div className="text-xs text-[var(--muted)] mt-1">
+                    {selected.sender} ·{" "}
+                    {new Date(selected.date).toLocaleString(lang === "el" ? "el-GR" : "en-US")}
+                  </div>
+                </div>
+                <div
+                  className="rich-text text-sm leading-relaxed"
+                  dangerouslySetInnerHTML={{
+                    __html: sanitizeHtml(selected.bodyHtml || selected.preview || ""),
+                  }}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
     </div>
   );
 }
@@ -2322,7 +2898,7 @@ function AssistantView({
   }, []);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    bottomRef.current?.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth" });
   }, [messages, streamingText]);
 
   const sendMessage = async (textToSend?: string) => {
@@ -2368,66 +2944,61 @@ function AssistantView({
 
   const quickPrompts =
     lang === "el"
-      ? [
-          "Τι προθεσμίες έχω;",
-          "Τι νέα ανακοινώθηκαν;",
-          "Ποια μαθήματα έχει το Α' εξάμηνο;",
-        ]
-      : [
-          "What deadlines do I have?",
-          "Any new announcements?",
-          "What subjects are in the 1st semester?",
-        ];
+      ? ["Τι προθεσμίες έχω αυτή την εβδομάδα;", "Τι νέο υπάρχει στα μαθήματά μου;", "Κάνε μου ένα πλάνο διαβάσματος"]
+      : ["What's due this week?", "What's new in my courses?", "Make me a study plan"];
+
+  const toolLabel = (name: string | null): string => {
+    const el: Record<string, string> = {
+      list_courses: "Κοιτάζω τα μαθήματά σου",
+      search_catalog: "Ψάχνω στον κατάλογο",
+      list_documents: "Κοιτάζω τα αρχεία",
+      read_document: "Διαβάζω το αρχείο",
+      get_announcements: "Κοιτάζω τις ανακοινώσεις",
+      get_messages: "Κοιτάζω τα μηνύματα",
+      read_message: "Διαβάζω το μήνυμα",
+      get_deadlines: "Κοιτάζω τις προθεσμίες",
+      get_assignment_details: "Διαβάζω την εργασία",
+    };
+    const en: Record<string, string> = {
+      list_courses: "Checking your courses",
+      search_catalog: "Searching the catalog",
+      list_documents: "Looking at the files",
+      read_document: "Reading the file",
+      get_announcements: "Checking announcements",
+      get_messages: "Checking messages",
+      read_message: "Reading the message",
+      get_deadlines: "Checking deadlines",
+      get_assignment_details: "Reading the assignment",
+    };
+    const fallback = lang === "el" ? "Σκέφτομαι" : "Thinking";
+    return (name && (lang === "el" ? el : en)[name]) || fallback;
+  };
 
   return (
     <div
       className={`flex flex-col ${
         compact
           ? "h-full"
-          : "h-[52vh] sm:h-[62vh] md:h-[calc(100vh-12rem)] max-w-[94%] sm:max-w-full mx-auto w-full"
+          : "h-[calc(100dvh-10.5rem)] md:h-[calc(100vh-2.5rem)] max-w-4xl mx-auto w-full"
       }`}
     >
-      {!compact && (
-        <div className="flex items-center justify-between mb-3 sm:mb-4">
-          <div>
-            <h1 className="text-base sm:text-lg font-semibold tracking-tight flex items-center gap-2">
-              <Bot className="w-5 h-5 text-[var(--accent)]" />
-              <span>{tr("assistantTitle")}</span>
-            </h1>
-            <p className="text-xs text-[var(--muted)] mt-0.5">{tr("assistantSubtitle")}</p>
-          </div>
-          {messages.length > 0 && (
-            <button
-              onClick={async () => {
-                await api.clearChat();
-                setMessages([]);
-              }}
-              className="text-xs text-[var(--muted)] hover:text-[var(--text)] inline-flex items-center gap-1 cursor-pointer"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              <span>{tr("clearChat")}</span>
-            </button>
-          )}
-        </div>
-      )}
-
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-3 sm:p-4 space-y-3 sm:space-y-4">
         {messages.length === 0 && (
           <div className="py-3 sm:py-6 text-center space-y-3 sm:space-y-4">
-            <div className="w-9 h-9 sm:w-11 sm:h-11 rounded-2xl bg-[var(--accent-soft)] text-[var(--accent)] flex items-center justify-center mx-auto">
-              <Sparkles className="w-4 h-4 sm:w-5 sm:h-5" />
+            <div className="w-9 h-9 sm:w-11 sm:h-11 rounded-xl bg-[var(--surface-2)] text-[var(--muted)] flex items-center justify-center mx-auto">
+              <Bot className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
             <div className="max-w-md mx-auto space-y-1">
-              <div className="text-xs sm:text-sm font-semibold">{tr("assistantTitle")}</div>
-              <p className="text-xs sm:text-xs text-[var(--muted)]">{tr("assistantSubtitle")}</p>
+              <div className="text-base font-semibold">{tr("assistantTitle")}</div>
+              <p className="text-sm text-[var(--muted)]">{tr("assistantSubtitle")}</p>
             </div>
             <div className="flex flex-wrap justify-center gap-1.5 sm:gap-2 max-w-lg mx-auto pt-1 sm:pt-2">
               {quickPrompts.map((p) => (
                 <button
                   key={p}
                   onClick={() => void sendMessage(p)}
-                  className="text-xs sm:text-xs px-2.5 py-1.5 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] transition cursor-pointer"
+                  className="text-sm px-3 py-1.5 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] transition-colors cursor-pointer"
                 >
                   {p}
                 </button>
@@ -2442,24 +3013,12 @@ function AssistantView({
             className={`flex flex-col ${m.role === "user" ? "items-end" : "items-start"}`}
           >
             <div
-              className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-xs leading-relaxed whitespace-pre-wrap ${
+              className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap ${
                 m.role === "user"
-                  ? "bg-[var(--accent)] text-white dark:text-[#0c0a14] font-medium"
+                  ? "bg-[var(--accent)] text-[var(--on-accent)] font-medium"
                   : "bg-[var(--surface-2)] text-[var(--text)]"
               }`}
             >
-              {m.toolsUsed && m.toolsUsed.length > 0 && (
-                <div className="flex flex-wrap gap-1 mb-1.5">
-                  {m.toolsUsed.map((tl, idx) => (
-                    <span
-                      key={`${tl}-${idx}`}
-                      className="text-[11px] px-1.5 py-0.5 rounded bg-[var(--accent-soft)] text-[var(--accent)] font-mono"
-                    >
-                      ⚡ {tl}
-                    </span>
-                  ))}
-                </div>
-              )}
               <FormattedChatText text={m.text} isUser={m.role === "user"} />
 
               {/* Confirmation Card for mutating actions */}
@@ -2469,9 +3028,8 @@ function AssistantView({
                     <span className="text-xs font-semibold text-[var(--accent)]">
                       {tr("actionPending")}
                     </span>
-                    <span className="text-[11px] font-mono text-[var(--muted)]">{m.action.tool}</span>
                   </div>
-                  <div className="text-xs font-medium">{m.action.summary}</div>
+                  <div className="text-sm font-medium">{m.action.summary}</div>
 
                   {m.action.status === "pending" ? (
                     <div className="flex items-center gap-2 pt-1">
@@ -2483,7 +3041,7 @@ function AssistantView({
                           );
                           await onActionCompleted();
                         }}
-                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-[var(--accent)] text-white dark:text-[#0c0a14] hover:opacity-95 cursor-pointer"
+                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-[var(--accent)] text-[var(--on-accent)] hover:opacity-95 cursor-pointer"
                       >
                         <Check className="w-3.5 h-3.5" />
                         <span>{tr("confirmAction")}</span>
@@ -2502,8 +3060,16 @@ function AssistantView({
                       </button>
                     </div>
                   ) : (
-                    <div className="text-xs text-emerald-400 flex items-center gap-1.5">
-                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                    <div
+                      className={`text-xs flex items-center gap-1.5 ${
+                        m.action.status === "done" ? "text-[var(--ok)]" : "text-[var(--muted)]"
+                      }`}
+                    >
+                      {m.action.status === "done" ? (
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                      ) : (
+                        <X className="w-3.5 h-3.5 shrink-0" />
+                      )}
                       <span>{m.action.result || m.action.status}</span>
                     </div>
                   )}
@@ -2514,9 +3080,9 @@ function AssistantView({
         ))}
 
         {busy && (
-          <div className="flex items-center gap-2 text-xs text-[var(--muted)]">
+          <div className="flex items-center gap-2 text-sm text-[var(--muted)]">
             <RefreshCw className="w-3.5 h-3.5 animate-spin text-[var(--accent)]" />
-            <span>{activeTool ? `Calling ${activeTool}...` : "Thinking..."}</span>
+            <span>{toolLabel(activeTool)}…</span>
           </div>
         )}
         <div ref={bottomRef} />
@@ -2530,20 +3096,35 @@ function AssistantView({
         }}
         className="mt-3 flex items-center gap-2"
       >
+        {!compact && messages.length > 0 && (
+          <button
+            type="button"
+            title={tr("clearChat")}
+            aria-label={tr("clearChat")}
+            onClick={async () => {
+              await api.clearChat();
+              setMessages([]);
+            }}
+            className="p-2.5 rounded-xl border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--text)] cursor-pointer"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
+        )}
         <input
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder={tr("chatPlaceholder")}
-          className="flex-1 px-4 py-2.5 rounded-xl text-xs border border-[var(--border)] bg-[var(--surface)] focus:outline-none focus:border-[var(--accent)]"
+          className="flex-1 min-w-0 px-4 py-2.5 rounded-xl text-sm border border-[var(--border)] bg-[var(--surface)] focus:outline-none focus:border-[var(--accent)]"
         />
         <button
           type="submit"
           disabled={busy || !input.trim()}
-          className="px-4 py-2.5 rounded-xl bg-[var(--accent)] text-white dark:text-[#0c0a14] font-semibold text-xs inline-flex items-center gap-1.5 hover:opacity-95 cursor-pointer disabled:opacity-50"
+          aria-label={tr("send")}
+          className="px-4 py-2.5 rounded-xl bg-[var(--accent)] text-[var(--on-accent)] font-semibold text-sm inline-flex items-center gap-1.5 hover:opacity-95 cursor-pointer disabled:opacity-50"
         >
-          <Send className="w-3.5 h-3.5" />
-          <span>{tr("send")}</span>
+          <Send className="w-4 h-4" />
+          <span className="hidden sm:inline">{tr("send")}</span>
         </button>
       </form>
     </div>
@@ -2557,20 +3138,20 @@ function AssistantView({
 function SettingsView({
   me,
   lang,
+  departments,
   onUpdatedMe,
   onLoggedOut,
   showToast,
 }: {
   me: Me;
   lang: Lang;
+  departments: DepartmentInfo[];
   onUpdatedMe: (m: Me) => void;
   onLoggedOut: () => void;
   showToast: (m: string) => void;
 }) {
   const tr = (k: DictKey) => t(lang, k);
   const [apiKeyInput, setApiKeyInput] = useState("");
-  const [googleFlowOpen, setGoogleFlowOpen] = useState(false);
-  const [googleKeyInput, setGoogleKeyInput] = useState("");
   const [busy, setBusy] = useState(false);
 
   const run = async (fn: () => Promise<void>) => {
@@ -2590,7 +3171,7 @@ function SettingsView({
       onUpdatedMe(res.me);
     });
 
-  const setNotify = (key: "announcements" | "messages" | "assignments", value: boolean) =>
+  const setNotify = (key: "announcements" | "messages" | "assignments" | "deadlines", value: boolean) =>
     patch({ notify: { ...me.settings.notify, [key]: value } });
 
   const aiMode = me.settings.ai.mode;
@@ -2636,7 +3217,7 @@ function SettingsView({
         <div className="min-w-0 flex-1">
           <div className="font-semibold truncate">{me.displayName}</div>
           <div className="text-xs text-[var(--muted)] truncate">
-            {me.username} · {me.universityName}
+            {me.username} · {me.departmentName ?? me.universityName}
           </div>
         </div>
         <button
@@ -2679,6 +3260,67 @@ function SettingsView({
         </SettingsRow>
       </SettingsGroup>
 
+      <SettingsGroup title={lang === "el" ? "Προσβασιμότητα" : "Accessibility"}>
+        <SettingsRow
+          label={lang === "el" ? "Μέγεθος κειμένου" : "Text size"}
+          hint={lang === "el" ? "Ισχύει σε όλη την εφαρμογή." : "Applies across the whole app."}
+        >
+          <Segmented
+            value={String(me.settings.accessibility.fontScale)}
+            disabled={busy}
+            onChange={(v) => patch({ accessibility: { fontScale: Number(v) as 0.9 | 1 | 1.15 | 1.3 } })}
+            options={[
+              { value: "0.9", label: "A−" },
+              { value: "1", label: "A" },
+              { value: "1.15", label: "A+" },
+              { value: "1.3", label: "A++" },
+            ]}
+          />
+        </SettingsRow>
+        <SettingsRow
+          label={lang === "el" ? "Λιγότερη κίνηση" : "Reduce motion"}
+          hint={
+            lang === "el"
+              ? "Χωρίς κινήσεις και μεταβάσεις. «Συσκευή» ακολουθεί τη ρύθμιση του κινητού/υπολογιστή."
+              : "No movement or transitions. “Device” follows your phone or computer setting."
+          }
+        >
+          <Segmented
+            value={me.settings.accessibility.reduceMotion}
+            disabled={busy}
+            onChange={(v) => patch({ accessibility: { reduceMotion: v } })}
+            options={[
+              { value: "system", label: lang === "el" ? "Συσκευή" : "Device" },
+              { value: "on", label: lang === "el" ? "Ναι" : "On" },
+              { value: "off", label: lang === "el" ? "Όχι" : "Off" },
+            ]}
+          />
+        </SettingsRow>
+      </SettingsGroup>
+
+      {departments.length > 0 && (
+        <SettingsGroup title={lang === "el" ? "Σπουδές" : "Studies"}>
+          <SettingsRow
+            label={tr("departmentLabel")}
+            hint={lang === "el" ? "Ο κατάλογος «Όλα» και ο βοηθός χρησιμοποιούν αυτό το τμήμα." : "Used by the “All” catalog and the assistant."}
+          >
+            <select
+              aria-label={tr("departmentLabel")}
+              value={me.departmentId ?? ""}
+              disabled={busy}
+              onChange={(e) => patch({ departmentId: e.target.value })}
+              className="max-w-[12rem] sm:max-w-xs px-3 py-1.5 rounded-lg text-sm border border-[var(--border)] bg-[var(--surface-2)] text-[var(--text)] focus:outline-none focus:border-[var(--accent)] cursor-pointer"
+            >
+              {departments.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {lang === "el" ? d.name : d.nameEn}
+                </option>
+              ))}
+            </select>
+          </SettingsRow>
+        </SettingsGroup>
+      )}
+
       <SettingsGroup title={tr("notificationsSection")}>
         <SettingsRow label={tr("notifyAnnouncements")}>
           <Toggle
@@ -2704,6 +3346,21 @@ function SettingsView({
             onChange={(v) => setNotify("assignments", v)}
           />
         </SettingsRow>
+        <SettingsRow
+          label={lang === "el" ? "Υπενθυμίσεις προθεσμιών" : "Deadline reminders"}
+          hint={
+            lang === "el"
+              ? "24 ώρες και 1 ώρα πριν λήξει εργασία που δεν έχεις υποβάλει."
+              : "24 hours and 1 hour before an assignment you haven't submitted is due."
+          }
+        >
+          <Toggle
+            checked={me.settings.notify.deadlines}
+            disabled={busy}
+            label={lang === "el" ? "Υπενθυμίσεις προθεσμιών" : "Deadline reminders"}
+            onChange={(v) => setNotify("deadlines", v)}
+          />
+        </SettingsRow>
         <SettingsRow label={tr("pollIntervalLabel")}>
           <Segmented
             value={String(me.settings.pollIntervalMin)}
@@ -2719,12 +3376,14 @@ function SettingsView({
               ? lang === "el"
                 ? "Στο iPhone πρόσθεσε πρώτα το myClass στην οθόνη αφετηρίας."
                 : "On iPhone, add myClass to your Home Screen first."
-              : undefined
+              : lang === "el"
+                ? "Ανακοινώσεις, μηνύματα, εργασίες και υπενθυμίσεις, ακόμα κι όταν η εφαρμογή είναι κλειστή."
+                : "Announcements, messages, assignments and reminders, even when the app is closed."
           }
         >
           {me.settings.notify.push ? (
             <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-emerald-400 inline-flex items-center gap-1">
+              <span className="text-xs font-medium text-[var(--ok)] inline-flex items-center gap-1">
                 <CheckCircle2 className="w-3.5 h-3.5" />
                 {tr("pushOn")}
               </span>
@@ -2739,13 +3398,15 @@ function SettingsView({
             <button
               onClick={enablePush}
               disabled={busy}
-              className="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent)] text-white dark:text-[#0c0a14] cursor-pointer disabled:opacity-50"
+              className="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent)] text-[var(--on-accent)] cursor-pointer disabled:opacity-50"
             >
               {tr("enableWebPush")}
             </button>
           )}
         </SettingsRow>
       </SettingsGroup>
+
+      <HomeScreenCalendarSettings me={me} lang={lang} onUpdatedMe={onUpdatedMe} showToast={showToast} />
 
       <SettingsGroup title={tr("aiSection")}>
         <div className="px-4 py-3.5 space-y-3">
@@ -2757,21 +3418,20 @@ function SettingsView({
             options={[
               { value: "server", label: tr("aiModeServer") },
               { value: "apiKey", label: tr("aiModeApiKey") },
-              { value: "google", label: tr("aiModeGoogle") },
             ]}
           />
           <p className="text-xs text-[var(--muted)]">
             {aiMode === "server"
-              ? tr("aiModeServerHint")
-              : aiMode === "apiKey"
-                ? tr("aiModeApiKeyHint")
-                : tr("aiModeGoogleHint")}
+              ? me.ai.serverKeyAvailable
+                ? tr("aiModeServerHint")
+                : tr("aiModeServerMissing")
+              : tr("aiModeApiKeyHint")}
           </p>
 
           {aiMode === "apiKey" &&
             (me.ai.hasApiKey ? (
               <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-medium text-emerald-400 inline-flex items-center gap-1">
+                <span className="text-xs font-medium text-[var(--ok)] inline-flex items-center gap-1">
                   <ShieldCheck className="w-3.5 h-3.5" />
                   {tr("keySaved")}
                 </span>
@@ -2810,85 +3470,11 @@ function SettingsView({
                 <button
                   type="submit"
                   disabled={busy || apiKeyInput.trim().length < 10}
-                  className="px-3.5 py-2 rounded-xl text-sm font-medium bg-[var(--accent)] text-white dark:text-[#0c0a14] cursor-pointer disabled:opacity-50"
+                  className="px-3.5 py-2 rounded-xl text-sm font-medium bg-[var(--accent)] text-[var(--on-accent)] cursor-pointer disabled:opacity-50"
                 >
                   {tr("saveKeyBtn")}
                 </button>
               </form>
-            ))}
-
-          {aiMode === "google" &&
-            (me.ai.googleConnected ? (
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-medium text-emerald-400 inline-flex items-center gap-1 truncate">
-                  <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                  <span className="truncate">{me.ai.googleEmail || tr("pushOn")}</span>
-                </span>
-                <button
-                  onClick={() =>
-                    run(async () => {
-                      const res = await api.disconnectGoogle();
-                      onUpdatedMe(res.me);
-                    })
-                  }
-                  className="px-3 py-1.5 rounded-lg text-xs border border-[var(--border)] hover:bg-[var(--surface-2)] cursor-pointer shrink-0"
-                >
-                  {tr("disconnectGoogleBtn")}
-                </button>
-              </div>
-            ) : googleFlowOpen ? (
-              <form
-                className="space-y-2"
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  void run(async () => {
-                    const res = await api.connectGoogleAccount(googleKeyInput);
-                    onUpdatedMe(res.me);
-                    setGoogleKeyInput("");
-                    setGoogleFlowOpen(false);
-                  });
-                }}
-              >
-                <p className="text-xs text-[var(--muted)]">
-                  {lang === "el"
-                    ? "Πάτα «Create API key» στο παράθυρο του Google και επικόλλησέ το εδώ."
-                    : "Click “Create API key” in the Google window and paste it here."}
-                </p>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="password"
-                    value={googleKeyInput}
-                    onChange={(e) => setGoogleKeyInput(e.target.value)}
-                    placeholder={tr("apiKeyPlaceholder")}
-                    autoComplete="off"
-                    className="flex-1 min-w-0 px-3 py-2 rounded-xl text-sm border border-[var(--border)] bg-[var(--surface-2)] focus:outline-none focus:border-[var(--accent)]"
-                  />
-                  <button
-                    type="submit"
-                    disabled={busy || googleKeyInput.trim().length < 10}
-                    className="px-3.5 py-2 rounded-xl text-sm font-medium bg-[var(--accent)] text-white dark:text-[#0c0a14] cursor-pointer disabled:opacity-50"
-                  >
-                    {tr("saveKeyBtn")}
-                  </button>
-                </div>
-              </form>
-            ) : (
-              <button
-                onClick={() =>
-                  run(async () => {
-                    const res = await api.startGoogleOAuth();
-                    if (res.mode === "oauth") {
-                      window.location.href = res.url;
-                    } else {
-                      window.open(res.url, "google_aistudio", "width=960,height=720");
-                      setGoogleFlowOpen(true);
-                    }
-                  })
-                }
-                className="px-3.5 py-2 rounded-xl text-sm font-medium bg-[var(--accent)] text-white dark:text-[#0c0a14] cursor-pointer"
-              >
-                {tr("connectGoogleBtn")}
-              </button>
             ))}
         </div>
       </SettingsGroup>
@@ -2904,7 +3490,7 @@ function SettingsView({
               });
             }}
             aria-label={tr("deleteDataBtn")}
-            className="p-2 rounded-lg bg-red-500/15 text-red-400 hover:bg-red-500/25 cursor-pointer"
+            className="p-2 rounded-lg bg-[var(--danger-soft)] text-[var(--danger)] hover:bg-[var(--danger)]/20 cursor-pointer"
           >
             <Trash2 className="w-4 h-4" />
           </button>
@@ -2914,10 +3500,191 @@ function SettingsView({
   );
 }
 
+/** Browsers offer "Install" through this event (Chrome, Edge, Android); kept so Settings can ask later. */
+interface InstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
+}
+let deferredInstall: InstallPromptEvent | null = null;
+if (typeof window !== "undefined") {
+  window.addEventListener("beforeinstallprompt", (e) => {
+    e.preventDefault();
+    deferredInstall = e as InstallPromptEvent;
+  });
+}
+
+function isInstalledApp(): boolean {
+  return (
+    window.matchMedia("(display-mode: standalone)").matches ||
+    (navigator as unknown as { standalone?: boolean }).standalone === true
+  );
+}
+
+/**
+ * Deadlines on the home screen. Phone browsers don't let web apps place widgets, so on Android and
+ * iPhone the deadlines go into the phone's own calendar (a private subscription link) and that
+ * calendar's widget shows them. On Windows, the installed app has its own Widgets board card.
+ */
+function HomeScreenCalendarSettings({
+  me,
+  lang,
+  onUpdatedMe,
+  showToast,
+}: {
+  me: Me;
+  lang: Lang;
+  onUpdatedMe: (m: Me) => void;
+  showToast: (m: string) => void;
+}) {
+  const el = lang === "el";
+  const [busy, setBusy] = useState(false);
+  const [canInstall, setCanInstall] = useState(() => Boolean(deferredInstall));
+  const installed = isInstalledApp();
+  const ua = navigator.userAgent;
+  const isWindows = /Windows/.test(ua);
+  const isApple = /iPhone|iPad|iPod|Macintosh/.test(ua);
+  const feed = me.calendarFeedUrl;
+  const webcal = feed?.replace(/^https?:\/\//, "webcal://");
+  const googleAdd = webcal ? `https://calendar.google.com/calendar/r?cid=${encodeURIComponent(webcal)}` : undefined;
+
+  useEffect(() => {
+    const onPrompt = () => setCanInstall(true);
+    window.addEventListener("beforeinstallprompt", onPrompt);
+    return () => window.removeEventListener("beforeinstallprompt", onPrompt);
+  }, []);
+
+  const run = async (fn: () => Promise<void>) => {
+    setBusy(true);
+    try {
+      await fn();
+    } catch (err) {
+      showToast((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const linkBtn =
+    "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border border-[var(--border)] hover:bg-[var(--surface-2)] cursor-pointer";
+
+  return (
+    <SettingsGroup title={el ? "Προθεσμίες στην αρχική οθόνη" : "Deadlines on your home screen"}>
+      {!installed && canInstall && (
+        <SettingsRow
+          label={el ? "Εγκατάσταση εφαρμογής" : "Install the app"}
+          hint={el ? "Το myClass ως εφαρμογή, με εικονίδιο και συντομεύσεις." : "myClass as an app, with an icon and shortcuts."}
+        >
+          <button
+            onClick={async () => {
+              if (!deferredInstall) return;
+              await deferredInstall.prompt();
+              deferredInstall = null;
+              setCanInstall(false);
+            }}
+            className="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent)] text-[var(--on-accent)] cursor-pointer"
+          >
+            {el ? "Εγκατάσταση" : "Install"}
+          </button>
+        </SettingsRow>
+      )}
+
+      <div className="px-4 py-3.5 space-y-2.5">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm">{el ? "Widget ημερολογίου" : "Calendar widget"}</div>
+            <div className="text-xs text-[var(--muted)] mt-0.5">
+              {el
+                ? `Οι προθεσμίες σου μπαίνουν στο ${isApple ? "Ημερολόγιο του iPhone" : "Google Calendar"} και ενημερώνονται μόνες τους. Μετά πρόσθεσε το widget του ημερολογίου στην αρχική οθόνη.`
+                : `Your deadlines go into ${isApple ? "Apple Calendar" : "Google Calendar"} and stay up to date. Then add that calendar's widget to your home screen.`}
+            </div>
+          </div>
+          {!feed && (
+            <button
+              disabled={busy}
+              onClick={() => run(async () => onUpdatedMe((await api.enableCalendarFeed()).me))}
+              className="shrink-0 px-3.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent)] text-[var(--on-accent)] cursor-pointer disabled:opacity-50"
+            >
+              {el ? "Ενεργοποίηση" : "Turn on"}
+            </button>
+          )}
+        </div>
+        {feed && (
+          <div className="enter space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <a href={isApple ? webcal : googleAdd} target="_blank" rel="noreferrer" className={linkBtn}>
+                <Calendar className="w-3.5 h-3.5" />
+                {el ? "Προσθήκη στο ημερολόγιο" : "Add to calendar"}
+              </a>
+              {!isApple && (
+                <a href={webcal} className={linkBtn}>
+                  {el ? "Άλλη εφαρμογή ημερολογίου" : "Other calendar app"}
+                </a>
+              )}
+              <button
+                onClick={() =>
+                  navigator.clipboard
+                    .writeText(feed)
+                    .then(() => showToast(el ? "Ο σύνδεσμος αντιγράφηκε." : "Link copied."))
+                    .catch(() => showToast(feed))
+                }
+                className={linkBtn}
+              >
+                {el ? "Αντιγραφή συνδέσμου" : "Copy link"}
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => run(async () => onUpdatedMe((await api.disableCalendarFeed()).me))}
+                className="ml-auto text-xs text-[var(--muted)] hover:text-[var(--danger)] cursor-pointer"
+              >
+                {el ? "Απενεργοποίηση" : "Turn off"}
+              </button>
+            </div>
+            <p className="text-xs text-[var(--muted)]">
+              {el
+                ? "Ο σύνδεσμος είναι ιδιωτικός: όποιος τον έχει βλέπει τις προθεσμίες σου. Αν τον μοιράστηκες κατά λάθος, απενεργοποίησέ τον και ενεργοποίησέ τον ξανά."
+                : "The link is private: anyone who has it sees your deadlines. If you shared it by mistake, turn it off and on again."}
+            </p>
+          </div>
+        )}
+      </div>
+
+      {isWindows && (
+        <SettingsRow
+          label={el ? "Widget των Windows" : "Windows widget"}
+          hint={
+            installed
+              ? el
+                ? "Πάτα Win + W → «+» → myClass deadlines."
+                : "Press Win + W → “+” → myClass deadlines."
+              : el
+                ? "Εγκατάστησε το myClass από τον Edge, μετά Win + W → «+» → myClass deadlines."
+                : "Install myClass from Edge, then Win + W → “+” → myClass deadlines."
+          }
+        >
+          <span className="text-xs text-[var(--muted)]">Windows 11</span>
+        </SettingsRow>
+      )}
+
+      {(installed || /Android/.test(ua)) && (
+        <SettingsRow
+          label={el ? "Συντόμευση" : "Shortcut"}
+          hint={
+            el
+              ? "Κράτα πατημένο το εικονίδιο του myClass → «Προθεσμίες» για να ανοίξει κατευθείαν το ημερολόγιο."
+              : "Long-press the myClass icon → “Προθεσμίες” to open straight to the calendar."
+          }
+        >
+          <span />
+        </SettingsRow>
+      )}
+    </SettingsGroup>
+  );
+}
+
 function SettingsGroup({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section>
-      <h2 className="px-1 mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">{title}</h2>
+      <h2 className="px-1 mb-2 text-sm text-[var(--muted)]">{title}</h2>
       <div className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] divide-y divide-[var(--border)]">
         {children}
       </div>
@@ -2964,7 +3731,7 @@ function Toggle({
       aria-label={label}
       disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`relative w-11 h-6 rounded-full transition cursor-pointer disabled:opacity-60 ${
+      className={`relative w-11 h-6 rounded-full transition-colors cursor-pointer disabled:opacity-60 ${
         checked ? "bg-[var(--accent)]" : "bg-[var(--border)]"
       }`}
     >
@@ -3003,7 +3770,7 @@ function Segmented<T extends string>({
           aria-checked={value === o.value}
           disabled={disabled}
           onClick={() => value !== o.value && onChange(o.value)}
-          className={`${stretch ? "flex-1" : ""} inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer disabled:cursor-default ${
+          className={`${stretch ? "flex-1" : ""} inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:cursor-default ${
             value === o.value
               ? "bg-[var(--surface)] text-[var(--text)] shadow-sm"
               : "text-[var(--muted)] hover:text-[var(--text)]"
@@ -3037,9 +3804,9 @@ function NavButton({
   return (
     <button
       onClick={onClick}
-      className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-xs font-medium transition cursor-pointer ${
+      className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
         active
-          ? "bg-[var(--accent-soft)] text-[var(--accent)] font-semibold"
+          ? "bg-[var(--accent-soft)] text-[var(--accent-text)]"
           : "text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
       }`}
     >
@@ -3048,7 +3815,7 @@ function NavButton({
         <span>{label}</span>
       </span>
       {badge !== undefined && badge > 0 && (
-        <span className="text-[11px] px-1.5 py-0.5 rounded-full bg-[var(--surface-2)] text-[var(--text)]">
+        <span className="text-xs px-1.5 rounded-full bg-[var(--surface-2)] text-[var(--muted)]">
           {badge}
         </span>
       )}
@@ -3073,24 +3840,38 @@ function MobileTab({
     <button
       onClick={onClick}
       aria-current={active ? "page" : undefined}
-      className={`relative flex-1 min-h-[52px] flex flex-col items-center justify-center gap-1 px-1 py-1 text-xs font-medium transition cursor-pointer ${
-        active ? "text-[var(--accent)] font-semibold" : "text-[var(--muted)] active:opacity-70"
+      className={`relative flex-1 min-w-0 min-h-[52px] flex flex-col items-center justify-center gap-1 py-1 text-[0.6875rem] tracking-[-0.01em] font-medium transition-colors cursor-pointer ${
+        active ? "text-[var(--accent-text)]" : "text-[var(--muted)]"
       }`}
     >
       <div
-        className={`relative flex items-center justify-center w-14 h-7 rounded-full transition ${
+        className={`relative flex items-center justify-center w-14 h-7 rounded-full transition-colors ${
           active ? "bg-[var(--accent-soft)]" : ""
         }`}
       >
         {icon}
         {badge !== undefined && badge > 0 && (
-          <span className="-top-1 right-2 absolute min-w-[15px] h-[15px] px-1 rounded-full bg-[var(--accent)] text-white dark:text-[#0c0a14] text-[11px] font-bold flex items-center justify-center">
+          <span className="-top-1 right-2 absolute min-w-[15px] h-[15px] px-1 rounded-full bg-[var(--accent)] text-[var(--on-accent)] text-[0.6875rem] font-semibold tabular-nums flex items-center justify-center">
             {badge}
           </span>
         )}
       </div>
-      <span className="truncate max-w-[64px]">{label}</span>
+      <span className="truncate max-w-full">{label}</span>
     </button>
+  );
+}
+
+/** "Action needed · what to do" under an announcement title; nothing for FYI items. */
+function TriageTag({ lang, triage }: { lang: Lang; triage?: AnnouncementTriage }) {
+  if (triage?.label !== "action") return null;
+  return (
+    <div className="mt-1.5 inline-flex items-center gap-1.5 max-w-full px-2 py-0.5 rounded-md text-xs font-medium bg-[var(--warn-soft)] text-[var(--warn)]">
+      <CircleAlert className="w-3.5 h-3.5 shrink-0" />
+      <span className="truncate">
+        {lang === "el" ? "Χρειάζεται ενέργεια" : "Action needed"}
+        {triage.reason ? ` · ${triage.reason}` : ""}
+      </span>
+    </div>
   );
 }
 
@@ -3150,7 +3931,7 @@ function FormattedChatText({ text, isUser }: { text: string; isUser?: boolean })
           const content = trimmed.replace(/^([-•*])\s+/, "");
           return (
             <div key={idx} className="flex items-start gap-2 pl-1">
-              <span className="text-[var(--accent)] font-bold select-none">•</span>
+              <span className="text-[var(--muted)] select-none">•</span>
               <span className="flex-1">{renderInlineBold(content)}</span>
             </div>
           );

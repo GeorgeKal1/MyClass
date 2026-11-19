@@ -11,12 +11,15 @@ import type {
   DepartmentInfo,
   DocNode,
   Message,
+  MyStats,
   PortalWarning,
   SubmissionResult,
   University,
 } from "@myclass/shared";
 import { decrypt, encrypt } from "../crypto.js";
+import { aggregateUsage, eclassStatsDate, parseUsageDetails, statsWindow, subtractBackground, ymd } from "../stats.js";
 import { users, type UserRecord } from "../store.js";
+import { backgroundHitsFor, eclassDay, ensureHitLedger, noteEclassResponse, rememberCourseTitles } from "./hit-ledger.js";
 import { EclassHttp } from "./http.js";
 import {
   parseAnnouncementsAjax,
@@ -46,13 +49,18 @@ import {
   filterCurrentAcademicYearAnnouncements,
   filterCurrentAcademicYearAssignments,
   filterCurrentAcademicYearDocs,
+  hasPastAcademicYearTag,
+  isPastExamRoom,
+  PORTAL_BASE_URL,
   resolveSemesterForCourse,
   resolveUniPiPortalForCourse,
   SEMESTERS,
+  splitCourseTitle,
   THALES_BASE_URL,
   UNIPI_CENTRAL_BASE_URL,
   UNIPI_DEPARTMENTS,
 } from "./unipi-curriculum.js";
+import { ECLASS_MODULES, withOrigin } from "./request-origin.js";
 import { getUniversity } from "./universities.js";
 
 export interface SubmissionInput {
@@ -77,6 +85,8 @@ export interface EclassConnector {
   listDepartments(): Promise<DepartmentInfo[]>;
   defaultDepartmentId(): string;
   listCatalog(query?: string, departmentId?: string): Promise<CatalogCourse[]>;
+  /** The student's own usage statistics, merged across every portal they use. */
+  getMyStats(): Promise<MyStats>;
   enrollCourse(codeOrId: string): Promise<Course>;
   unenrollCourse(codeOrId: string): Promise<Course>;
   downloadFile(
@@ -107,11 +117,13 @@ const reauthInFlight = new Map<string, Promise<void>>();
 const authGeneration = new Map<string, number>();
 /** Which portal each course was found on (`${userId}|${CODE}` -> base URL). */
 const coursePortalByUser = new Map<string, string>();
+/** Secondary portals (`${userId}|${base}`) whose login failed recently, so requests skip them for a while. */
+const secondaryLoginRefused = new Map<string, number>();
+const SECONDARY_RETRY_MS = 30 * 60 * 1000;
 const persistTimers = new Map<string, NodeJS.Timeout>();
 
-// Short-lived in-memory catalog/department caches per user
+// Short-lived in-memory catalog cache per user
 const catalogCache = new Map<string, { expiresAt: number; items: CatalogCourse[] }>();
-const departmentCache = new Map<string, { expiresAt: number; items: DepartmentInfo[] }>();
 const CATALOG_TTL_MS = 10 * 60 * 1000;
 
 export function invalidateUserCatalogCache(userId: string) {
@@ -136,7 +148,6 @@ export function forgetUserSession(userId: string) {
   sessionPasswords.delete(userId);
   httpByUser.delete(userId);
   invalidateUserCatalogCache(userId);
-  departmentCache.delete(userId);
 }
 
 class FirewallError extends Error {
@@ -149,6 +160,16 @@ class FirewallError extends Error {
 /* Login                                                               */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Header values arrive as Latin-1 (one char per byte). eClass sends Greek filenames as raw UTF-8
+ * inside `filename="…"`, which then reads as "MÎÎÎ…"; turn such names back into proper UTF-8.
+ */
+export function fixHeaderUtf8(name: string): string {
+  if (!/[\u0080-ÿ]/.test(name) || /[^\u0000-ÿ]/.test(name)) return name;
+  const decoded = Buffer.from(name, "latin1").toString("utf8");
+  return decoded.includes("�") ? name : decoded;
+}
+
 function hostOf(base: string): string {
   try {
     return new URL(base).host;
@@ -157,19 +178,29 @@ function hostOf(base: string): string {
   }
 }
 
-/** University of Piraeus: Informatics uses thales.cs.unipi.gr (+ central); every other department only eclass.unipi.gr. */
-function unipiUsesThales(username: string): boolean {
-  const dept = detectUniPiDepartmentFromUsername(username);
-  return dept === "cs-ug" || dept === "cs-pg";
+const departmentFamily = (id: string) => id.split("-")[0];
+
+/**
+ * Ordered eClass portals for a student; the first one must authenticate for login to succeed.
+ * Informatics: thales.cs.unipi.gr + eclass.unipi.gr. Digital Systems: eclass.unipi.gr +
+ * Aristarchus (undergraduate) or Lefkippos (MSc). Everyone else: eclass.unipi.gr only.
+ * A saved department of the same family (e.g. DS MSc for an "e…" username) adds its portals.
+ */
+export function portalsForUser(_uni: University, username: string, chosenDepartmentId?: string): string[] {
+  const detected = detectUniPiDepartmentFromUsername(username);
+  const ids = [detected];
+  if (chosenDepartmentId && chosenDepartmentId !== detected && departmentFamily(chosenDepartmentId) === departmentFamily(detected)) {
+    ids.push(chosenDepartmentId);
+  }
+  const portals = ids.flatMap((id) => UNIPI_DEPARTMENTS.find((d) => d.id === id)?.portals ?? ["central" as const]);
+  return [...new Set(portals.map((p) => PORTAL_BASE_URL[p]))];
 }
 
-/** Ordered list of eClass portals for a user; the first one must authenticate for login to succeed. */
-export function portalsForUser(uni: University, username: string): string[] {
-  const primary = uni.eclassUrl.replace(/\/$/, "");
-  if (uni.id === "unipi") {
-    return unipiUsesThales(username) ? [THALES_BASE_URL, UNIPI_CENTRAL_BASE_URL] : [UNIPI_CENTRAL_BASE_URL];
-  }
-  return [primary];
+/** The department whose catalog the student browses: their saved choice, else detected from the username. */
+export function userDepartmentId(user: UserRecord): string {
+  const chosen = user.settings.departmentId;
+  if (chosen && UNIPI_DEPARTMENTS.some((d) => d.id === chosen)) return chosen;
+  return detectUniPiDepartmentFromUsername(user.username);
 }
 
 /**
@@ -177,7 +208,16 @@ export function portalsForUser(uni: University, username: string): string[] {
  * university SSO (CAS, or Shibboleth/SAML), falling back to eClass' native login.
  * Throws unless the portal ends up with an active session.
  */
-export async function authenticatePortalSession(
+export function authenticatePortalSession(
+  http: EclassHttp,
+  baseUrl: string,
+  username: string,
+  password: string,
+): Promise<{ displayName?: string; mobileToken?: string }> {
+  return withOrigin("login", () => authenticatePortalSessionNow(http, baseUrl, username, password));
+}
+
+async function authenticatePortalSessionNow(
   http: EclassHttp,
   baseUrl: string,
   username: string,
@@ -316,8 +356,7 @@ export async function performEclassLogin(
 }
 
 export function getConnectorForUser(user: UserRecord, passwordOverride?: string): EclassConnector {
-  const uni = getUniversity(user.universityId) ?? getUniversity("unipi")!;
-  return createLiveConnector(user, uni, passwordOverride);
+  return createLiveConnector(user, getUniversity(), passwordOverride);
 }
 
 /* ------------------------------------------------------------------ */
@@ -325,17 +364,17 @@ export function getConnectorForUser(user: UserRecord, passwordOverride?: string)
 /* ------------------------------------------------------------------ */
 
 function createLiveConnector(user: UserRecord, uni: University, passwordOverride?: string): EclassConnector {
-  const isUniPi = uni.id === "unipi";
-  const portals = portalsForUser(uni, user.username);
+  const portals = portalsForUser(uni, user.username, user.settings.departmentId);
   const primaryBase = portals[0];
+  ensureHitLedger(user);
   const uidByBase = new Map<string, number>();
   const csrfTokenByBase = new Map<string, string>();
   const downloadUrlCache = new Map<string, string>();
   const messagePortalMap = new Map<string, string>();
 
-  /** Semester grouping: curated UniPi Informatics curriculum, otherwise title / faculty-name hints. */
+  /** Semester grouping: curated Informatics curriculum, otherwise title / faculty-name hints. */
   const semesterFor = (code: string, title: string, hints: string[] = [], defaultYear?: number) => {
-    if (isUniPi && (resolveUniPiPortalForCourse(code) === "thales" || CS_COURSE_SEMESTER[code.toUpperCase()])) {
+    if (resolveUniPiPortalForCourse(code) === "thales" || CS_COURSE_SEMESTER[code.toUpperCase()]) {
       const sem = resolveSemesterForCourse(code, title, defaultYear);
       return { semester: sem.shortLabel, semesterIndex: sem.index, semesterFolder: sem.folder };
     }
@@ -350,8 +389,7 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     if (!courseCode) return primaryBase;
     const known = coursePortalByUser.get(`${user.id}|${courseCode.toUpperCase()}`);
     if (known) return known;
-    if (!isUniPi) return primaryBase;
-    return resolveUniPiPortalForCourse(courseCode) === "thales" ? THALES_BASE_URL : UNIPI_CENTRAL_BASE_URL;
+    return PORTAL_BASE_URL[resolveUniPiPortalForCourse(courseCode)];
   };
 
   const getHttp = (): EclassHttp => {
@@ -406,10 +444,22 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     const key = `${user.id}|${portalBase}`;
     const inflight = reauthInFlight.get(key);
     if (inflight) return inflight;
+    const refusedUntil = secondaryLoginRefused.get(key) ?? 0;
+    if (portalBase !== primaryBase && refusedUntil > Date.now()) {
+      return Promise.reject(new Error(`${hostOf(portalBase)} did not accept this account`));
+    }
     const attempt = (async () => {
       const pw = getPassword();
       if (!pw) throw new Error("eClass session expired. Please sign in again.");
-      const { displayName } = await authenticatePortalSession(getHttp(), portalBase, user.username, pw);
+      let displayName: string | undefined;
+      try {
+        ({ displayName } = await authenticatePortalSession(getHttp(), portalBase, user.username, pw));
+      } catch (err) {
+        // A department portal the student has no account on: stop retrying it on every request
+        if (portalBase !== primaryBase) secondaryLoginRefused.set(key, Date.now() + SECONDARY_RETRY_MS);
+        throw err;
+      }
+      secondaryLoginRefused.delete(key);
       authGeneration.set(key, (authGeneration.get(key) ?? 0) + 1);
       persistSoon();
       if (displayName && displayName !== user.displayName && !/^(Το προφίλ μου|My profile)$/i.test(displayName)) {
@@ -424,7 +474,12 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
   };
 
   /** Runs `doRequest`; if the portal answers with a login page, re-authenticates once and retries. */
-  const withSession = async <T extends { url: string; html: string; status: number }>(
+  /** Tells the hit ledger about a response that reached eClass with an active session. */
+  const noteHits = (portalBase: string, hops: string[]) => {
+    for (const url of hops) noteEclassResponse(user, hostOf(portalBase), url);
+  };
+
+  const withSession = async <T extends { url: string; html: string; status: number; hops: string[] }>(
     portalBase: string,
     doRequest: (http: EclassHttp) => Promise<T>,
     looksLoggedOut: (r: T) => boolean = (r) => isLoggedOutPage(r.url, r.html),
@@ -443,6 +498,7 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
         throw new Error(`Could not open an eClass session on ${hostOf(portalBase)}. Please sign out and sign in again.`);
       }
     }
+    noteHits(portalBase, res.hops);
     persistSoon();
     return res;
   };
@@ -463,7 +519,7 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
           form,
           headers: { "X-Requested-With": "XMLHttpRequest" },
         });
-        return { url: r.url, html: await r.text(), status: r.status };
+        return { url: r.url, html: await r.text(), status: r.status, hops: r.hops };
       },
       (r) => isLoggedOutPage(r.url, r.html) || !r.html.trim().startsWith("{"),
     );
@@ -474,11 +530,27 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     }
   };
 
+  /** "[Α] - (ΨΣ-014) - Λογική" -> title "Λογική", public code "ΨΣ-014", semester 1. */
+  const tidyTitle = <T extends { code: string; title: string; publicCode?: string }>(c: T, hints: string[] = []) => {
+    const split = splitCourseTitle(c.title);
+    const bracketSem = split.semesterIndex !== undefined ? SEMESTERS[split.semesterIndex] : undefined;
+    const sem = bracketSem
+      ? { semester: bracketSem.shortLabel, semesterIndex: bracketSem.index, semesterFolder: bracketSem.folder }
+      : semesterFor(c.code, split.title, hints);
+    return {
+      title: split.title,
+      publicCode: split.curriculumCode ?? c.publicCode,
+      ...sem,
+    };
+  };
+
   const decorateCourse = (c: Course, portalBase: string): Course => {
     coursePortalByUser.set(`${user.id}|${c.code.toUpperCase()}`, portalBase);
+    // The raw eClass title, which is what the usage log prints for this course
+    rememberCourseTitles(user, hostOf(portalBase), [{ code: c.code, title: c.title }]);
     return {
       ...c,
-      ...semesterFor(c.code, c.title),
+      ...tidyTitle(c),
       portal: hostOf(portalBase),
       url: c.url ?? `${portalBase}/courses/${encodeURIComponent(c.code)}/`,
       enrolled: true,
@@ -586,9 +658,9 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
   const crawlFaculty = async (
     portalBase: string,
     rootFc: number | undefined,
-    opts: { maxDepth: number; maxPages: number },
+    opts: { maxDepth: number; maxPages: number; skipFc?: number[] },
   ): Promise<Array<CatalogCourse & { facultyPath: string[] }>> => {
-    const visited = new Set<number>();
+    const visited = new Set<number>(opts.skipFc);
     const out: Array<CatalogCourse & { facultyPath: string[] }> = [];
     let level: Array<{ fc?: number; path: string[] }> = [{ fc: rootFc, path: [] }];
     let pages = 0;
@@ -609,7 +681,8 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
             try {
               const { html } = await authedGet(portalBase, url);
               return { node, parsed: parseCatalogHtml(html) };
-            } catch {
+            } catch (err) {
+              console.warn(`[catalog] ${hostOf(portalBase)} fc=${node.fc}: ${(err as Error).message}`);
               return null;
             }
           }),
@@ -631,41 +704,7 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     return out;
   };
 
-  /** Generic departments: the user's own faculty ("auto") + the top-level faculties of the portal. */
-  const listGenericDepartments = async (): Promise<DepartmentInfo[]> => {
-    const cached = departmentCache.get(user.id);
-    if (cached && cached.expiresAt > Date.now()) return cached.items;
-    const items: DepartmentInfo[] = [];
-    try {
-      const { html } = await authedGet(primaryBase, `${primaryBase}/modules/auth/courses.php`);
-      const landing = parseCatalogHtml(html);
-      items.push({
-        id: "auto",
-        name: landing.currentFacultyName ?? "Το τμήμα μου",
-        nameEn: landing.currentFacultyName ?? "My department",
-        portalLabel: hostOf(primaryBase),
-      });
-      let top = landing.childFaculties;
-      if (landing.ancestorFaculties.length > 0) {
-        const root = await authedGet(
-          primaryBase,
-          `${primaryBase}/modules/auth/courses.php?fc=${landing.ancestorFaculties[0].fc}`,
-        );
-        top = parseCatalogHtml(root.html).childFaculties;
-      }
-      for (const f of top.slice(0, 60)) {
-        items.push({ id: `fc:${f.fc}`, name: f.name, nameEn: f.name, portalLabel: hostOf(primaryBase) });
-      }
-    } catch {
-      if (items.length === 0) {
-        items.push({ id: "auto", name: uni.name, nameEn: uni.nameEn, portalLabel: hostOf(primaryBase) });
-      }
-    }
-    departmentCache.set(user.id, { expiresAt: Date.now() + 30 * 60 * 1000, items });
-    return items;
-  };
-
-  const defaultDepartmentId = () => (isUniPi ? detectUniPiDepartmentFromUsername(user.username) : "auto");
+  const defaultDepartmentId = () => userDepartmentId(user);
 
   const fetchCatalog = async (departmentId: string): Promise<CatalogCourse[]> => {
     const fromCrawl = (rows: Array<CatalogCourse & { facultyPath: string[] }>, portalBase: string, deptName?: string) =>
@@ -675,7 +714,7 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
           coursePortalByUser.set(`${user.id}|${c.code.toUpperCase()}`, portalBase);
           return {
             ...c,
-            ...semesterFor(c.code, c.title, [...facultyPath].reverse()),
+            ...tidyTitle(c, [...facultyPath].reverse()),
             departmentId,
             departmentName: deptName ?? facultyPath[0],
             portal: hostOf(portalBase),
@@ -683,12 +722,13 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
           } satisfies CatalogCourse;
         });
 
-    if (isUniPi) {
+    {
       const dept = UNIPI_DEPARTMENTS.find((d) => d.id === departmentId) ?? UNIPI_DEPARTMENTS[0];
       const batches = await Promise.all(
         dept.sources.map(async (src) => {
-          const portalBase = src.portal === "thales" ? THALES_BASE_URL : UNIPI_CENTRAL_BASE_URL;
-          const rows = await crawlFaculty(portalBase, src.fc, { maxDepth: src.portal === "thales" ? 0 : 2, maxPages: 25 });
+          const portalBase = PORTAL_BASE_URL[src.portal];
+          // Thales sources are single folders; other roots fan out into programme -> semester folders
+          const rows = await crawlFaculty(portalBase, src.fc, { maxDepth: src.portal === "thales" ? 0 : 3, maxPages: 60, skipFc: src.skipFc });
           return rows.map(({ facultyPath, ...c }) => {
             coursePortalByUser.set(`${user.id}|${c.code.toUpperCase()}`, portalBase);
             const sem =
@@ -697,7 +737,7 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
                     const s = resolveSemesterForCourse(c.code, c.title, src.defaultYear);
                     return { semester: s.shortLabel, semesterIndex: s.index, semesterFolder: s.folder };
                   })()
-                : semesterFor(c.code, c.title, [...facultyPath].reverse());
+                : tidyTitle(c, [...facultyPath].reverse());
             return {
               ...c,
               ...sem,
@@ -709,7 +749,10 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
           });
         }),
       );
-      let items: CatalogCourse[] = batches.flat().filter((c) => !EXCLUDED_COURSE_CODES.has(c.code.toUpperCase()));
+      // Old exam rooms / past-year copies ("ΕΞΕΤΑΣΗ ΦΕΒΡ2024", "… 2023-2024") are not real courses any more
+      let items: CatalogCourse[] = batches
+        .flat()
+        .filter((c) => !EXCLUDED_COURSE_CODES.has(c.code.toUpperCase()) && !hasPastAcademicYearTag(c.title) && !isPastExamRoom(c.title));
 
       for (const extra of dept.extraCentralCourses ?? []) {
         if (items.some((c) => c.code.toUpperCase() === extra.code.toUpperCase())) continue;
@@ -741,10 +784,6 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
       }
       return items;
     }
-
-    const fc = departmentId.startsWith("fc:") ? Number(departmentId.slice(3)) : undefined;
-    const rows = await crawlFaculty(primaryBase, Number.isFinite(fc) ? fc : undefined, { maxDepth: 2, maxPages: 30 });
-    return fromCrawl(rows, primaryBase);
   };
 
   const listCatalog = async (query?: string, departmentId?: string): Promise<CatalogCourse[]> => {
@@ -837,10 +876,12 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
         await reauth(portalBase);
         res = await getHttp().request(targetUrl);
       } else {
+        noteHits(portalBase, res.hops);
         persistSoon();
         return { filename: fallbackName, contentType: ct, body: Buffer.from(html, "utf8") };
       }
     }
+    noteHits(portalBase, res.hops);
     persistSoon();
     const disp = res.headers.get("content-disposition") || "";
     const fnMatch = disp.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)/i);
@@ -851,6 +892,7 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
       } catch {
         filename = fnMatch[1];
       }
+      filename = fixHeaderUtf8(filename);
     }
     const contentType = res.headers.get("content-type") || "application/octet-stream";
     const arrayBuf = await res.raw.arrayBuffer();
@@ -869,6 +911,77 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     const id = assignmentId.includes(":") ? assignmentId.split(":").pop()! : assignmentId;
     if (!/^\d+$/.test(id)) throw new Error("Invalid assignment id");
     return id;
+  };
+
+  /**
+   * eClass' personal usage log, with myClass' own background checks taken out (see hit-ledger.ts).
+   * Visits removed are exact; seconds are an estimate. Days before the ledger started cannot be
+   * separated and are left as eClass reports them (flagged with `uncorrectedBefore`).
+   */
+  const getMyStatsNow = async (): Promise<MyStats> => {
+    const { start, end } = statsWindow();
+    const from = ymd(start);
+    const to = ymd(end);
+    const warnings: PortalWarning[] = [];
+    let removedVisits = 0;
+    let removedSeconds = 0;
+    let earliestOwnDay: string | undefined;
+    const perPortal = await Promise.all(
+      portals.map(async (portalBase) => {
+        try {
+          // The personal stats page tells its chart script which user id to plot
+          const page = await authedGet(portalBase, `${portalBase}/modules/usage/index.php?t=u`);
+          const uid = Number(page.html.match(/\buser\s*=\s*(\d+)\s*;/)?.[1]) || uidByBase.get(portalBase);
+          if (!uid) throw new Error("no personal statistics page");
+          const url =
+            `${portalBase}/modules/usage/results.php?t=ud&u=${uid}` +
+            `&s=${eclassStatsDate(start)}&e=${eclassStatsDate(end)}`;
+          const res = await authedGet(portalBase, url);
+          const rows = parseUsageDetails(JSON.parse(res.html.trim() || "[]"));
+          for (const r of rows) {
+            if (r.visits > 0 && (!earliestOwnDay || r.day < earliestOwnDay)) earliestOwnDay = r.day;
+          }
+          const host = hostOf(portalBase);
+          const adjusted = subtractBackground(rows, backgroundHitsFor(user, host, from, to), ECLASS_MODULES);
+          removedVisits += adjusted.removedVisits;
+          removedSeconds += adjusted.removedSeconds;
+          if (adjusted.unmatchedVisits > 0) {
+            console.warn(`[stats] ${host}: ${adjusted.unmatchedVisits} background hits matched no usage row`);
+          }
+          return adjusted.rows;
+        } catch (err) {
+          const message = (err as Error).message || "Unknown error";
+          console.warn(`[stats] ${hostOf(portalBase)} failed: ${message}`);
+          warnings.push({ portal: hostOf(portalBase), message });
+          return [];
+        }
+      }),
+    );
+
+    // Background checks only started once the student joined myClass. Between then and the day
+    // the ledger started (the day itself only partly counted), they cannot be told apart.
+    const ledger = ensureHitLedger(user);
+    let uncorrectedBefore: string | undefined;
+    if (new Date(ledger.since).getTime() - new Date(user.createdAt).getTime() > 60_000) {
+      const sinceDay = eclassDay(new Date(ledger.since));
+      const firstFullDay = new Date(`${sinceDay}T12:00:00Z`);
+      firstFullDay.setUTCDate(firstFullDay.getUTCDate() + 1);
+      const boundary = firstFullDay.toISOString().slice(0, 10);
+      const joinedDay = eclassDay(new Date(user.createdAt));
+      const hasMixedDays = earliestOwnDay !== undefined && earliestOwnDay < boundary;
+      // Only flag it when some activity in the window falls between joining and the boundary
+      if (hasMixedDays && boundary > from && joinedDay < boundary) uncorrectedBefore = boundary;
+    }
+
+    const adjustment =
+      removedVisits > 0 || uncorrectedBefore
+        ? { visits: removedVisits, seconds: Math.round(removedSeconds), uncorrectedBefore }
+        : undefined;
+    return {
+      ...aggregateUsage(perPortal.flat()),
+      warnings: warnings.length ? warnings : undefined,
+      adjustment,
+    };
   };
 
   return {
@@ -1051,10 +1164,11 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
       persistSoon();
       if (isFirewallBlock(res.status, html)) throw new FirewallError(hostOf(portalBase));
       if (isLoggedOutPage(res.url, html)) throw new Error("Your eClass session expired during the upload. Please try again.");
+      noteHits(portalBase, res.hops);
 
       const after = parseAssignmentDetailHtml(html, res.url);
       if (after.flashMessage?.kind === "error") return { ok: false, message: after.flashMessage.text };
-      // Confirm by re-reading the assignment list (submitted ✓)
+      // Confirm by re-reading the assignment list (submitted flag)
       const list = await this.getAssignments(courseCode).catch(() => [] as Assignment[]);
       const confirmed = list.find((a) => a.id === `${courseCode}:${id}`)?.submitted;
       if (confirmed || after.flashMessage?.kind === "success") {
@@ -1075,8 +1189,10 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
       const native = new Set(["announcements", "document", "work", "message"]);
       return parseCourseTools(html, url, courseCode).map((t) => ({ ...t, native: native.has(t.id) }));
     },
+    getMyStats(): Promise<MyStats> {
+      return withOrigin("stats", () => getMyStatsNow());
+    },
     async listDepartments(): Promise<DepartmentInfo[]> {
-      if (!isUniPi) return listGenericDepartments();
       return UNIPI_DEPARTMENTS.map(({ id, name, nameEn, portalLabel }) => ({ id, name, nameEn, portalLabel }));
     },
     defaultDepartmentId,

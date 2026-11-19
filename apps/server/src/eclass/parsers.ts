@@ -770,7 +770,13 @@ export function parseUserDisplayName(html: string): string | undefined {
 export function isLoggedOutPage(url: string, html: string): boolean {
   if (/login_form\.php|\/cas\/login|:\/\/sso\.|\/idp\/|\/Shibboleth\.sso/i.test(url)) return true;
   if (html.includes("jumbotron-login")) return true;
-  if (/name=["']uname["']/.test(html) && /name=["']pass["']/.test(html)) return true;
+  // A visible username + password field. Catalog pages also carry hidden uname/pass inputs on
+  // "guest access" buttons of courses that allow guests, which are not a login page.
+  const visibleField = (name: string) =>
+    (html.match(new RegExp(`<input\\b[^>]*\\bname=["']${name}["'][^>]*>`, "gi")) ?? []).some(
+      (tag) => !/\btype=["']?hidden/i.test(tag),
+    );
+  if (visibleField("uname") && visibleField("pass")) return true;
   // Mobile API answers for an expired/absent session
   const trimmed = html.trim();
   if (trimmed === "EXPIRED" || trimmed === "FAILED") return true;

@@ -1,51 +1,105 @@
 @import "tailwindcss";
 
-/* Readability: slightly larger small text (most secondary text in the app uses text-xs/text-sm) */
+/* Synonym for text, Amulya for headings and figures (Fontshare). Neither has a Greek alphabet,
+   only a stray Δ, Ω, μ or π, so a Greek-only Commissioner face comes first in both stacks: Greek
+   words render in one font, everything else falls through to Synonym / Amulya.
+   Commissioner (Kostas Bartsokas) is SIL Open Font License; the Greek subset is self-hosted. */
+@font-face {
+  font-family: "Commissioner Greek";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("/fonts/commissioner-greek.woff2") format("woff2");
+  unicode-range: U+0370-0377, U+037A-037F, U+0384-038A, U+038C, U+038E-03A1, U+03A3-03FF;
+}
+
 @theme {
+  --font-sans: "Commissioner Greek", "Synonym", "Noto Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-display: "Commissioner Greek", "Amulya", "Noto Sans", system-ui, sans-serif;
   --text-xs: 0.8125rem;
-  --text-xs--line-height: 1.25rem;
+  --text-xs--line-height: 1.2rem;
   --text-sm: 0.9375rem;
   --text-sm--line-height: 1.45rem;
+  --text-base: 1rem;
+  --text-base--line-height: 1.55rem;
 }
 
 :root {
-  --bg: #f7f7f9;
+  --bg: #f6f6f8;
   --surface: #ffffff;
-  --surface-2: #f1f1f5;
-  --border: #e3e3ea;
-  --text: #15161b;
-  --muted: #5d606c;
-  --accent: #6d4fe0;
-  --accent-hover: #5b3dd0;
-  --accent-soft: #eeeafd;
-  --accent-text: #4a2fb8;
-  --ok: #15803d;
-  --warn: #b45309;
-  --danger: #b91c1c;
+  --surface-2: #f0f0f4;
+  --border: #e1e1e8;
+  --text: #1c1d24;
+  --muted: #5c5f6c;
+  /* Soft, slightly muted violet; white text on it stays >= 4.5:1 */
+  --accent: #7765cb;
+  --accent-hover: #6654b8;
+  --accent-soft: #edeaf8;
+  --accent-text: #52428f;
+  --on-accent: #ffffff;
+  --ok: #2f7a4d;
+  --warn: #9a6119;
+  --danger: #b04545;
+  /* State fills: the semantic colors at low strength, never raw Tailwind hues */
+  --ok-soft: rgb(47 122 77 / 0.12);
+  --warn-soft: rgb(154 97 25 / 0.12);
+  --danger-soft: rgb(176 69 69 / 0.1);
+  /* Charts: neutral ink for the data, the accent only for "now" */
+  --chart-line: #3b3d47;
+  --chart-bar: #c9cad3;
+  --chart-grid: rgb(28 29 36 / 0.07);
+  --chart-grid-strong: rgb(28 29 36 / 0.18);
+  /* Course share: validated categorical order (CVD-safe adjacent pairs), "other" stays neutral */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-other: #c3c4cc;
   color-scheme: light;
 }
 
 /* Dark: neutral graphite surfaces (no purple tint) + one soft lavender accent.
    Muted text keeps >= 7:1 contrast on surfaces for long reading sessions. */
 html.dark {
-  --bg: #0e0f12;
-  --surface: #15171b;
-  --surface-2: #1c1e24;
-  --border: #2a2d35;
-  --text: #eceef2;
-  --muted: #a3a8b4;
-  --accent: #ab9ff6;
-  --accent-hover: #c3baf9;
-  --accent-soft: #25223a;
-  --accent-text: #dcd6ff;
-  --ok: #4ade80;
-  --warn: #fbbf24;
-  --danger: #f87171;
+  --bg: #111216;
+  --surface: #181a1f;
+  --surface-2: #1f2127;
+  --border: #2d2f38;
+  --text: #e8eaee;
+  --muted: #a1a6b2;
+  --accent: #b2a8e4;
+  --accent-hover: #c4bcee;
+  --accent-soft: #26252f;
+  --accent-text: #d8d3f2;
+  --on-accent: #17161d;
+  --ok: #7cc79a;
+  --warn: #dcb572;
+  --danger: #e59090;
+  --ok-soft: rgb(124 199 154 / 0.14);
+  --warn-soft: rgb(220 181 114 / 0.14);
+  --danger-soft: rgb(229 144 144 / 0.14);
+  --chart-line: #c9ccd4;
+  --chart-bar: #3a3d47;
+  --chart-grid: rgb(232 234 238 / 0.07);
+  --chart-grid-strong: rgb(232 234 238 / 0.2);
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-other: #4a4d57;
   color-scheme: dark;
 }
 
+/* Text size (Settings > Accessibility) scales the root, so every rem-based size follows */
+html {
+  font-size: calc(100% * var(--font-scale, 1));
+}
+
 body {
-  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-family: var(--font-sans);
+  font-size: 0.9375rem;
   background-color: var(--bg);
   color: var(--text);
   margin: 0;
@@ -56,11 +110,135 @@ body {
   overscroll-behavior-x: none;
 }
 
+/* Accordions animate to height: auto */
+:root {
+  interpolate-size: allow-keywords;
+}
+
+h1,
+h2,
+.font-display {
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: 0;
+}
+h2 {
+  font-weight: 500;
+}
+
+/* ------------------------------------------------------------------ */
+/* Motion: one easing curve, short durations, transform + opacity only */
+/* ------------------------------------------------------------------ */
+
+/* Every button gives a small press. Unlayered on purpose: it outranks Tailwind's transition
+   utilities, so the press always animates and hover colors share the same 150 ms ease-out. */
+button {
+  transition-property: scale, color, background-color, border-color, opacity;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+button:active:not(:disabled) {
+  scale: 0.97;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+/* While the theme flips, nothing animates (no colour wave across the page) */
+.theme-switching,
+.theme-switching * {
+  transition: none !important;
+}
+
+/* Entrances start from 97% scale and transparent, never from zero */
+@keyframes enter {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+.enter {
+  animation: enter 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Accordion body: collapsed to 0, opens to its natural height */
+.accordion {
+  height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transition:
+    height 240ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 200ms ease-out;
+}
+.accordion[data-open="true"] {
+  height: auto;
+  opacity: 1;
+}
+
+/* Tooltips: the first one waits, the rest follow instantly (see Tooltip in App.tsx) */
+.tooltip {
+  position: absolute;
+  z-index: 60;
+  pointer-events: none;
+  white-space: nowrap;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  line-height: 1rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  animation: enter 120ms ease-out both;
+}
+
+/* Chart pieces */
+.chart-label {
+  fill: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.chart-label-now {
+  fill: var(--text);
+  font-weight: 600;
+}
+.chart-tooltip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 160px;
+  pointer-events: none;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+/* Reduced motion: <html class="reduce-motion"> is set from Settings > Accessibility ("System"
+   follows the device). Movement stops; colour and opacity changes stay instant. Loading
+   spinners keep turning because they say something is happening. */
+html.reduce-motion *:not(.animate-spin),
+html.reduce-motion *::before,
+html.reduce-motion *::after {
+  animation-duration: 1ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 1ms !important;
+  scroll-behavior: auto !important;
+}
+html.reduce-motion button:active:not(:disabled) {
+  scale: none;
+}
+
 /* Smooth slide animations for mobile swipe navigation */
 @keyframes slideInFromRight {
   from {
-    opacity: 0.45;
-    transform: translateX(28px);
+    opacity: 0;
+    transform: translateX(24px);
   }
   to {
     opacity: 1;
@@ -70,8 +248,8 @@ body {
 
 @keyframes slideInFromLeft {
   from {
-    opacity: 0.45;
-    transform: translateX(-28px);
+    opacity: 0;
+    transform: translateX(-24px);
   }
   to {
     opacity: 1;
@@ -132,4 +310,34 @@ body {
 .rich-text table {
   display: block;
   overflow-x: auto;
+}
+
+/* Focus ring for keyboard users (in the base layer, so fields that style their own focus keep it) */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+/* Flashcards: the card turns over on its vertical axis (instant with reduced motion) */
+.flashcard {
+  perspective: 1200px;
+}
+.flashcard-inner {
+  position: relative;
+  display: grid;
+  transform-style: preserve-3d;
+  transition: transform 360ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.flashcard[data-flipped="true"] .flashcard-inner {
+  transform: rotateY(180deg);
+}
+.flashcard-face {
+  grid-area: 1 / 1;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+.flashcard-back {
+  transform: rotateY(180deg);
 }

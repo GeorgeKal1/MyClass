@@ -34,6 +34,8 @@ export interface HttpResponse {
   headers: Headers;
   /** Location of the last redirect that was NOT followed (e.g. custom scheme). */
   unfollowedLocation?: string;
+  /** Every URL requested on the way, the final one included (eClass logs a hit per course-page hop). */
+  hops: string[];
   /** Underlying fetch response – body not yet consumed. */
   raw: Response;
   text(): Promise<string>;
@@ -90,8 +92,10 @@ export class EclassHttp {
       body = p.toString();
     }
     const max = opts.maxRedirects ?? 15;
+    const hops: string[] = [];
 
     for (let hop = 0; hop <= max; hop++) {
+      hops.push(url);
       const cookie = await this.jar.getCookieString(url);
       const headers: Record<string, string> = {
         "User-Agent": UA,
@@ -123,7 +127,7 @@ export class EclassHttp {
       if (res.status >= 300 && res.status < 400 && loc) {
         const next = new URL(loc, url);
         if (next.protocol !== "http:" && next.protocol !== "https:") {
-          return wrap(res, url, loc);
+          return wrap(res, url, hops, loc);
         }
         await res.body?.cancel();
         url = next.toString();
@@ -134,21 +138,22 @@ export class EclassHttp {
         }
         continue;
       }
-      return wrap(res, url);
+      return wrap(res, url, hops);
     }
     throw new Error(`Too many redirects for ${inputUrl}`);
   }
 
-  async getText(url: string, opts?: RequestOptions): Promise<{ url: string; html: string; status: number }> {
+  async getText(url: string, opts?: RequestOptions): Promise<{ url: string; html: string; status: number; hops: string[] }> {
     const r = await this.request(url, opts);
-    return { url: r.url, html: await r.text(), status: r.status };
+    return { url: r.url, html: await r.text(), status: r.status, hops: r.hops };
   }
 }
 
-function wrap(res: Response, url: string, unfollowedLocation?: string): HttpResponse {
+function wrap(res: Response, url: string, hops: string[], unfollowedLocation?: string): HttpResponse {
   return {
     status: res.status,
     url,
+    hops,
     headers: res.headers,
     unfollowedLocation,
     raw: res,

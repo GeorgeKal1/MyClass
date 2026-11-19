@@ -10,7 +10,7 @@ import {
   FileUp,
   Paperclip,
   RefreshCw,
-  Sparkles,
+  ScrollText,
   Upload,
   X,
 } from "lucide-react";
@@ -59,7 +59,7 @@ const DOT_CLASS: Record<DueState, string> = {
   submitted: "bg-[var(--ok)]",
   overdue: "bg-[var(--danger)]",
   soon: "bg-[var(--warn)]",
-  later: "bg-[var(--accent)]",
+  later: "bg-[var(--muted)]",
 };
 
 /* ================================================================== */
@@ -133,7 +133,7 @@ export function DeadlineCalendar({
     <section className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
       <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-4 pt-4">
         <h2 className="text-sm font-semibold flex items-center gap-2 whitespace-nowrap">
-          <CalendarDays className="w-4 h-4 text-[var(--accent)]" />
+          <CalendarDays className="w-4 h-4 text-[var(--muted)]" />
           <span>{lang === "el" ? "Προθεσμίες" : "Deadlines"}</span>
           {loading && <RefreshCw className="w-3.5 h-3.5 animate-spin text-[var(--muted)]" />}
         </h2>
@@ -184,13 +184,13 @@ export function DeadlineCalendar({
               <button
                 key={k}
                 onClick={() => setSelected(isSelected ? null : k)}
-                className={`relative h-11 rounded-lg flex flex-col items-center justify-center gap-1 text-xs transition cursor-pointer ${
-                  isSelected
-                    ? "bg-[var(--accent)] text-white dark:text-[#0c0a14]"
-                    : isToday
-                      ? "bg-[var(--accent-soft)] text-[var(--accent-text)] font-semibold"
+                className={`relative h-11 rounded-lg flex flex-col items-center justify-center gap-1 text-xs transition-colors cursor-pointer ${
+                  isToday
+                    ? "bg-[var(--accent-soft)] text-[var(--accent-text)] font-semibold ring-1 ring-inset ring-[var(--accent)]/60"
+                    : isSelected
+                      ? "bg-[var(--surface-2)]"
                       : "hover:bg-[var(--surface-2)]"
-                } ${inMonth ? "" : "opacity-35"}`}
+                } ${isSelected ? "ring-1 ring-inset ring-[var(--muted)]/40" : ""} ${inMonth ? "" : "opacity-35"}`}
                 aria-label={`${d.toLocaleDateString(locale(lang))}${items.length ? ` · ${items.length}` : ""}`}
               >
                 <span>{d.getDate()}</span>
@@ -198,7 +198,7 @@ export function DeadlineCalendar({
                   {items.slice(0, 3).map((a) => (
                     <span
                       key={a.id}
-                      className={`w-1.5 h-1.5 rounded-full ${isSelected ? "bg-current" : DOT_CLASS[dueState(a, now)]}`}
+                      className={`w-1.5 h-1.5 rounded-full ${DOT_CLASS[dueState(a, now)]}`}
                     />
                   ))}
                 </span>
@@ -238,8 +238,8 @@ export function DeadlineCalendar({
                   ? "Καμία προθεσμία αυτή την ημέρα."
                   : "No deadlines on this day."
                 : lang === "el"
-                  ? "Δεν έχεις εκκρεμείς προθεσμίες. 🎉"
-                  : "No pending deadlines. 🎉"}
+                  ? "Δεν έχεις εκκρεμείς προθεσμίες."
+                  : "No pending deadlines."}
           </p>
         ) : (
           agenda.map((a) => <AgendaRow key={a.id} a={a} lang={lang} onClick={() => onOpenAssignment(a)} />)
@@ -264,7 +264,7 @@ function AgendaRow({ a, lang, onClick }: { a: Assignment; lang: Lang; onClick: (
   return (
     <button
       onClick={onClick}
-      className="w-full text-left flex items-start gap-3 px-2 py-2 -mx-2 rounded-xl hover:bg-[var(--surface-2)] transition cursor-pointer"
+      className="w-full text-left flex items-start gap-3 px-2 py-2 -mx-2 rounded-xl hover:bg-[var(--surface-2)] transition-colors cursor-pointer"
     >
       <span className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${DOT_CLASS[state]}`} />
       <span className="min-w-0 flex-1">
@@ -277,7 +277,7 @@ function AgendaRow({ a, lang, onClick }: { a: Assignment; lang: Lang; onClick: (
             state === "overdue" ? "text-[var(--danger)]" : state === "soon" ? "text-[var(--warn)] font-medium" : "text-[var(--muted)]"
           }`}
         >
-          {a.submitted ? (lang === "el" ? "✓ παραδόθηκε" : "✓ submitted") : relativeDue(a.deadline, lang)}
+          {a.submitted ? (lang === "el" ? "παραδόθηκε" : "submitted") : relativeDue(a.deadline, lang)}
           <span className="block text-[var(--muted)] font-normal">
             {new Date(a.deadline).toLocaleDateString(locale(lang), { day: "numeric", month: "short" })}
           </span>
@@ -465,7 +465,7 @@ export function AssignmentPanel({
             {detail.canSubmit ? (
               <div className="space-y-3 pt-1">
                 <div className="text-sm font-semibold flex items-center gap-2">
-                  <Upload className="w-4 h-4 text-[var(--accent)]" />
+                  <Upload className="w-4 h-4 text-[var(--muted)]" />
                   {lang === "el" ? "Υποβολή εργασίας" : "Submit your work"}
                 </div>
 
@@ -485,9 +485,9 @@ export function AssignmentPanel({
                       addFiles(e.dataTransfer.files);
                     }}
                     onClick={() => inputRef.current?.click()}
-                    className="rounded-xl border-2 border-dashed border-[var(--border)] hover:border-[var(--accent)] bg-[var(--bg)] px-4 py-6 text-center cursor-pointer transition"
+                    className="rounded-xl border-2 border-dashed border-[var(--border)] hover:border-[var(--accent)] bg-[var(--bg)] px-4 py-6 text-center cursor-pointer transition-colors"
                   >
-                    <FileUp className="w-5 h-5 mx-auto text-[var(--accent)]" />
+                    <FileUp className="w-5 h-5 mx-auto text-[var(--muted)]" />
                     <div className="text-sm mt-1.5">
                       {lang === "el" ? "Σύρε αρχεία εδώ ή πάτα για επιλογή" : "Drop files here or click to choose"}
                     </div>
@@ -552,7 +552,7 @@ export function AssignmentPanel({
                   <button
                     onClick={submit}
                     disabled={!canSend}
-                    className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold bg-[var(--accent)] text-white dark:text-[#0c0a14] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold bg-[var(--accent)] text-[var(--on-accent)] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
                   >
                     {submitting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
                     {submitting
@@ -598,7 +598,7 @@ export function AssignmentPanel({
             {result && (
               <div
                 className={`flex items-start gap-2 text-sm rounded-lg px-3 py-2 ${
-                  result.ok ? "bg-emerald-500/10 text-[var(--ok)]" : "bg-red-500/10 text-[var(--danger)]"
+                  result.ok ? "bg-[var(--ok-soft)] text-[var(--ok)]" : "bg-[var(--danger-soft)] text-[var(--danger)]"
                 }`}
               >
                 {result.ok ? <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" /> : <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />}
@@ -632,9 +632,9 @@ export function DocumentSummaryButton({
   return (
     <button
       onClick={onToggle}
-      className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs cursor-pointer transition ${
+      className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs cursor-pointer transition-colors ${
         open
-          ? "bg-[var(--accent)] text-white dark:text-[#0c0a14]"
+          ? "bg-[var(--accent)] text-[var(--on-accent)]"
           : "border border-[var(--border)] text-[var(--text)] hover:border-[var(--accent)]"
       }`}
       title={lang === "el" ? "Σύνοψη με AI" : "AI summary"}
@@ -642,7 +642,7 @@ export function DocumentSummaryButton({
       data-path={path}
       data-course={courseCode}
     >
-      <Sparkles className="w-3.5 h-3.5" />
+      <ScrollText className="w-3.5 h-3.5" />
       <span className="hidden sm:inline">{lang === "el" ? "Σύνοψη" : "Summary"}</span>
     </button>
   );
@@ -678,7 +678,7 @@ export function DocumentSummaryPanel({ lang, courseCode, path }: { lang: Lang; c
     <div className="mx-4 mb-3 rounded-xl bg-[var(--accent-soft)]/60 border border-[var(--accent)]/25 px-4 py-3">
       <div className="flex items-center justify-between gap-2 mb-1.5">
         <span className="text-xs font-semibold text-[var(--accent-text)] inline-flex items-center gap-1.5">
-          <Sparkles className="w-3.5 h-3.5" />
+          <ScrollText className="w-3.5 h-3.5" />
           {lang === "el" ? "Σύνοψη AI" : "AI summary"}
         </span>
         {!loading && (
@@ -701,7 +701,7 @@ export function DocumentSummaryPanel({ lang, courseCode, path }: { lang: Lang; c
       ) : (
         <SummaryText text={summary ?? ""} />
       )}
-      <p className="text-[11px] text-[var(--muted)] mt-2">
+      <p className="text-[0.6875rem] text-[var(--muted)] mt-2">
         {lang === "el"
           ? "Δημιουργήθηκε από AI — έλεγξε σημαντικές λεπτομέρειες στο πρωτότυπο."
           : "AI-generated — double-check important details in the original."}
@@ -723,7 +723,7 @@ function SummaryText({ text }: { text: string }) {
         const bullet = l.match(/^\s*(?:[•\-*]|\d+[.)])\s+(.*)$/);
         return bullet ? (
           <div key={i} className="flex gap-2 pl-1">
-            <span className="text-[var(--accent)]">•</span>
+            <span className="text-[var(--muted)]">•</span>
             <span>{renderInline(bullet[1])}</span>
           </div>
         ) : (
@@ -804,7 +804,7 @@ export function CourseToolsPanel({
           </>
         );
         const cls =
-          "flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)] transition text-left cursor-pointer";
+          "flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)] transition-colors text-left cursor-pointer";
         if (nativeTab)
           return (
             <button key={t.id} className={cls} onClick={() => onOpenTab(nativeTab)}>
