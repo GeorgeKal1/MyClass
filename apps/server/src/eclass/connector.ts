@@ -96,7 +96,8 @@ export interface EclassConnector {
   getMessages(): Promise<Message[]>;
   getMessage(id: string): Promise<Message | null>;
   listDocuments(courseCode: string, dir?: string): Promise<DocNode[]>;
-  getAssignments(courseCode?: string): Promise<Assignment[]>;
+  /** One course's assignment page (counts as a visit to that course on eClass). */
+  getAssignments(courseCode: string): Promise<Assignment[]>;
   getAssignmentDetail(courseCode: string, assignmentId: string): Promise<AssignmentDetail>;
   submitAssignment(courseCode: string, assignmentId: string, input: SubmissionInput): Promise<SubmissionResult>;
   getCourseTools(courseCode: string): Promise<CourseTool[]>;
@@ -1121,30 +1122,18 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
       };
     },
     listDocuments,
-    async getAssignments(courseCode?: string): Promise<Assignment[]> {
-      const targetCourses = courseCode
-        ? [{ code: courseCode, title: undefined as string | undefined }]
-        : (await listCourses()).map((c) => ({ code: c.code, title: c.title as string | undefined }));
-
-      const results: Assignment[][] = [];
-      // Bounded concurrency: dozens of parallel requests trip university rate limits / WAFs
-      for (let i = 0; i < targetCourses.length; i += 5) {
-        results.push(
-          ...(await Promise.all(
-            targetCourses.slice(i, i + 5).map(async (c) => {
-              try {
-                const portalBase = resolvePortalBase(c.code);
-                const pageUrl = `${portalBase}/modules/work/index.php?course=${encodeURIComponent(c.code)}`;
-                const { html, url } = await authedGet(portalBase, pageUrl);
-                return parseAssignmentsHtml(html, url, c.code, c.title);
-              } catch {
-                return [];
-              }
-            }),
-          )),
-        );
+    async getAssignments(courseCode: string): Promise<Assignment[]> {
+      // One course only, never a sweep: eClass logs each course's assignment page as a visit to
+      // that course. Every course at once comes from getDeadlines(), which eClass does not count.
+      if (!courseCode) throw new Error("getAssignments needs a course; use getDeadlines() for every course");
+      try {
+        const portalBase = resolvePortalBase(courseCode);
+        const pageUrl = `${portalBase}/modules/work/index.php?course=${encodeURIComponent(courseCode)}`;
+        const { html, url } = await authedGet(portalBase, pageUrl);
+        return filterCurrentAcademicYearAssignments(parseAssignmentsHtml(html, url, courseCode));
+      } catch {
+        return [];
       }
-      return filterCurrentAcademicYearAssignments(results.flat());
     },
     async getDeadlines(): Promise<Assignment[]> {
       const courses = await listCourses().catch(() => [] as Course[]);

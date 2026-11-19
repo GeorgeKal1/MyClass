@@ -62,8 +62,9 @@ async function main() {
   const catalog = await step("Department catalog", () => connector.listCatalog());
   if (catalog) console.log(`  ${catalog.length} course(s), ${catalog.filter((c) => c.enrolled).length} marked enrolled`);
 
-  const assignments = await step("Assignments", () => connector.getAssignments());
-  if (assignments) console.log(`  ${assignments.length} assignment(s) this academic year`);
+  // The calendar feed, not every course's assignment page: a probe must not add visits to the account's eClass stats
+  const assignments = await step("Deadlines (calendar feed)", () => connector.getDeadlines());
+  if (assignments) console.log(`  ${assignments.length} deadline(s) this academic year`);
 
   const announcements = await step("Announcements", () => connector.getAnnouncements());
   if (announcements) console.log(`  ${announcements.length} announcement(s)`);
