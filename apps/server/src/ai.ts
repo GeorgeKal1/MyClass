@@ -14,6 +14,7 @@ import crypto from "node:crypto";
 import { decrypt, randomId, sha256 } from "./crypto.js";
 import { withKnownSubmission } from "./deadlines.js";
 import { getConnectorForUser, userDepartmentId } from "./eclass/connector.js";
+import { withOrigin } from "./eclass/request-origin.js";
 import { getCurrentAcademicYearBounds, UNIPI_DEPARTMENTS } from "./eclass/unipi-curriculum.js";
 import { prepareDocumentForAi } from "./doctext.js";
 import { env } from "./env.js";
@@ -208,7 +209,16 @@ function describePendingAction(tool: string, args: Record<string, unknown>, lang
   return `${tool}(${JSON.stringify(args)})`;
 }
 
-async function runReadOnlyTool(
+/**
+ * Runs one of the assistant's read-only tools. The assistant is not the student: its requests run
+ * as "agent", so they only reach eClass pages that are never counted as a course visit, and course
+ * pages (documents, files, assignment pages) only as the student last opened them in myClass.
+ */
+export function runReadOnlyTool(user: UserRecord, name: string, args: Record<string, unknown>): Promise<unknown> {
+  return withOrigin("agent", () => runReadOnlyToolNow(user, name, args));
+}
+
+async function runReadOnlyToolNow(
   user: UserRecord,
   name: string,
   args: Record<string, unknown>,
@@ -747,7 +757,8 @@ async function documentParts(
   instruction: (filename: string) => string,
 ): Promise<{ name: string; parts: (auth: GeminiAuth) => Promise<GeminiPart[]> }> {
   const connector = getConnectorForUser(user);
-  const file = await connector.downloadFile(courseCode, path);
+  // A copy the student fetched in the last hours will do: re-reading it on eClass would be one more visit
+  const file = await connector.downloadFile(courseCode, path, { reuseOpened: true });
   const data = Buffer.isBuffer(file.body) ? file.body : Buffer.from(await streamToBuffer(file.body));
   const prepared = prepareDocumentForAi(file.filename, file.contentType, data, user.settings.language);
   if (prepared.kind === "unsupported") throw new Error(prepared.reason);
@@ -1164,6 +1175,7 @@ async function buildSystemInstruction(user: UserRecord): Promise<string> {
     "- Deadlines / 'what do I have this week': call get_deadlines (optionally with courseCode). Show upcoming, unsubmitted items first, sorted by date, with days left. Mention overdue or already-submitted items only if relevant.",
     "- Questions about what a file, lecture, exercise sheet or project brief says: call list_documents for the course (open sub-folders if needed), pick the best-matching file, then call read_document with the student's question. Answer from that content and name the file you used.",
     "- Assignment questions ('what does project 2 ask', 'can I still submit'): get_deadlines, then get_assignment_details.",
+    "- You never open course pages yourself: eClass would count each one as the student's visit. list_documents, read_document and get_assignment_details only see what the student opened in myClass in the last few hours (a course's Documents, a file's AI summary or download, an assignment). When a tool says something was not opened yet, tell the student exactly what to open in myClass (Courses → course → Documents / the file / the assignment) and to ask again; get_deadlines, get_announcements and get_messages always work.",
     "- Joining/leaving a course or archiving a semester: call enroll_course / unenroll_course / archive_semester directly; the app shows the student a confirmation card, so don't ask 'are you sure?' yourself.",
     "- Uploading/submitting work is done in the app (Courses → course → Assignments → Submit); you cannot attach files yourself, but you can check requirements and status.",
     "- If a request is ambiguous (e.g. two courses or files match), ask ONE short question that lists the options. If it's clear, act without asking.",
@@ -1182,7 +1194,16 @@ async function buildSystemInstruction(user: UserRecord): Promise<string> {
 /* Main chat turn orchestrator                                         */
 /* ------------------------------------------------------------------ */
 
-export async function runAssistantTurn(
+/** One chat turn. Everything it asks eClass for is the assistant's doing ("agent"), not the student's. */
+export function runAssistantTurn(
+  user: UserRecord,
+  userMessageText: string,
+  emit: (ev: ChatStreamEvent) => void,
+): Promise<ChatMessage> {
+  return withOrigin("agent", () => runAssistantTurnNow(user, userMessageText, emit));
+}
+
+async function runAssistantTurnNow(
   user: UserRecord,
   userMessageText: string,
   emit: (ev: ChatStreamEvent) => void,

@@ -194,8 +194,12 @@ const RESUME_WINDOW_MS = 15 * 60 * 1000;
 
 /**
  * Where a page load starts. Mobile browsers and installed apps reopen the last URL, so a plain
- * reopen after a while starts on Home. A course link, or `?open=1` from a notification or an app
- * shortcut, still opens what it points to.
+ * reopen after a while starts on Home. `?open=1` (a notification, an app shortcut, the calendar
+ * feed) opens what it points to.
+ *
+ * A course page is never reopened by itself: loading it reads the course's pages on eClass, which
+ * eClass logs as a visit the student did not make (an app reopening its last address, a reload).
+ * Within the resume window the app goes back to the Courses list instead; one tap reopens the course.
  */
 function launchRoute(): Route {
   const route = routeFromLocation();
@@ -212,7 +216,15 @@ function launchRoute(): Route {
   } catch {
     /* storage unavailable: treat as a new visit */
   }
-  if (route.tab === "home" || route.course || Date.now() - lastSeen < RESUME_WINDOW_MS) return route;
+  const resuming = Date.now() - lastSeen < RESUME_WINDOW_MS;
+  if (route.course) {
+    const start: Route = resuming
+      ? { tab: "courses", course: null, sub: "documents" }
+      : { tab: "home", course: null, sub: "documents" };
+    window.history.replaceState(null, "", pathForRoute(start));
+    return start;
+  }
+  if (route.tab === "home" || resuming) return route;
   window.history.replaceState(null, "", "/");
   return { tab: "home", course: null, sub: "documents" };
 }
@@ -607,6 +619,17 @@ function Workspace({
     return null;
   }, [selectedCourseCode, courses, catalog]);
 
+  // Stable between renders: the course page loads its own announcements when these come back empty,
+  // and a new array on every render made it ask eClass again (one more counted visit) each time
+  const activeCourseAnnouncements = useMemo(
+    () => (activeCourse ? announcements.filter((a) => a.courseCode === activeCourse.code) : []),
+    [announcements, activeCourse?.code],
+  );
+  const activeCourseAssignments = useMemo(
+    () => (activeCourse ? assignments.filter((a) => a.courseCode === activeCourse.code) : []),
+    [assignments, activeCourse?.code],
+  );
+
   const openCourse = (code: string, sub: CourseSubTab = "documents", assignmentId?: string) => {
     setFocusAssignmentId(assignmentId ?? null);
     setSlideDir("left");
@@ -965,10 +988,10 @@ function Workspace({
                 course={activeCourse}
                 subTab={courseSubTab}
                 onChangeSubTab={setCourseSubTab}
-                announcements={announcements.filter((a) => a.courseCode === activeCourse.code)}
+                announcements={activeCourseAnnouncements}
                 triage={triage}
                 onMeChanged={setMe}
-                assignments={assignments.filter((a) => a.courseCode === activeCourse.code)}
+                assignments={activeCourseAssignments}
                 focusAssignmentId={focusAssignmentId}
                 onOpenInbox={() => navigateTab("inbox", "left")}
                 onBack={goBack}
@@ -2558,20 +2581,33 @@ function CourseDetailView({
       .finally(() => setDocsLoading(false));
   }, [course.code, subTab, dir]);
 
-  // Fetch live announcements for this subject if not already in global feed
+  // Announcements the account-wide feed already has for this course
   useEffect(() => {
-    if (announcements.length > 0) {
-      setCourseAnnouncements(announcements);
-      return;
-    }
-    if (subTab !== "announcements") return;
+    if (announcements.length > 0) setCourseAnnouncements(announcements);
+  }, [announcements]);
+
+  // Nothing in the feed: the course's own announcements, once, when the student opens the tab.
+  // Keyed on "has feed items", not on the array, so re-renders never ask eClass again.
+  const feedHasAnnouncements = announcements.length > 0;
+  useEffect(() => {
+    if (feedHasAnnouncements || subTab !== "announcements") return;
+    let cancelled = false;
     setAnnLoading(true);
     void api
       .announcements(course.code)
-      .then((res) => setCourseAnnouncements(res.announcements))
-      .catch(() => setCourseAnnouncements([]))
-      .finally(() => setAnnLoading(false));
-  }, [course.code, subTab, announcements]);
+      .then((res) => {
+        if (!cancelled) setCourseAnnouncements(res.announcements);
+      })
+      .catch(() => {
+        if (!cancelled) setCourseAnnouncements([]);
+      })
+      .finally(() => {
+        if (!cancelled) setAnnLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [course.code, subTab, feedHasAnnouncements]);
 
   const parentDir = useMemo(() => {
     if (!dir || dir === "/") return null;

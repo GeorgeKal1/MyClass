@@ -190,7 +190,8 @@ describe("which requests eClass logs", () => {
   });
 
   it("keeps the request origin across awaits and nests login inside a background check", async () => {
-    expect(currentOrigin()).toBe("interactive");
+    // Nothing said who asked: unknown, never the student (fail closed)
+    expect(currentOrigin()).toBe("unknown");
     await withOrigin("background", async () => {
       await new Promise((r) => setTimeout(r, 1));
       expect(currentOrigin()).toBe("background");
@@ -200,6 +201,6 @@ describe("which requests eClass logs", () => {
       });
       expect(currentOrigin()).toBe("background");
     });
-    expect(currentOrigin()).toBe("interactive");
+    expect(currentOrigin()).toBe("unknown");
   });
 });

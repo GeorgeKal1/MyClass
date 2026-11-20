@@ -3,7 +3,8 @@ import tls from "node:tls";
 import { CookieJar } from "tough-cookie";
 import { Agent, FormData as UndiciFormData, fetch as undiciFetch } from "undici";
 import { EXTRA_INTERMEDIATE_CAS } from "./extra-ca.js";
-import { currentOrigin, eclassHitFor } from "./request-origin.js";
+import { auditEclassRequest } from "./request-audit.js";
+import { currentOrigin, eclassRequestPolicy, type RequestOrigin } from "./request-origin.js";
 
 /**
  * Strict TLS for every eClass/CAS request: Node's root store, plus intermediates that some
@@ -60,6 +61,8 @@ export interface RequestOptions {
 export class EclassHttp {
   /** Mobile-API tokens per portal base URL (Open eClass `mlogin.php` / `mtoken.php` session ids). */
   public tokens: Record<string, string> = {};
+  /** The myClass user this session belongs to (for the request audit only). */
+  public owner?: string;
 
   constructor(public jar: CookieJar = new CookieJar()) {}
 
@@ -94,10 +97,11 @@ export class EclassHttp {
     }
     const max = opts.maxRedirects ?? 15;
     const hops: string[] = [];
+    const origin = currentOrigin();
 
     for (let hop = 0; hop <= max; hop++) {
       // Automated work never opens a page eClass counts as a course visit, not even via a redirect
-      assertNotCountedVisit(url);
+      assertMaySend(url, method, origin, this.owner);
       hops.push(url);
       const cookie = await this.jar.getCookieString(url);
       const headers: Record<string, string> = {
@@ -152,21 +156,46 @@ export class EclassHttp {
   }
 }
 
-/** Thrown instead of sending an automated request that eClass would log as a course visit. */
+/** Thrown instead of sending an automated request that eClass would (or might) log as a course visit. */
 export class CountedVisitBlockedError extends Error {
-  constructor(readonly url: string) {
-    super("myClass does not open course pages in the background (eClass would count it as a visit)");
+  constructor(
+    readonly url: string,
+    readonly reason = "eClass counts this page as a course visit",
+  ) {
+    super(`myClass does not open this eClass page on its own (${reason})`);
     this.name = "CountedVisitBlockedError";
   }
 }
 
 /**
- * The student's eClass usage log must only ever show what the student did. Requests started by
- * the background poller (origin "background") may not touch a page that writes a hit into
- * eClass' `actions_daily` (see `eclassHitFor`): the request is refused before it leaves.
+ * The student's eClass usage log must only ever show what the student did. Only requests the
+ * student asked for in the app (origin "interactive") may reach a page that writes a hit into
+ * eClass' `actions_daily`; background checks, the assistant, sign-in, statistics and anything of
+ * unknown origin may only use the named hit-free endpoints (see `eclassRequestPolicy`). Checked
+ * for every hop, so a redirect cannot lead there either. Every decision goes to the request audit.
  */
-function assertNotCountedVisit(url: string) {
-  if (currentOrigin() === "background" && eclassHitFor(url)) throw new CountedVisitBlockedError(url);
+function assertMaySend(url: string, method: string, origin: RequestOrigin, owner?: string) {
+  const verdict = eclassRequestPolicy(url, origin);
+  let host = "";
+  let path = url.split("?")[0];
+  try {
+    const u = new URL(url);
+    host = u.host;
+    path = u.pathname;
+  } catch {
+    /* relative or broken address: logged without its query */
+  }
+  auditEclassRequest({
+    owner,
+    origin,
+    method,
+    host,
+    path,
+    course: verdict.counted?.courseCode,
+    counted: Boolean(verdict.counted),
+    blocked: verdict.allow ? undefined : verdict.reason,
+  });
+  if (!verdict.allow) throw new CountedVisitBlockedError(url, verdict.reason);
 }
 
 function wrap(res: Response, url: string, hops: string[], unfollowedLocation?: string): HttpResponse {

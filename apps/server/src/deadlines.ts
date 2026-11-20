@@ -200,7 +200,8 @@ export function buildDeadlinesIcs(user: UserRecord, publicUrl: string, now = Dat
       `DTEND:${icsDate(d.deadline)}`,
       `SUMMARY:${icsEscape(`${d.submitted ? (lang === "el" ? "[Υποβλήθηκε] " : "[Submitted] ") : ""}${d.title}`)}`,
       `DESCRIPTION:${icsEscape(course)}`,
-      `URL:${publicUrl}/courses/${encodeURIComponent(d.courseCode)}?tab=assignments`,
+      // `open=1`: tapping the event is asking for that course page (see launchRoute in the web app)
+      `URL:${publicUrl}/courses/${encodeURIComponent(d.courseCode)}?tab=assignments&open=1`,
       "TRANSP:TRANSPARENT",
     );
     if (!d.submitted) {

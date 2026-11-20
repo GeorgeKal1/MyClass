@@ -116,8 +116,15 @@ export async function emitNotification(user: UserRecord, item: NotificationItem)
  * student's eClass usage stats never grow because of myClass.
  */
 
+/** A check already running per user: the timer, login, a submission and the Refresh button share it. */
+const pollsInFlight = new Map<string, Promise<NotificationItem[]>>();
+
 export function pollUserNow(user: UserRecord): Promise<NotificationItem[]> {
-  return withOrigin("background", () => pollUserNowInContext(user));
+  const running = pollsInFlight.get(user.id);
+  if (running) return running;
+  const poll = withOrigin("background", () => pollUserNowInContext(user)).finally(() => pollsInFlight.delete(user.id));
+  pollsInFlight.set(user.id, poll);
+  return poll;
 }
 
 async function pollUserNowInContext(user: UserRecord): Promise<NotificationItem[]> {

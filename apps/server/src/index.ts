@@ -43,6 +43,8 @@ import {
   setTransientCredentials,
   userDepartmentId,
 } from "./eclass/connector.js";
+import { eclassRequestAudit } from "./eclass/request-audit.js";
+import { withOrigin } from "./eclass/request-origin.js";
 import { hasPastAcademicYearTag, SEMESTERS, UNIPI_DEPARTMENTS } from "./eclass/unipi-curriculum.js";
 import { UNIPI } from "./eclass/universities.js";
 import { env, publicUrl } from "./env.js";
@@ -155,6 +157,14 @@ class HttpError extends Error {
   }
 }
 
+/**
+ * The student asked for exactly this page in the app (opened a course's documents, an assignment,
+ * a file): the only kind of request allowed to open a page eClass logs as a course visit, and it is
+ * their own visit. Every other route runs with no origin, which the HTTP client treats like a
+ * background check (hit-free eClass pages only).
+ */
+const asStudent = <T>(fn: () => Promise<T>): Promise<T> => withOrigin("interactive", fn);
+
 app.onError((err, c) => {
   if (err instanceof HttpError) {
     return c.json({ error: err.message }, err.status as 400);
@@ -200,7 +210,7 @@ app.post("/api/auth/login", async (c) => {
   existing.remember = body.remember;
 
   try {
-    const { http, displayName } = await performEclassLogin(uni, existing.username, body.password);
+    const { http, displayName } = await performEclassLogin(uni, existing.username, body.password, userId);
     failedLoginMap.delete(rateKey);
     existing.displayName = displayName || existing.username;
     const serialized = http.serialize();
@@ -384,7 +394,10 @@ app.get("/api/announcements", async (c) => {
   const u = requireUser(c);
   const courseCode = c.req.query("course") || undefined;
   const connector = getConnectorForUser(u);
-  const announcements = await connector.getAnnouncements(courseCode);
+  // With a course: the student opened that course's Announcements tab. Without: "my announcements" (hit-free).
+  const announcements = courseCode
+    ? await asStudent(() => connector.getAnnouncements(courseCode))
+    : await connector.getAnnouncements();
   return c.json({ announcements });
 });
 
@@ -422,7 +435,7 @@ app.get("/api/assignments", async (c) => {
   const connector = getConnectorForUser(u);
   if (courseCode) {
     // The student opened this course's assignments: its own page (one visit, theirs) also says what was handed in
-    const assignments = await connector.getAssignments(courseCode);
+    const assignments = await asStudent(() => connector.getAssignments(courseCode));
     rememberDeadlines(u, assignments, courseCode);
     return c.json({ assignments });
   }
@@ -435,13 +448,16 @@ app.get("/api/assignments", async (c) => {
 
 app.get("/api/courses/:code/tools", async (c) => {
   const u = requireUser(c);
-  const tools = await getConnectorForUser(u).getCourseTools(c.req.param("code"));
+  // The student opened the course's Info tab: the course home page lists its tools
+  const tools = await asStudent(() => getConnectorForUser(u).getCourseTools(c.req.param("code")));
   return c.json({ tools });
 });
 
 app.get("/api/assignments/:code/:id", async (c) => {
   const u = requireUser(c);
-  const detail = await getConnectorForUser(u).getAssignmentDetail(c.req.param("code"), c.req.param("id"));
+  const detail = await asStudent(() =>
+    getConnectorForUser(u).getAssignmentDetail(c.req.param("code"), c.req.param("id")),
+  );
   return c.json({ assignment: detail });
 });
 
@@ -469,11 +485,9 @@ app.post(
     if (total > MAX_UPLOAD_BYTES) throw new HttpError(413, "The files are too large (max 50 MB in total).");
     const text = typeof body["text"] === "string" ? body["text"].slice(0, 100_000) : undefined;
     const comments = typeof body["comments"] === "string" ? body["comments"].slice(0, 5000) : undefined;
-    const result = await getConnectorForUser(u).submitAssignment(c.req.param("code"), c.req.param("id"), {
-      files,
-      text,
-      comments,
-    });
+    const result = await asStudent(() =>
+      getConnectorForUser(u).submitAssignment(c.req.param("code"), c.req.param("id"), { files, text, comments }),
+    );
     if (!result.ok) throw new HttpError(422, result.message);
     markDeadlineSubmitted(u, c.req.param("code"), c.req.param("id"));
     void pollUserNow(u);
@@ -485,11 +499,12 @@ app.post(
 app.get("/api/courses/:code/proxy", async (c) => {
   const u = requireUser(c);
   const url = c.req.query("url") || "";
-  const file = await getConnectorForUser(u)
-    .downloadPortalUrl(c.req.param("code"), url)
-    .catch((err: Error) => {
+  // The student clicked this attachment
+  const file = await asStudent(() => getConnectorForUser(u).downloadPortalUrl(c.req.param("code"), url)).catch(
+    (err: Error) => {
       throw new HttpError(400, err.message);
-    });
+    },
+  );
   c.header("Content-Type", file.contentType);
   c.header("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(file.filename)}`);
   return c.body(new Uint8Array(file.body));
@@ -503,7 +518,10 @@ app.post("/api/courses/:code/documents/summary", async (c) => {
   const u = requireUser(c);
   const { path: docPath, refresh } = DocumentSummaryRequest.parse(await c.req.json());
   try {
-    const res = await summarizeCourseDocument(u, c.req.param("code"), docPath, { refresh, countQuota: true });
+    // The student pressed "AI summary" on this file
+    const res = await asStudent(() =>
+      summarizeCourseDocument(u, c.req.param("code"), docPath, { refresh, countQuota: true }),
+    );
     return c.json({
       summary: {
         path: docPath,
@@ -523,7 +541,7 @@ app.post("/api/courses/:code/documents/study", async (c) => {
   const u = requireUser(c);
   const { path: docPath, kind, refresh } = StudyRequest.parse(await c.req.json());
   try {
-    const material = await generateStudyMaterial(u, c.req.param("code"), docPath, kind, { refresh });
+    const material = await asStudent(() => generateStudyMaterial(u, c.req.param("code"), docPath, kind, { refresh }));
     return c.json({ material, me: toMe(users.get(u.id)!) });
   } catch (err) {
     if (err instanceof AiQuotaError) throw err;
@@ -536,7 +554,8 @@ app.get("/api/courses/:code/documents", async (c) => {
   const code = c.req.param("code");
   const dir = c.req.query("dir") || "/";
   const connector = getConnectorForUser(u);
-  const nodes = await connector.listDocuments(code, dir);
+  // The student opened this course's Documents (or a folder in it)
+  const nodes = await asStudent(() => connector.listDocuments(code, dir));
   return c.json({ nodes, dir });
 });
 
@@ -545,7 +564,7 @@ app.get("/api/courses/:code/documents/file", async (c) => {
   const code = c.req.param("code");
   const filePath = c.req.query("path") || "/";
   const connector = getConnectorForUser(u);
-  const file = await connector.downloadFile(code, filePath);
+  const file = await asStudent(() => connector.downloadFile(code, filePath));
 
   c.header("Content-Type", file.contentType);
   c.header(
@@ -567,7 +586,8 @@ app.get("/api/courses/:code/documents/zip", async (c) => {
   const u = requireUser(c);
   const code = c.req.param("code");
   const connector = getConnectorForUser(u);
-  const { filename, stream: zipStream } = await connector.streamCourseZip(code);
+  // The student pressed "download the course's files" (the zip keeps working inside this origin)
+  const { filename, stream: zipStream } = await asStudent(() => connector.streamCourseZip(code));
 
   c.header("Content-Type", "application/zip");
   c.header("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
@@ -610,7 +630,9 @@ app.get("/api/documents/zip-all", async (c) => {
   const pass = new PassThrough();
   archive.pipe(pass);
 
-  void (async () => {
+  // The student pressed "download everything": each course's Documents page and files are their own
+  // visits (eClass logs them like downloading on eClass would). Started inside that origin.
+  void asStudent(async () => {
     try {
       for (const course of filtered) {
         const semFolder = (course.semesterFolder || "Εξάμηνο").replace(/[\\/:*?"<>|]/g, "_");
@@ -631,7 +653,7 @@ app.get("/api/documents/zip-all", async (c) => {
     } catch (err) {
       pass.destroy(err as Error);
     }
-  })();
+  });
 
   c.header("Content-Type", "application/zip");
   c.header("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(zipFilename)}`);
@@ -770,6 +792,17 @@ app.get("/api/calendar/:file", (c) => {
   return c.body(buildDeadlinesIcs(users.get(owner.id)!, publicUrl));
 });
 
+/**
+ * Every request this server process sent to eClass for the signed-in student (and every one it
+ * refused), with why it was made. `countedNotByStudent` must stay 0: no counted eClass visit that
+ * the student did not ask for themselves. Host, path and course only; no query strings or bodies.
+ */
+app.get("/api/debug/eclass-requests", (c) => {
+  const u = requireUser(c);
+  c.header("Cache-Control", "no-store");
+  return c.json(eclassRequestAudit(u.id));
+});
+
 /** Data for the Windows Widgets board card (template in /widgets/deadlines.json). */
 app.get("/api/widget/deadlines", (c) => {
   c.header("Cache-Control", "no-store");
@@ -902,9 +935,14 @@ if (clientDist) {
 /* Start server + background poller                                    */
 /* ------------------------------------------------------------------ */
 
-startBackgroundPoller();
+export { app };
 
-serve({ fetch: app.fetch, port: env.port }, (info) => {
-  console.log(`myClass server listening on http://localhost:${info.port}`);
-  void checkServerGeminiKey();
-});
+// Tests import the app without starting the poller or listening on a port
+if (!process.env.VITEST) {
+  startBackgroundPoller();
+
+  serve({ fetch: app.fetch, port: env.port }, (info) => {
+    console.log(`myClass server listening on http://localhost:${info.port} (pid ${process.pid})`);
+    void checkServerGeminiKey();
+  });
+}

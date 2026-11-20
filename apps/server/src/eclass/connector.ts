@@ -62,7 +62,7 @@ import {
   UNIPI_DEPARTMENTS,
 } from "./unipi-curriculum.js";
 import { curriculumSemester, isPostgraduatePath, POSTGRAD_INDEX } from "./unipi-curricula.js";
-import { ECLASS_MODULES, withOrigin } from "./request-origin.js";
+import { currentOrigin, ECLASS_MODULES, eclassHitFor, withOrigin } from "./request-origin.js";
 import { getUniversity } from "./universities.js";
 
 export interface SubmissionInput {
@@ -109,9 +109,14 @@ export interface EclassConnector {
   /** `password`: the course's registration code, for courses that ask for one. */
   enrollCourse(codeOrId: string, password?: string): Promise<Course>;
   unenrollCourse(codeOrId: string): Promise<Course>;
+  /**
+   * One course file (a visit to the course on eClass). `reuseOpened`: a copy the student fetched in
+   * the last hours will do (AI summary, then study cards of the same file), saving another visit.
+   */
   downloadFile(
     courseCode: string,
     filePathOrUrl: string,
+    opts?: { reuseOpened?: boolean },
   ): Promise<{ filename: string; contentType: string; body: Buffer | Readable }>;
   /** Downloads an absolute eClass URL (e.g. an assignment attachment) through the user's session. */
   downloadPortalUrl(courseCode: string, url: string): Promise<{ filename: string; contentType: string; body: Buffer }>;
@@ -168,12 +173,72 @@ export function forgetUserSession(userId: string) {
   sessionPasswords.delete(userId);
   httpByUser.delete(userId);
   invalidateUserCatalogCache(userId);
+  for (const key of [...openedByStudent.keys()]) if (key.startsWith(`${userId}|`)) forgetOpened(key);
 }
 
 class FirewallError extends Error {
   constructor(host: string) {
     super(`The university firewall of ${host} blocked the request. Try again in a few minutes.`);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* What the student opened (for the assistant)                         */
+/* ------------------------------------------------------------------ */
+
+/** Something other than the student (the assistant, a background check) asked for a course page. */
+export class NotOpenedByStudentError extends Error {
+  constructor(what: string) {
+    super(
+      `${what} has not been opened in myClass yet. Opening it now would count as a visit to the course in the ` +
+        `student's eClass statistics, so only the student can open it: ask them to open it in myClass ` +
+        `(Courses → the course), then try again.`,
+    );
+    this.name = "NotOpenedByStudentError";
+  }
+}
+
+/**
+ * Course document lists, files and assignment pages the student opened in myClass, kept for a
+ * while so the assistant can read them without opening the course page again (eClass would log
+ * that as one more visit, and the assistant is not the student). Also the download address of
+ * every listed file, so a later download costs only the file itself. Oldest entries go first.
+ */
+const OPENED_TTL_MS = 6 * 60 * 60_000;
+const OPENED_FILE_MAX_BYTES = 15 * 1024 * 1024;
+const OPENED_TOTAL_MAX_BYTES = 60 * 1024 * 1024;
+const OPENED_MAX_ENTRIES = 3000;
+const openedByStudent = new Map<string, { at: number; value: unknown; bytes: number }>();
+let openedBytes = 0;
+
+function forgetOpened(key: string) {
+  const e = openedByStudent.get(key);
+  if (!e) return;
+  openedBytes -= e.bytes;
+  openedByStudent.delete(key);
+}
+
+function rememberOpened(key: string, value: unknown, bytes = 0) {
+  forgetOpened(key);
+  if (bytes > OPENED_FILE_MAX_BYTES) return;
+  const now = Date.now();
+  openedByStudent.set(key, { at: now, value, bytes });
+  openedBytes += bytes;
+  for (const [k, e] of openedByStudent) {
+    const fits = openedBytes <= OPENED_TOTAL_MAX_BYTES && openedByStudent.size <= OPENED_MAX_ENTRIES;
+    if (fits && now - e.at < OPENED_TTL_MS) break;
+    forgetOpened(k);
+  }
+}
+
+function openedEarlier<T>(key: string): T | undefined {
+  const e = openedByStudent.get(key);
+  if (!e) return undefined;
+  if (Date.now() - e.at >= OPENED_TTL_MS) {
+    forgetOpened(key);
+    return undefined;
+  }
+  return e.value as T;
 }
 
 /* ------------------------------------------------------------------ */
@@ -357,8 +422,11 @@ export async function performEclassLogin(
   uni: University,
   username: string,
   password: string,
+  /** The myClass user id, for the request audit. */
+  owner?: string,
 ): Promise<{ http: EclassHttp; displayName: string; mobileToken?: string }> {
   const http = new EclassHttp();
+  http.owner = owner;
   const [primaryBase, ...others] = portalsForUser(uni, username);
   const primary = await authenticatePortalSession(http, primaryBase, username, password);
   let displayName = primary.displayName;
@@ -389,8 +457,11 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
   ensureHitLedger(user);
   const uidByBase = new Map<string, number>();
   const csrfTokenByBase = new Map<string, string>();
-  const downloadUrlCache = new Map<string, string>();
   const messagePortalMap = new Map<string, string>();
+  /** The student asked for exactly this page in the app; anyone else only gets what they opened before. */
+  const byStudent = () => currentOrigin() === "interactive";
+  const openedKey = (kind: "docs" | "url" | "file" | "asg", courseCode: string, rest: string) =>
+    `${user.id}|${kind}|${courseCode.toUpperCase()}|${rest}`;
 
   /**
    * Semester grouping, most specific first: curated Informatics curriculum, postgraduate programme
@@ -441,6 +512,7 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
       }
       httpByUser.set(user.id, http);
     }
+    http.owner = user.id;
     return http;
   };
 
@@ -557,7 +629,9 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
         });
         return { url: r.url, html: await r.text(), status: r.status, hops: r.hops };
       },
-      (r) => isLoggedOutPage(r.url, r.html) || !r.html.trim().startsWith("{"),
+      // A non-JSON answer usually means the session expired. On a page eClass counts (a course's
+      // announcements) only a real login page earns a retry: every attempt there is one more visit.
+      (r) => isLoggedOutPage(r.url, r.html) || (!eclassHitFor(url) && !r.html.trim().startsWith("{")),
     );
     try {
       return JSON.parse(res.html) as DataTablesResponse;
@@ -671,7 +745,14 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
 
   const listCourses = async () => (await listCoursesDetailed()).courses;
 
+  /** A course's Documents page (a visit to that course on eClass): only for the student, else what they opened. */
   const listDocuments = async (courseCode: string, dir = "/"): Promise<DocNode[]> => {
+    const listingKey = openedKey("docs", courseCode, dir || "/");
+    if (!byStudent()) {
+      const seen = openedEarlier<DocNode[]>(listingKey);
+      if (seen) return seen;
+      throw new NotOpenedByStudentError(`The documents of ${courseCode}${dir && dir !== "/" ? ` (folder ${dir})` : ""}`);
+    }
     const portalBase = resolvePortalBase(courseCode);
     const dirParam = dir && dir !== "/" ? `&openDir=${encodeURIComponent(dir)}` : "";
     const pageUrl = `${portalBase}/modules/document/index.php?course=${encodeURIComponent(courseCode)}${dirParam}`;
@@ -679,15 +760,17 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     const { nodes, dirZipUrl } = parseDocumentsHtml(html, url);
     const currentYearNodes = filterCurrentAcademicYearDocs(nodes);
     if (dirZipUrl && (dir === "/" || !dir)) {
-      downloadUrlCache.set(`${courseCode}:__ROOT_ZIP__`, dirZipUrl);
+      rememberOpened(openedKey("url", courseCode, "__ROOT_ZIP__"), dirZipUrl);
     }
     for (const n of currentYearNodes) {
-      if (n.downloadUrl) downloadUrlCache.set(`${courseCode}:${n.path}`, n.downloadUrl);
+      if (n.downloadUrl) rememberOpened(openedKey("url", courseCode, n.path), n.downloadUrl);
     }
-    return currentYearNodes.map((n) => ({
+    const listing = currentYearNodes.map((n) => ({
       ...n,
       downloadUrl: `/api/courses/${encodeURIComponent(courseCode)}/documents/file?path=${encodeURIComponent(n.path)}`,
     }));
+    rememberOpened(listingKey, listing);
+    return listing;
   };
 
   /* -------------------------- Catalog ----------------------------- */
@@ -1041,7 +1124,7 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     async verifyLogin() {
       const pw = getPassword();
       if (!pw) throw new Error("Password is required to verify login");
-      const { http, displayName } = await performEclassLogin(uni, user.username, pw);
+      const { http, displayName } = await performEclassLogin(uni, user.username, pw, user.id);
       httpByUser.set(user.id, http);
       persistSoon();
       return { displayName };
@@ -1050,20 +1133,27 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     listCoursesDetailed,
     async getAnnouncements(courseCode?: string): Promise<Announcement[]> {
       if (courseCode) {
+        // Not the student opening this course's Announcements: the account-wide list, filtered
+        if (!byStudent()) {
+          const wanted = courseCode.toUpperCase();
+          return (await this.getAnnouncements()).filter((a) => a.courseCode.toUpperCase() === wanted);
+        }
         const portalBase = resolvePortalBase(courseCode);
+        // The course's RSS feed first: eClass does not count it as a visit. The announcements page
+        // itself (counted) only when the feed has nothing to show.
+        const rss = await authedGet(
+          portalBase,
+          `${portalBase}/modules/announcements/rss.php?c=${encodeURIComponent(courseCode)}`,
+        ).catch(() => null);
+        const fromRss = rss ? parseAnnouncementsRss(rss.html, courseCode) : [];
+        if (fromRss.length > 0) return filterCurrentAcademicYearAnnouncements(fromRss);
+
         const json = await authedAjaxPost(
           portalBase,
           `${portalBase}/modules/announcements/index.php?course=${encodeURIComponent(courseCode)}`,
           { start: "0", length: "50", "search[value]": "" },
         );
-        const list = parseAnnouncementsAjax(json, portalBase, { code: courseCode });
-        if (list.length > 0) return filterCurrentAcademicYearAnnouncements(list);
-
-        const rss = await authedGet(
-          portalBase,
-          `${portalBase}/modules/announcements/rss.php?c=${encodeURIComponent(courseCode)}`,
-        );
-        return filterCurrentAcademicYearAnnouncements(parseAnnouncementsRss(rss.html, courseCode));
+        return filterCurrentAcademicYearAnnouncements(parseAnnouncementsAjax(json, portalBase, { code: courseCode }));
       }
 
       const results = await Promise.all(
@@ -1173,21 +1263,26 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     },
     async getAssignmentDetail(courseCode: string, assignmentId: string): Promise<AssignmentDetail> {
       const id = numericAssignmentId(assignmentId);
+      const detailKey = openedKey("asg", courseCode, id);
+      if (!byStudent()) {
+        const seen = openedEarlier<AssignmentDetail>(detailKey);
+        if (seen) return seen;
+        throw new NotOpenedByStudentError(`Assignment ${courseCode}:${id}`);
+      }
       const { portalBase, url } = assignmentPageUrl(courseCode, id);
-      const [{ html, url: finalUrl }, list] = await Promise.all([
-        authedGet(portalBase, url),
-        this.getAssignments(courseCode).catch(() => [] as Assignment[]),
-      ]);
+      // One page, one visit: deadline and hand-in state come from what myClass already knows
+      // (calendar feed, the course's assignment list), not from loading the list page as well
+      const { html, url: finalUrl } = await authedGet(portalBase, url);
       const parsed = parseAssignmentDetailHtml(html, finalUrl);
-      const summary = list.find((a) => a.id === `${courseCode}:${id}`);
-      return {
-        id: `${courseCode}:${id}`,
+      const fullId = `${courseCode}:${id}`;
+      const known = user.deadlines?.find((d) => d.id.toUpperCase() === fullId.toUpperCase());
+      const detail: AssignmentDetail = {
+        id: fullId,
         courseCode,
-        title: summary?.title ?? parsed.title ?? `#${id}`,
+        title: known?.title ?? parsed.title ?? `#${id}`,
         descriptionHtml: parsed.descriptionHtml,
-        deadline: summary?.deadline,
-        submitted: summary?.submitted ?? Boolean(parsed.existingSubmission),
-        grade: summary?.grade,
+        deadline: known?.deadline,
+        submitted: Boolean(parsed.existingSubmission) || Boolean(known?.submitted),
         attachments: parsed.attachments.map((a) => ({
           name: a.name,
           url: `/api/courses/${encodeURIComponent(courseCode)}/proxy?url=${encodeURIComponent(a.url)}`,
@@ -1198,6 +1293,8 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
         existingSubmission: parsed.existingSubmission,
         url,
       };
+      rememberOpened(detailKey, detail);
+      return detail;
     },
     async submitAssignment(courseCode: string, assignmentId: string, input: SubmissionInput): Promise<SubmissionResult> {
       const id = numericAssignmentId(assignmentId);
@@ -1245,9 +1342,12 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
 
       const after = parseAssignmentDetailHtml(html, res.url);
       if (after.flashMessage?.kind === "error") return { ok: false, message: after.flashMessage.text };
-      // Confirm by re-reading the assignment list (submitted flag)
-      const list = await this.getAssignments(courseCode).catch(() => [] as Assignment[]);
-      const confirmed = list.find((a) => a.id === `${courseCode}:${id}`)?.submitted;
+      // eClass answers with the assignment page (or the course's assignment list) again, which shows
+      // the hand-in: confirmed there, not by loading the list once more (one more visit to the course)
+      forgetOpened(openedKey("asg", courseCode, id));
+      const confirmed =
+        Boolean(after.existingSubmission) ||
+        Boolean(parseAssignmentsHtml(html, res.url, courseCode).find((a) => a.id === `${courseCode}:${id}`)?.submitted);
       if (confirmed || after.flashMessage?.kind === "success") {
         return { ok: true, message: after.flashMessage?.text || "Submitted to eClass." };
       }
@@ -1363,18 +1463,28 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
       invalidateUserCatalogCache(user.id);
       return { ...target, enrolled: false };
     },
-    async downloadFile(courseCode: string, filePath: string) {
+    async downloadFile(courseCode: string, filePath: string, opts: { reuseOpened?: boolean } = {}) {
+      const fileKey = openedKey("file", courseCode, filePath);
+      if (!byStudent() || opts.reuseOpened) {
+        const seen = openedEarlier<{ filename: string; contentType: string; body: Buffer }>(fileKey);
+        if (seen) return seen;
+        if (!byStudent()) throw new NotOpenedByStudentError(`The file ${filePath} of ${courseCode}`);
+      }
       const portalBase = resolvePortalBase(courseCode);
-      let targetUrl = downloadUrlCache.get(`${courseCode}:${filePath}`);
+      // The address from the folder listing the student just opened: the download is then the only visit
+      const urlKey = openedKey("url", courseCode, filePath);
+      let targetUrl = openedEarlier<string>(urlKey);
       if (!targetUrl) {
         const parentDir = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) || "/" : "/";
         await listDocuments(courseCode, parentDir);
-        targetUrl = downloadUrlCache.get(`${courseCode}:${filePath}`);
+        targetUrl = openedEarlier<string>(urlKey);
       }
       if (!targetUrl) {
         targetUrl = `${portalBase}/modules/document/file.php/${encodeURIComponent(courseCode)}${filePath}`;
       }
-      return downloadFromPortal(portalBase, targetUrl, filePath.split("/").pop() || "download");
+      const file = await downloadFromPortal(portalBase, targetUrl, filePath.split("/").pop() || "download");
+      rememberOpened(fileKey, file, file.body.length);
+      return file;
     },
     async downloadPortalUrl(courseCode: string, url: string) {
       const portalBase = resolvePortalBase(courseCode);
@@ -1393,10 +1503,11 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     async streamCourseZip(courseCode: string) {
       const portalBase = resolvePortalBase(courseCode);
       const rootNodes = await listDocuments(courseCode, "/");
-      const nativeZipUrl = downloadUrlCache.get(`${courseCode}:__ROOT_ZIP__`);
+      const nativeZipUrl = openedEarlier<string>(openedKey("url", courseCode, "__ROOT_ZIP__"));
 
       if (nativeZipUrl) {
         const res = await getHttp().request(nativeZipUrl);
+        noteHits(portalBase, res.hops);
         persistSoon();
         const ct = res.headers.get("content-type") || "";
         if (res.status === 200 && (ct.includes("zip") || ct.includes("octet-stream")) && res.raw.body) {

@@ -41,7 +41,24 @@ export class ApiError extends Error {
   }
 }
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
+/**
+ * GETs already on their way, by path. A second identical GET while the first is pending (React's
+ * StrictMode running every effect twice, a re-render, a double tap) shares the first answer
+ * instead of asking again: for a course page that would be one more visit in the student's
+ * eClass statistics.
+ */
+const pendingGets = new Map<string, Promise<unknown>>();
+
+function req<T>(path: string, init?: RequestInit): Promise<T> {
+  if (init?.method && init.method !== "GET") return send<T>(path, init);
+  const pending = pendingGets.get(path);
+  if (pending) return pending as Promise<T>;
+  const p = send<T>(path, init).finally(() => pendingGets.delete(path));
+  pendingGets.set(path, p);
+  return p;
+}
+
+async function send<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
     res = await fetch(path, {

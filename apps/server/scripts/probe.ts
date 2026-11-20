@@ -5,15 +5,19 @@ import {
   portalsForUser,
   setTransientCredentials,
 } from "../src/eclass/connector.js";
+import { eclassRequestAudit } from "../src/eclass/request-audit.js";
+import { withOrigin } from "../src/eclass/request-origin.js";
 import { getUniversity } from "../src/eclass/universities.js";
 import { newUser } from "../src/store.js";
 
 /**
  * Live diagnostic for one student account. Nothing is stored: the user record only lives in memory.
  *
- *   PROBE_USERNAME=e24xxx PROBE_PASSWORD=... npm run probe
- *   (optionally PROBE_UNIVERSITY=unipi; otherwise it is detected from the username)
+ *   PROBE_LIVE=1 PROBE_USERNAME=e24xxx PROBE_PASSWORD=... npm run probe
  *
+ * It signs in to the real eClass portals, so it only runs with PROBE_LIVE=1. Every request runs as a
+ * background check: only pages eClass never counts as a course visit are read (the HTTP client
+ * refuses the rest), so a probe adds nothing to the account's eClass statistics.
  * Prints, per step and per eClass portal, what worked and what failed – never the password.
  */
 async function step<T>(label: string, fn: () => Promise<T>): Promise<T | undefined> {
@@ -34,6 +38,10 @@ async function main() {
   const uni = getUniversity();
 
   console.log(`[probe] University: ${uni.nameEn} (${uni.eclassUrl})`);
+  if (process.env.PROBE_LIVE !== "1") {
+    console.log("The probe signs in to the real eClass. Run it with PROBE_LIVE=1 if that is what you want.");
+    return;
+  }
   if (!username || !password) {
     console.log("Set PROBE_USERNAME and PROBE_PASSWORD (env or apps/server/.env) to test a live login.");
     return;
@@ -69,16 +77,13 @@ async function main() {
   const announcements = await step("Announcements", () => connector.getAnnouncements());
   if (announcements) console.log(`  ${announcements.length} announcement(s)`);
 
-  const first = courses?.courses[0];
-  if (first) {
-    const tools = await step(`Tools of ${first.code}`, () => connector.getCourseTools(first.code));
-    if (tools) console.log(`  ${tools.map((t) => t.id).join(", ")}`);
-    const docs = await step(`Documents of ${first.code}`, () => connector.listDocuments(first.code));
-    if (docs) console.log(`  ${docs.length} item(s) in /`);
-  }
+  // Course pages (tools, documents, assignments) are left out on purpose: each one is a counted visit
+  const audit = eclassRequestAudit();
+  console.log(`[probe] eClass requests by origin: ${JSON.stringify(audit.byOrigin)}`);
+  console.log(`[probe] counted visits sent: ${audit.countedNotByStudent}`);
 }
 
-main().catch((err) => {
+withOrigin("background", main).catch((err) => {
   console.error("Probe failed:", err);
   process.exit(1);
 });
