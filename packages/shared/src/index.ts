@@ -99,6 +99,8 @@ export interface Assignment {
   title: string;
   deadline?: string; // ISO
   submitted: boolean;
+  /** False when the state is just not known: deadlines from the calendar feed carry no hand-in state. */
+  submissionKnown?: boolean;
   grade?: string;
   url?: string;
 }

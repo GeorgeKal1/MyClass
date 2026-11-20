@@ -59,6 +59,8 @@ export interface KnownDeadline {
   title: string;
   deadline: string;
   submitted: boolean;
+  /** The hand-in state was seen on the course page or set by an upload (the calendar feed has none). */
+  submissionKnown?: boolean;
 }
 
 export interface UserRecord {

@@ -19,6 +19,8 @@ export function rememberDeadlines(user: UserRecord, assignments: Assignment[], c
       title: a.title,
       deadline: a.deadline!,
       submitted: a.submitted,
+      // A course page (opened by the student) tells the state; the calendar feed does not
+      submissionKnown: courseCode ? true : a.submissionKnown === true,
     }));
   const now = Date.now();
   const loadedCourses = new Set(loaded.map((d) => d.courseCode));
@@ -43,14 +45,20 @@ export function rememberDeadlines(user: UserRecord, assignments: Assignment[], c
  * keep whatever was last seen for each assignment.
  */
 export function withKnownSubmission(user: UserRecord, list: Assignment[]): Assignment[] {
-  const known = new Map((user.deadlines ?? []).map((d) => [d.id, d.submitted]));
-  return list.map((a) => (known.get(a.id) ? { ...a, submitted: true } : a));
+  const known = new Map((user.deadlines ?? []).map((d) => [d.id, d]));
+  return list.map((a) => {
+    const seen = known.get(a.id);
+    return { ...a, submitted: Boolean(seen?.submitted), submissionKnown: seen?.submissionKnown === true || Boolean(seen?.submitted) };
+  });
 }
 
 export function markDeadlineSubmitted(user: UserRecord, courseCode: string, assignmentId: string): void {
   users.update(user.id, (u) => {
     for (const d of u.deadlines ?? []) {
-      if (d.courseCode === courseCode && (d.id === assignmentId || d.id.split(":").pop() === assignmentId)) d.submitted = true;
+      if (d.courseCode === courseCode && (d.id === assignmentId || d.id.split(":").pop() === assignmentId)) {
+        d.submitted = true;
+        d.submissionKnown = true;
+      }
     }
   });
 }

@@ -191,7 +191,7 @@ beforeEach(() => {
 
 const user = () => store.users.get(USER_ID)!;
 const call = (p: string, init: RequestInit = {}) =>
-  app.request(p, { ...init, headers: { Cookie: `myclass_sid=${SID}`, "Content-Type": "application/json", ...(init.headers ?? {}) } });
+  app.request(p, { ...init, headers: { Cookie: `myclass_sid=${SID}`, "Content-Type": "application/json", "X-Myclass-Client": "240", ...(init.headers ?? {}) } });
 const counted = () => fake.sent.filter((r) => origin.eclassHitFor(r.url));
 const blockedSince = (before: number) => audit.eclassRequestAudit().recent.filter((e) => e.blocked).length - before;
 const blockedNow = () => audit.eclassRequestAudit().recent.filter((e) => e.blocked).length;
@@ -376,5 +376,21 @@ describe("nothing but the student opens a page eClass counts", () => {
     // never a query string (CAS tickets, tokens)
     expect(body.recent.every((e) => !e.path.includes("?"))).toBe(true);
     expect(audit.eclassRequestAudit().countedNotByStudent).toBe(0);
+  });
+});
+
+describe("tabs running the old app code", () => {
+  it("get 426 on every route that opens a counted course page, and send nothing to eClass", async () => {
+    for (const p of [
+      "/api/announcements?course=TMC101",
+      "/api/assignments?course=TMC101",
+      "/api/assignments/TMC101/1",
+      "/api/courses/TMC101/tools",
+      "/api/courses/TMC101/documents",
+    ]) {
+      const res = await app.request(p, { headers: { Cookie: `myclass_sid=${SID}` } });
+      expect(res.status, p).toBe(426);
+    }
+    expect(fake.sent.length).toBe(0);
   });
 });

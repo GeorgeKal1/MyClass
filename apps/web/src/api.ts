@@ -66,6 +66,7 @@ async function send<T>(path: string, init?: RequestInit): Promise<T> {
       ...init,
       headers: {
         "Content-Type": "application/json",
+        "X-Myclass-Client": "240",
         ...(init?.headers ?? {}),
       },
     });
@@ -125,7 +126,7 @@ export const api = {
     try {
       res = await fetch(
         `/api/assignments/${encodeURIComponent(code)}/${encodeURIComponent(id.split(":").pop() ?? id)}/submit`,
-        { method: "POST", credentials: "include", body: fd },
+        { method: "POST", credentials: "include", body: fd, headers: { "X-Myclass-Client": "240" } },
       );
     } catch {
       throw new ServerUnavailableError();

@@ -45,19 +45,21 @@ export function relativeDue(iso: string, lang: Lang): string {
   return days > 0 ? `in ${days} days` : `${-days} days ago`;
 }
 
-type DueState = "submitted" | "overdue" | "soon" | "later";
+type DueState = "submitted" | "overdue" | "unknown" | "soon" | "later";
 
 function dueState(a: Assignment, now = Date.now()): DueState {
   if (a.submitted) return "submitted";
   if (!a.deadline) return "later";
   const t = new Date(a.deadline).getTime();
-  if (t < now) return "overdue";
+  // Past and never seen on its course page: it may well have been handed in, so do not call it overdue
+  if (t < now) return a.submissionKnown === false ? "unknown" : "overdue";
   return t - now < 3 * 86_400_000 ? "soon" : "later";
 }
 
 const DOT_CLASS: Record<DueState, string> = {
   submitted: "bg-[var(--ok)]",
   overdue: "bg-[var(--danger)]",
+  unknown: "bg-[var(--border)]",
   soon: "bg-[var(--warn)]",
   later: "bg-[var(--muted)]",
 };
@@ -218,6 +220,7 @@ export function DeadlineCalendar({
               ["soon", lang === "el" ? "< 3 ημέρες" : "< 3 days"],
               ["later", lang === "el" ? "Εκκρεμεί" : "Pending"],
               ["overdue", lang === "el" ? "Έληξε" : "Overdue"],
+              ["unknown", lang === "el" ? "Έληξε, δεν έχει ελεγχθεί" : "Ended, not checked"],
               ["submitted", lang === "el" ? "Παραδόθηκε" : "Submitted"],
             ] as const
           ).map(([k, label]) => (

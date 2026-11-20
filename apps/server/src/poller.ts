@@ -90,6 +90,8 @@ export async function emitNotification(user: UserRecord, item: NotificationItem)
         } catch (err: unknown) {
           const status = (err as { statusCode?: number })?.statusCode;
           if (status === 404 || status === 410) deadEndpoints.push(sub.endpoint);
+          // Anything else (403 = push keys changed or a rejected VAPID subject, 429, 5xx) used to vanish silently
+          console.warn(`[push] ${new URL(sub.endpoint).host}: ${status ?? (err as Error).message}${status === 403 ? " (VAPID keys or subject rejected)" : ""}`);
         }
       }),
     );

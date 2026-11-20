@@ -3,7 +3,7 @@ import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import fs from "node:fs";
 import path from "node:path";
-import { Hono, type Context } from "hono";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
@@ -164,6 +164,34 @@ class HttpError extends Error {
  * background check (hit-free eClass pages only).
  */
 const asStudent = <T>(fn: () => Promise<T>): Promise<T> => withOrigin("interactive", fn);
+
+/**
+ * Routes that open a counted eClass page for the student. An app tab opened before v2.4.0 still runs
+ * the old code (re-fetching in loops, restoring course pages), so these routes only answer clients that
+ * identify themselves as the current build. Older tabs get a 426 and must be reloaded; they can no
+ * longer add hits to the student's eClass usage log.
+ */
+export const CLIENT_HEADER = "x-myclass-client";
+export const MIN_CLIENT_BUILD = 240;
+const countedFetchPaths = [
+  "/api/announcements",
+  "/api/assignments",
+  "/api/assignments/*",
+  "/api/courses/:code/tools",
+  "/api/courses/:code/documents",
+  "/api/courses/:code/documents/summary",
+  "/api/courses/:code/documents/study",
+];
+const requireCurrentClient: MiddlewareHandler = async (c, next) => {
+  const isFeed = c.req.path === "/api/announcements" || c.req.path === "/api/assignments";
+  if (isFeed && !c.req.query("course")) return next(); // hit-free feeds: no course page involved
+  const build = Number(c.req.header(CLIENT_HEADER) ?? 0);
+  if (!(build >= MIN_CLIENT_BUILD)) {
+    return c.json({ error: "Η εφαρμογή χρειάζεται ανανέωση. Φόρτωσε ξανά τη σελίδα.", code: "client_outdated" }, 426);
+  }
+  return next();
+};
+for (const p of countedFetchPaths) app.use(p, requireCurrentClient);
 
 app.onError((err, c) => {
   if (err instanceof HttpError) {
@@ -458,6 +486,8 @@ app.get("/api/assignments/:code/:id", async (c) => {
   const detail = await asStudent(() =>
     getConnectorForUser(u).getAssignmentDetail(c.req.param("code"), c.req.param("id")),
   );
+  // The detail page says whether it was handed in: Home and reminders learn it without another visit
+  if (detail.submitted) markDeadlineSubmitted(u, c.req.param("code"), c.req.param("id"));
   return c.json({ assignment: detail });
 });
 

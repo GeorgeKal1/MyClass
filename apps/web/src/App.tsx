@@ -992,6 +992,12 @@ function Workspace({
                 triage={triage}
                 onMeChanged={setMe}
                 assignments={activeCourseAssignments}
+                onAssignmentsLoaded={(code, list) =>
+                  setAssignments((prev) => [
+                    ...prev.filter((a) => a.courseCode !== code || !list.some((n) => n.id === a.id)),
+                    ...list,
+                  ])
+                }
                 focusAssignmentId={focusAssignmentId}
                 onOpenInbox={() => navigateTab("inbox", "left")}
                 onBack={goBack}
@@ -2499,6 +2505,7 @@ function CourseDetailView({
   triage,
   onMeChanged,
   assignments,
+  onAssignmentsLoaded,
   focusAssignmentId,
   onOpenInbox,
   onBack,
@@ -2513,6 +2520,8 @@ function CourseDetailView({
   onChangeSubTab: (t: "announcements" | "documents" | "assignments" | "info") => void;
   announcements: Announcement[];
   assignments: Assignment[];
+  /** The course page told which assignments were handed in: Home and the calendar learn it too. */
+  onAssignmentsLoaded?: (courseCode: string, list: Assignment[]) => void;
   focusAssignmentId?: string | null;
   onOpenInbox: () => void;
   onBack: () => void;
@@ -2556,7 +2565,9 @@ function CourseDetailView({
     void api
       .assignments(course.code)
       .then((r) => {
-        if (!cancelled) setCourseAssignments(r.assignments);
+        if (cancelled) return;
+        setCourseAssignments(r.assignments);
+        onAssignmentsLoaded?.(course.code, r.assignments);
       })
       .catch(() => {
         if (!cancelled && assignments.length === 0) setCourseAssignments([]);
