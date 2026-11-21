@@ -321,6 +321,8 @@ export interface UserSettings {
     reduceMotion: "system" | "on" | "off";
   };
   mutedCourses: string[];
+  /** Courses pinned to the top of the Courses list (course codes, in pin order). */
+  pinnedCourses?: string[];
   downloads: {
     /** How "download all courses" packages files. */
     allCoursesMode: "single-zip" | "zip-per-course";
@@ -437,6 +439,7 @@ export const SettingsPatch = z
       })
       .partial(),
     mutedCourses: z.array(z.string()),
+    pinnedCourses: z.array(z.string().max(60)).max(60),
     downloads: z.object({ allCoursesMode: z.enum(["single-zip", "zip-per-course"]) }),
     ai: z.object({ mode: z.enum(["server", "apiKey"]), model: z.string().max(80).optional().default("") }),
     departmentId: z.string().max(20),

@@ -355,6 +355,37 @@ describe("nothing but the student opens a page eClass counts", () => {
     expect(fake.sent).toEqual([]);
   });
 
+  it("the file preview reuses the copy the student just opened, and only it may be framed", async () => {
+    fake.sent.length = 0;
+    const p = `/api/courses/TMC106/documents/file?path=${encodeURIComponent("/Guide.pdf")}`;
+    const inline = await call(`${p}&inline=1`);
+    expect(inline.status).toBe(200);
+    await inline.arrayBuffer();
+    expect(inline.headers.get("content-disposition")).toMatch(/^inline;/);
+    expect(inline.headers.get("content-type")).toBe("application/pdf");
+    expect(inline.headers.get("x-frame-options")).toBe("SAMEORIGIN");
+    expect(inline.headers.get("content-security-policy")).toContain("frame-ancestors 'self'");
+    expect(inline.headers.get("content-security-policy")).not.toContain("script-src");
+    // Opened a moment ago: no second visit on eClass
+    expect(counted()).toEqual([]);
+
+    const download = await call(p);
+    await download.arrayBuffer();
+    expect(download.headers.get("content-disposition")).toMatch(/^attachment;/);
+    expect(download.headers.get("x-frame-options")).toBe("DENY");
+
+    // A PDF has no text preview: the app shows it in the frame instead
+    const text = await call(`/api/courses/TMC106/documents/preview?path=${encodeURIComponent("/Guide.pdf")}`);
+    expect(await text.json()).toMatchObject({ kind: "unsupported", name: "Guide.pdf" });
+  });
+
+  it("a course's own assignment page marks each assignment's hand-in state as known", async () => {
+    const res = await call("/api/assignments?course=TMC106");
+    const body = (await res.json()) as { assignments: Array<{ submissionKnown?: boolean }> };
+    expect(body.assignments.length).toBeGreaterThan(0);
+    expect(body.assignments.every((a) => a.submissionKnown === true)).toBe(true);
+  });
+
   it("does not retry a counted page that answers with HTML", async () => {
     fake.mode.announcementsAnswerHtml = true;
     const res = await call("/api/announcements?course=TMC106");
@@ -387,6 +418,7 @@ describe("tabs running the old app code", () => {
       "/api/assignments/TMC101/1",
       "/api/courses/TMC101/tools",
       "/api/courses/TMC101/documents",
+      "/api/courses/TMC101/documents/preview?path=%2Fa.docx",
     ]) {
       const res = await app.request(p, { headers: { Cookie: `myclass_sid=${SID}` } });
       expect(res.status, p).toBe(426);

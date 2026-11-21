@@ -47,19 +47,29 @@ export function relativeDue(iso: string, lang: Lang): string {
 
 type DueState = "submitted" | "overdue" | "unknown" | "soon" | "later";
 
+/**
+ * eClass' calendar feed lists deadlines but not hand-ins: only the course's own assignment page says
+ * what was submitted. Until that page has been read, an assignment is "not checked", never "pending".
+ */
+export function isUnchecked(a: Assignment): boolean {
+  return !a.submitted && a.submissionKnown !== true;
+}
+
 function dueState(a: Assignment, now = Date.now()): DueState {
   if (a.submitted) return "submitted";
-  if (!a.deadline) return "later";
+  if (!a.deadline) return isUnchecked(a) ? "unknown" : "later";
   const t = new Date(a.deadline).getTime();
   // Past and never seen on its course page: it may well have been handed in, so do not call it overdue
-  if (t < now) return a.submissionKnown === false ? "unknown" : "overdue";
+  if (t < now) return isUnchecked(a) ? "unknown" : "overdue";
+  if (isUnchecked(a)) return "unknown";
   return t - now < 3 * 86_400_000 ? "soon" : "later";
 }
 
 const DOT_CLASS: Record<DueState, string> = {
   submitted: "bg-[var(--ok)]",
   overdue: "bg-[var(--danger)]",
-  unknown: "bg-[var(--border)]",
+  // Hollow: the hand-in state is not known yet
+  unknown: "bg-transparent ring-[1.5px] ring-inset ring-[var(--muted)]",
   soon: "bg-[var(--warn)]",
   later: "bg-[var(--muted)]",
 };
@@ -73,13 +83,17 @@ export function DeadlineCalendar({
   assignments,
   loading,
   onOpenAssignment,
+  onCheckSubmissions,
 }: {
   lang: Lang;
   assignments: Assignment[];
   loading?: boolean;
   onOpenAssignment: (a: Assignment) => void;
+  /** Reads these courses' assignment pages (the student's own visits) to learn what was handed in. */
+  onCheckSubmissions?: (courseCodes: string[]) => Promise<void>;
 }) {
   const today = startOfDay(new Date());
+  const [checking, setChecking] = useState(false);
   const [month, setMonth] = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
   const [selected, setSelected] = useState<string | null>(null);
 
@@ -128,6 +142,8 @@ export function DeadlineCalendar({
         })
         .slice(0, 6);
   const undated = assignments.filter((a) => !a.deadline && !a.submitted);
+  // Courses whose shown deadlines have no known hand-in state yet (one check per course)
+  const uncheckedCodes = [...new Set([...agenda, ...(selected ? [] : undated)].filter(isUnchecked).map((a) => a.courseCode))];
 
   const monthLabel = month.toLocaleDateString(locale(lang), { month: "long", year: "numeric" });
   const selectedLabel = selected
@@ -220,7 +236,7 @@ export function DeadlineCalendar({
               ["soon", lang === "el" ? "< 3 ημέρες" : "< 3 days"],
               ["later", lang === "el" ? "Εκκρεμεί" : "Pending"],
               ["overdue", lang === "el" ? "Έληξε" : "Overdue"],
-              ["unknown", lang === "el" ? "Έληξε, δεν έχει ελεγχθεί" : "Ended, not checked"],
+              ["unknown", lang === "el" ? "Δεν ελέγχθηκε" : "Not checked"],
               ["submitted", lang === "el" ? "Παραδόθηκε" : "Submitted"],
             ] as const
           ).map(([k, label]) => (
@@ -233,8 +249,37 @@ export function DeadlineCalendar({
       </div>
 
       <div className="border-t border-[var(--border)] px-4 py-3 space-y-1">
-        <div className="text-xs font-medium text-[var(--muted)] capitalize mb-1">
-          {selectedLabel ?? (lang === "el" ? "Επόμενες προθεσμίες" : "Coming up")}
+        <div className="flex items-center justify-between gap-2 mb-1">
+          <div className="text-xs font-medium text-[var(--muted)] capitalize truncate">
+            {selectedLabel ?? (lang === "el" ? "Επόμενες προθεσμίες" : "Coming up")}
+          </div>
+          {onCheckSubmissions && uncheckedCodes.length > 0 && (
+            <button
+              type="button"
+              disabled={checking}
+              onClick={async () => {
+                setChecking(true);
+                try {
+                  await onCheckSubmissions(uncheckedCodes);
+                } finally {
+                  setChecking(false);
+                }
+              }}
+              title={
+                lang === "el"
+                  ? "Ανοίγει τη σελίδα εργασιών κάθε μαθήματος στο eClass για να δει τι έχεις παραδώσει (μετράει ως δική σου επίσκεψη)"
+                  : "Opens each course's assignment page on eClass to see what you handed in (counts as your own visit)"
+              }
+              className="shrink-0 whitespace-nowrap inline-flex items-center gap-1.5 px-2 py-1 -mr-1 rounded-lg text-xs font-medium text-[var(--accent-text)] hover:bg-[var(--accent-soft)] cursor-pointer disabled:opacity-60 disabled:cursor-default"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${checking ? "animate-spin" : ""}`} />
+              <span>
+                {checking
+                  ? lang === "el" ? "Έλεγχος…" : "Checking…"
+                  : lang === "el" ? "Έλεγχος" : "Check"}
+              </span>
+            </button>
+          )}
         </div>
         {agenda.length === 0 ? (
           <p className="text-sm text-[var(--muted)] py-2">
@@ -659,7 +704,18 @@ export function DocumentSummaryButton({
 
 const summaryMemo = new Map<string, string>();
 
-export function DocumentSummaryPanel({ lang, courseCode, path }: { lang: Lang; courseCode: string; path: string }) {
+export function DocumentSummaryPanel({
+  lang,
+  courseCode,
+  path,
+  embedded = false,
+}: {
+  lang: Lang;
+  courseCode: string;
+  path: string;
+  /** Inside the document window: no card of its own, roomier text. */
+  embedded?: boolean;
+}) {
   const key = `${courseCode}|${path}|${lang}`;
   const [summary, setSummary] = useState<string | null>(summaryMemo.get(key) ?? null);
   const [loading, setLoading] = useState(!summaryMemo.has(key));
@@ -684,12 +740,16 @@ export function DocumentSummaryPanel({ lang, courseCode, path }: { lang: Lang; c
   }, [key]);
 
   return (
-    <div className="mx-4 mb-3 rounded-xl bg-[var(--accent-soft)]/60 border border-[var(--accent)]/25 px-4 py-3">
-      <div className="flex items-center justify-between gap-2 mb-1.5">
-        <span className="text-xs font-semibold text-[var(--accent-text)] inline-flex items-center gap-1.5">
-          <ScrollText className="w-3.5 h-3.5" />
-          {lang === "el" ? "Σύνοψη AI" : "AI summary"}
-        </span>
+    <div className={embedded ? "" : "mx-4 mb-3 rounded-xl bg-[var(--accent-soft)]/60 border border-[var(--accent)]/25 px-4 py-3"}>
+      <div className={`flex items-center justify-between gap-2 ${embedded ? "mb-3" : "mb-1.5"}`}>
+        {embedded ? (
+          <span />
+        ) : (
+          <span className="text-xs font-semibold text-[var(--accent-text)] inline-flex items-center gap-1.5">
+            <ScrollText className="w-3.5 h-3.5" />
+            {lang === "el" ? "Σύνοψη AI" : "AI summary"}
+          </span>
+        )}
         {!loading && (
           <button
             onClick={() => load(true)}

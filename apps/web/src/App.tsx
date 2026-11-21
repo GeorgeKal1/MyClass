@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   ArrowUpRight,
   Bell,
@@ -26,6 +27,8 @@ import {
   Megaphone,
   Monitor,
   Moon,
+  Pin,
+  PinOff,
   RefreshCw,
   Search,
   Send,
@@ -64,10 +67,11 @@ import {
   CourseToolsPanel,
   DeadlineCalendar,
   DocumentSummaryButton,
-  DocumentSummaryPanel,
 } from "./features";
 import { StatsView } from "./stats";
-import { StudyButton, StudyPanel } from "./study";
+import { StudyButton } from "./study";
+import { aiReadable, DocumentViewer, type DocTab } from "./docviewer";
+import { rubberBand } from "./gestures";
 import { InstallAppPrompt, isInstalledApp, promptInstall, useCanInstall } from "./install";
 
 type Tab = "home" | "courses" | "inbox" | "assistant" | "stats" | "settings";
@@ -494,6 +498,61 @@ function Workspace({
     setSyncing(false);
   }, [showToast]);
 
+  /** A course's own assignment page was read: it says what was handed in, so Home and the calendar follow it. */
+  const mergeCourseAssignments = useCallback((code: string, list: Assignment[]) => {
+    if (list.length === 0) return;
+    setAssignments((prev) => {
+      const titles = new Map(prev.filter((a) => a.courseCode === code).map((a) => [a.id, a.courseTitle]));
+      const fresh = list.map((n) => ({ ...n, courseTitle: n.courseTitle ?? titles.get(n.id) ?? prev.find((a) => a.courseCode === code)?.courseTitle }));
+      return [...prev.filter((a) => a.courseCode !== code || !list.some((n) => n.id === a.id)), ...fresh];
+    });
+  }, []);
+
+  /**
+   * The student pressed "check" on Home: read the assignment page of each course with a deadline whose
+   * hand-in state is unknown. One course at a time; each is the student's own visit to that course.
+   */
+  const checkSubmissions = useCallback(
+    async (codes: string[]) => {
+      let failed = 0;
+      for (const code of codes) {
+        try {
+          const r = await api.assignments(code);
+          if (r.assignments.length === 0) failed++;
+          mergeCourseAssignments(code, r.assignments);
+        } catch {
+          failed++;
+        }
+      }
+      if (failed > 0) {
+        showToast(
+          lang === "el"
+            ? "Δεν ήταν δυνατός ο έλεγχος σε κάποιο μάθημα. Δοκίμασε ξανά αργότερα."
+            : "Could not check one of the courses. Try again later.",
+        );
+      }
+    },
+    [mergeCourseAssignments, showToast, lang],
+  );
+
+  /** Pinned courses live in the account settings, so a pin on the PC also shows on the phone. */
+  const pinnedCourses = useMemo(() => me.settings.pinnedCourses ?? [], [me.settings.pinnedCourses]);
+  const togglePin = useCallback(
+    async (code: string) => {
+      const before = me;
+      const next = pinnedCourses.includes(code) ? pinnedCourses.filter((c) => c !== code) : [...pinnedCourses, code];
+      setMe({ ...me, settings: { ...me.settings, pinnedCourses: next } });
+      try {
+        const res = await api.patchSettings({ pinnedCourses: next });
+        setMe(res.me);
+      } catch (err) {
+        setMe(before);
+        showToast((err as Error).message);
+      }
+    },
+    [me, pinnedCourses, setMe, showToast],
+  );
+
   /** Everything the Refresh button does: poll eClass now, then reload every list. */
   const syncNow = useCallback(async () => {
     setSyncing(true);
@@ -914,7 +973,7 @@ function Workspace({
 
         {/* Toast banner */}
         {toast && (
-          <div className="enter fixed bottom-24 md:bottom-6 right-4 md:right-6 z-50 px-4 py-2.5 rounded-xl bg-[var(--surface-2)] border border-[var(--border)] shadow-lg shadow-black/10 text-xs font-medium flex items-center gap-2">
+          <div className="enter fixed bottom-24 md:bottom-6 right-4 md:right-6 z-[80] px-4 py-2.5 rounded-xl bg-[var(--surface-2)] border border-[var(--border)] shadow-lg shadow-black/10 text-xs font-medium flex items-center gap-2">
             <span>{toast}</span>
             <button onClick={() => setToast(null)} className="text-[var(--muted)] hover:text-[var(--text)]">
               <X className="w-3.5 h-3.5" />
@@ -955,6 +1014,7 @@ function Workspace({
                 messages={messages}
                 lastPollAt={lastPollAt}
                 onOpenCourse={openCourse}
+                onCheckSubmissions={checkSubmissions}
                 onOpenEnrolledCourses={() => navigateTab("courses", "left", "enrolled")}
                 onOpenAllCourses={() => navigateTab("courses", "left", "all")}
                 onOpenInbox={() => navigateTab("inbox", "left")}
@@ -979,6 +1039,8 @@ function Workspace({
                   await Promise.all([refreshAllData(), loadCatalog()]);
                 }}
                 showToast={showToast}
+                pinned={pinnedCourses}
+                onTogglePin={(code) => void togglePin(code)}
               />
             )}
 
@@ -992,12 +1054,7 @@ function Workspace({
                 triage={triage}
                 onMeChanged={setMe}
                 assignments={activeCourseAssignments}
-                onAssignmentsLoaded={(code, list) =>
-                  setAssignments((prev) => [
-                    ...prev.filter((a) => a.courseCode !== code || !list.some((n) => n.id === a.id)),
-                    ...list,
-                  ])
-                }
+                onAssignmentsLoaded={mergeCourseAssignments}
                 focusAssignmentId={focusAssignmentId}
                 onOpenInbox={() => navigateTab("inbox", "left")}
                 onBack={goBack}
@@ -1243,12 +1300,6 @@ function NotificationsBell({
   );
 }
 
-/** Pages rubber-band past the first/last tab: the further you pull, the more it resists. */
-function rubberBand(dx: number, width: number): number {
-  const c = 0.55;
-  return Math.sign(dx) * (1 - 1 / ((Math.abs(dx) * c) / width + 1)) * width;
-}
-
 /** Shared tooltip timing: only the first tooltip waits; while one was shown recently, the next opens at once. */
 const TOOLTIP_DELAY_MS = 500;
 const TOOLTIP_WARM_MS = 600;
@@ -1257,17 +1308,27 @@ let tooltipWarmUntil = 0;
 function IconButton({
   label,
   onClick,
+  href,
   children,
   disabled,
   active,
+  tone = "default",
+  pressed,
   tooltipSide = "bottom",
 }: {
   label: string;
-  onClick: () => void;
+  onClick?: () => void;
+  /** A link instead of a button (file downloads). */
+  href?: string;
   children: React.ReactNode;
   disabled?: boolean;
   active?: boolean;
-  tooltipSide?: "top" | "bottom";
+  /** "danger": turns red on hover (leaving a course). */
+  tone?: "default" | "danger";
+  /** A toggle (pin): says whether it is on. */
+  pressed?: boolean;
+  /** "left": beside the icon, for rows inside clipped cards. */
+  tooltipSide?: "top" | "bottom" | "left";
 }) {
   const [tip, setTip] = useState<"hidden" | "delayed" | "instant">("hidden");
   const timer = useRef<number | null>(null);
@@ -1291,33 +1352,51 @@ function IconButton({
     });
   };
 
+  const className = `relative inline-flex p-2 rounded-lg transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-default ${
+    active
+      ? "text-[var(--accent)] bg-[var(--accent-soft)]"
+      : tone === "danger"
+        ? "text-[var(--muted)] hover:text-[var(--danger)] hover:bg-[var(--danger-soft)]"
+        : "text-[var(--muted)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]"
+  }`;
+  const tooltip = tip !== "hidden" && (
+    <span
+      role="tooltip"
+      className={`tooltip ${
+        tooltipSide === "left"
+          ? "right-full mr-1.5 top-1/2 -translate-y-1/2"
+          : `left-1/2 -translate-x-1/2 ${tooltipSide === "top" ? "bottom-full mb-2" : "top-full mt-2"}`
+      }`}
+      style={tip === "instant" ? { animation: "none" } : undefined}
+    >
+      {label}
+    </span>
+  );
+
+  if (href) {
+    return (
+      <a href={href} aria-label={label} onClick={hide} onPointerEnter={show} onPointerLeave={hide} className={className}>
+        {children}
+        {tooltip}
+      </a>
+    );
+  }
   return (
     <button
       type="button"
       aria-label={label}
+      aria-pressed={pressed}
       onClick={() => {
         hide();
-        onClick();
+        onClick?.();
       }}
       onPointerEnter={show}
       onPointerLeave={hide}
       disabled={disabled}
-      className={`relative p-2 rounded-lg transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-default ${
-        active
-          ? "text-[var(--accent)] bg-[var(--accent-soft)]"
-          : "text-[var(--muted)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]"
-      }`}
+      className={className}
     >
       {children}
-      {tip !== "hidden" && (
-        <span
-          role="tooltip"
-          className={`tooltip left-1/2 -translate-x-1/2 ${tooltipSide === "top" ? "bottom-full mb-2" : "top-full mt-2"}`}
-          style={tip === "instant" ? { animation: "none" } : undefined}
-        >
-          {label}
-        </span>
-      )}
+      {tooltip}
     </button>
   );
 }
@@ -1492,6 +1571,7 @@ function HomeView({
   messages,
   lastPollAt,
   onOpenCourse,
+  onCheckSubmissions,
   onOpenEnrolledCourses,
   onOpenAllCourses,
   onOpenInbox,
@@ -1511,6 +1591,7 @@ function HomeView({
     sub?: "announcements" | "documents" | "assignments" | "info",
     assignmentId?: string,
   ) => void;
+  onCheckSubmissions?: (courseCodes: string[]) => Promise<void>;
   onOpenEnrolledCourses: () => void;
   onOpenAllCourses: () => void;
   onOpenInbox: () => void;
@@ -1589,6 +1670,7 @@ function HomeView({
             assignments={assignments}
             loading={assignmentsLoading}
             onOpenAssignment={(a) => onOpenCourse(a.courseCode, "assignments", a.id)}
+            onCheckSubmissions={onCheckSubmissions}
           />
 
           {unreadMessages.length > 0 && (
@@ -1918,6 +2000,8 @@ function CoursesView({
   onSelectCourse,
   onChanged,
   showToast,
+  pinned = [],
+  onTogglePin,
 }: {
   lang: Lang;
   courses: Course[];
@@ -1932,6 +2016,9 @@ function CoursesView({
   onSelectCourse: (code: string, sub?: "announcements" | "documents" | "assignments" | "info") => void;
   onChanged: () => Promise<void>;
   showToast: (m: string) => void;
+  /** Course codes pinned to the top, in pin order. */
+  pinned?: string[];
+  onTogglePin?: (code: string) => void;
 }) {
   const tr = (k: DictKey) => t(lang, k);
   // Default view is the classes the student is subscribed to ("enrolled")
@@ -1941,6 +2028,50 @@ function CoursesView({
   const [searchQuery, setSearchQuery] = useState("");
   const [busyCode, setBusyCode] = useState<string | null>(null);
   const { join, dialog: courseCodeDialog } = useJoinCourse({ lang, showToast, onJoined: onChanged });
+  /** Phone: the course whose long-press menu is open */
+  const [sheetCourse, setSheetCourse] = useState<CatalogCourse | null>(null);
+  // The pinned group can be folded away; remembered on this device
+  const [pinnedOpen, setPinnedOpen] = useState(() => {
+    try {
+      return localStorage.getItem(PINNED_FOLDED_KEY) !== "1";
+    } catch {
+      return true;
+    }
+  });
+  const togglePinnedOpen = () =>
+    setPinnedOpen((open) => {
+      try {
+        localStorage.setItem(PINNED_FOLDED_KEY, open ? "1" : "0");
+      } catch {
+        /* private mode: the fold just isn't remembered */
+      }
+      return !open;
+    });
+
+  const leave = async (c: CatalogCourse) => {
+    const ok = window.confirm(
+      lang === "el" ? `Απεγγραφή από το μάθημα «${c.title}» στο eClass;` : `Unenroll from "${c.title}" on eClass?`,
+    );
+    if (!ok) return;
+    setBusyCode(c.code);
+    try {
+      await api.unenroll(c.code);
+      showToast(lang === "el" ? `Απεγγράφηκες από ${c.title}` : `Unenrolled from ${c.title}`);
+      await onChanged();
+    } catch (err) {
+      showToast((err as Error).message);
+    } finally {
+      setBusyCode(null);
+    }
+  };
+  const enroll = async (c: CatalogCourse) => {
+    setBusyCode(c.code);
+    try {
+      await join(c);
+    } finally {
+      setBusyCode(null);
+    }
+  };
 
   useEffect(() => {
     setViewMode(initialViewMode);
@@ -1988,12 +2119,9 @@ function CoursesView({
   }, [viewMode, catalog, enrolledCourses, enrolledCodes]);
 
   // Filter by search query and selected semester
-  const filteredSubjects = useMemo(() => {
+  const searchMatched = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return sourceSubjects.filter((s) => {
-      if (selectedSemester !== "all" && (s.semesterIndex ?? 9) !== selectedSemester) {
-        return false;
-      }
       if (!q) return true;
       return (
         s.title.toLowerCase().includes(q) ||
@@ -2004,7 +2132,27 @@ function CoursesView({
         (s.semesterFolder ?? "").toLowerCase().includes(q)
       );
     });
-  }, [sourceSubjects, selectedSemester, searchQuery]);
+  }, [sourceSubjects, searchQuery]);
+
+  // Pinned courses sit above the semesters, in pin order. The search narrows them; the semester
+  // filter does not (pinned means "always on top").
+  const pinnedSubjects = useMemo(
+    () =>
+      pinned
+        .map((code) => searchMatched.find((s) => s.code === code))
+        .filter((s): s is CatalogCourse => Boolean(s)),
+    [pinned, searchMatched],
+  );
+  const pinnedShown = useMemo(() => new Set(pinnedSubjects.map((s) => s.code)), [pinnedSubjects]);
+
+  const filteredSubjects = useMemo(
+    () =>
+      searchMatched.filter(
+        (s) =>
+          !pinnedShown.has(s.code) && (selectedSemester === "all" || (s.semesterIndex ?? 9) === selectedSemester),
+      ),
+    [searchMatched, pinnedShown, selectedSemester],
+  );
 
   // Count per semester for dropdown options
   const semesterCounts = useMemo(() => {
@@ -2251,7 +2399,7 @@ function CoursesView({
               : "Loading..."}
           </span>
         </div>
-      ) : groupedBySemester.length === 0 ? (
+      ) : groupedBySemester.length === 0 && pinnedSubjects.length === 0 ? (
         <div className="p-8 rounded-2xl border border-dashed border-[var(--border)] bg-[var(--surface)]/40 text-center space-y-3">
           <p className="text-sm text-[var(--muted)]">
             {viewMode === "enrolled" && enrolledCourses.length === 0
@@ -2289,206 +2437,386 @@ function CoursesView({
           )}
         </div>
       ) : (
-        <div className="flex flex-col gap-3">
-          {groupedBySemester.map(([semIndex, list]) => {
-            const meta =
-              SEMESTER_META.find((m) => m.index === semIndex) ??
-              SEMESTER_META[SEMESTER_META.length - 1];
-            const isOpen = !collapsedSemesters.has(semIndex);
-
-            return (
-              <section
-                key={semIndex}
-                className="flex flex-col rounded-2xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden transition-colors"
+        <div className="flex flex-col gap-4">
+          {pinnedSubjects.length > 0 && (
+            <section aria-labelledby="pinned-courses-title" className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
+              <button
+                type="button"
+                onClick={togglePinnedOpen}
+                aria-expanded={pinnedOpen}
+                className="w-full px-4 py-3 flex items-center gap-2.5 text-left hover:bg-[var(--surface-2)] cursor-pointer"
               >
-                {/* Minimalist Collapsible Semester Dropdown Header */}
-                <div
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => toggleSemesterAccordion(semIndex)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      toggleSemesterAccordion(semIndex);
-                    }
-                  }}
-                  className="px-4 py-3 sm:py-2.5 flex items-center justify-between gap-3 bg-[var(--surface)] hover:bg-[var(--surface-2)]/70 transition-colors cursor-pointer select-none"
-                >
-                  <div className="flex items-center gap-2.5 min-w-0">
+                <Pin className="w-4 h-4 text-[var(--accent)] shrink-0" />
+                <span id="pinned-courses-title" className="font-display text-[0.9375rem] font-semibold">
+                  {lang === "el" ? "Καρφιτσωμένα" : "Pinned"}
+                </span>
+                <span className="text-xs text-[var(--muted)] tabular-nums">{pinnedSubjects.length}</span>
+                <span className="ml-auto inline-flex items-center gap-1 text-xs text-[var(--muted)]">
+                  <span className="hidden sm:inline">
+                    {pinnedOpen ? (lang === "el" ? "Ελαχιστοποίηση" : "Minimize") : lang === "el" ? "Εμφάνιση" : "Show"}
+                  </span>
+                  <ChevronDown className={`w-4 h-4 transition-transform duration-200 ${pinnedOpen ? "rotate-180" : ""}`} />
+                </span>
+              </button>
+              <div className="accordion" data-open={pinnedOpen} inert={!pinnedOpen}>
+                <ul className="border-t border-[var(--border)] divide-y divide-[var(--border)]">
+                  {pinnedSubjects.map((c) => (
+                    <CourseRow
+                      key={c.code}
+                      lang={lang}
+                      course={c}
+                      showEnrolledMark={viewMode === "all"}
+                      pinned
+                      busy={busyCode === c.code}
+                      onOpen={() => onSelectCourse(c.code, "documents")}
+                      onTogglePin={onTogglePin ? () => onTogglePin(c.code) : undefined}
+                      onLeave={() => void leave(c)}
+                      onJoin={() => void enroll(c)}
+                      onLongPress={() => setSheetCourse(c)}
+                    />
+                  ))}
+                </ul>
+              </div>
+            </section>
+          )}
+
+          {groupedBySemester.map(([semIndex, list]) => {
+            const meta = SEMESTER_META.find((m) => m.index === semIndex) ?? SEMESTER_META[SEMESTER_META.length - 1];
+            const isOpen = !collapsedSemesters.has(semIndex);
+            return (
+              <section key={semIndex} className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
+                <div className="flex items-center gap-2 pr-2 hover:bg-[var(--surface-2)]">
+                  <button
+                    type="button"
+                    onClick={() => toggleSemesterAccordion(semIndex)}
+                    aria-expanded={isOpen}
+                    className="flex-1 min-w-0 pl-4 py-3 flex items-center gap-2.5 text-left cursor-pointer"
+                  >
                     <ChevronRight
                       className={`w-4 h-4 text-[var(--muted)] shrink-0 transition-transform duration-200 ${isOpen ? "rotate-90" : ""}`}
                     />
-                    <div className="flex items-baseline gap-2 min-w-0">
-                      <span className="text-sm font-medium truncate">{lang === "el" ? meta.labelEl : meta.labelEn}</span>
-                      <span className="text-xs text-[var(--muted)] tabular-nums">{list.length}</span>
-                    </div>
-                  </div>
-
-                  <a
-                    href={`/api/documents/zip-all?semester=${semIndex}`}
-                    onClick={(e) => e.stopPropagation()}
-                    title={`${tr("downloadSemesterZip")} (${meta.folder}.zip)`}
-                    aria-label={`${tr("downloadSemesterZip")} (${meta.folder}.zip)`}
-                    className="hidden sm:inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors shrink-0"
-                  >
-                    <Download className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">.zip</span>
-                  </a>
+                    <span className="font-display text-[0.9375rem] font-semibold truncate">
+                      {lang === "el" ? meta.labelEl : meta.labelEn}
+                    </span>
+                    <span className="text-xs text-[var(--muted)] tabular-nums">{list.length}</span>
+                  </button>
+                  <span className="hidden sm:inline-flex">
+                    <IconButton
+                      label={`${tr("downloadSemesterZip")} (${meta.folder}.zip)`}
+                      href={`/api/documents/zip-all?semester=${semIndex}`}
+                      tooltipSide="left"
+                    >
+                      <Download className="w-4 h-4" />
+                    </IconButton>
+                  </span>
                 </div>
-
-                {/* Expandable Minimalist Course List */}
                 <div className="accordion" data-open={isOpen} inert={!isOpen}>
-                  <div className="border-t border-[var(--border)] divide-y divide-[var(--border)]">
-                    {list.map((c) => {
-                      const isBusy = busyCode === c.code;
-                      return (
-                        <div
-                          key={c.code}
-                          className={`pl-4 pr-2 sm:pr-4 py-3 sm:py-2.5 flex items-center justify-between gap-2 sm:gap-3 hover:bg-[var(--surface-2)]/40 active:bg-[var(--surface-2)]/70 sm:active:bg-transparent transition-colors`}
-                        >
-                          {/* Title and meta. On a phone the whole block opens the course; the title
-                              gets two full lines, and code + teacher share one quiet line under it. */}
-                          <div
-                            role="link"
-                            tabIndex={0}
-                            onClick={() => onSelectCourse(c.code, "documents")}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") onSelectCourse(c.code, "documents");
-                            }}
-                            className="min-w-0 flex-1 cursor-pointer group rounded-md"
-                          >
-                            <div className="flex items-baseline gap-2 min-w-0">
-                              <span className="hidden sm:inline text-xs text-[var(--muted)] font-mono shrink-0">
-                                {c.publicCode ?? c.code}
-                              </span>
-                              <h3
-                                className={`text-[0.9375rem] leading-snug sm:text-sm font-medium group-hover:text-[var(--accent-text)] transition-colors line-clamp-2 sm:line-clamp-none sm:truncate ${
-                                  isAllCaps(c.title) ? "caps-title" : ""
-                                }`}
-                              >
-                                {c.title}
-                              </h3>
-                              {/* In "My courses" every row is enrolled, so the mark only shows in "All" */}
-                              {c.enrolled && viewMode === "all" && (
-                                <span className="hidden sm:inline-flex text-[0.6875rem] px-1.5 py-0.5 rounded-full bg-[var(--ok-soft)] text-[var(--ok)] font-medium items-center gap-1 shrink-0">
-                                  <CheckCircle2 className="w-2.5 h-2.5" />
-                                  <span>{tr("enrolledBadge")}</span>
-                                </span>
-                              )}
-                            </div>
-
-                            <div className="mt-1 sm:mt-0.5 flex items-center gap-1.5 text-xs text-[var(--muted)] min-w-0">
-                              {c.enrolled && viewMode === "all" && (
-                                <CheckCircle2
-                                  className="sm:hidden w-3.5 h-3.5 shrink-0 text-[var(--ok)]"
-                                  aria-label={tr("enrolledBadge")}
-                                />
-                              )}
-                              <span className="sm:hidden font-mono shrink-0">{c.publicCode ?? c.code}</span>
-                              <span aria-hidden className="sm:hidden">
-                                ·
-                              </span>
-                              <User className="hidden sm:block w-3 h-3 shrink-0" />
-                              <span className="truncate">
-                                {c.professor ||
-                                  (lang === "el" ? "Διδάσκων Τμήματος" : "Department Instructor")}
-                              </span>
-                            </div>
-                          </div>
-
-                          {/* Actions: labelled on wider screens; on a phone only join/leave (downloads live inside the course) */}
-                          <div className="flex items-center justify-end gap-1 sm:gap-1.5 shrink-0">
-                            <button
-                              onClick={() => onSelectCourse(c.code, "documents")}
-                              className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent-soft)] text-[var(--accent)] hover:opacity-90 cursor-pointer"
-                            >
-                              <FolderOpen className="w-3.5 h-3.5" />
-                              <span>{tr("viewFilesBtn")}</span>
-                            </button>
-
-                            <a
-                              href={`/api/courses/${encodeURIComponent(c.code)}/documents/zip`}
-                              title={tr("downloadCourseZip")}
-                              aria-label={tr("downloadCourseZip")}
-                              className="hidden sm:inline-flex items-center justify-center sm:p-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
-                            >
-                              <Download className="w-3.5 h-3.5" />
-                            </a>
-
-                            {c.enrolled ? (
-                              <button
-                                disabled={isBusy}
-                                title={tr("unenrollCourse")}
-                                onClick={async () => {
-                                  const ok = window.confirm(
-                                    lang === "el"
-                                      ? `Απεγγραφή από το μάθημα «${c.title}» στο eClass;`
-                                      : `Unenroll from "${c.title}" on eClass?`,
-                                  );
-                                  if (!ok) return;
-                                  setBusyCode(c.code);
-                                  try {
-                                    await api.unenroll(c.code);
-                                    showToast(
-                                      lang === "el"
-                                        ? `Απεγγράφηκες από ${c.title}`
-                                        : `Unenrolled from ${c.title}`,
-                                    );
-                                    await onChanged();
-                                  } catch (err) {
-                                    showToast((err as Error).message);
-                                  } finally {
-                                    setBusyCode(null);
-                                  }
-                                }}
-                                aria-label={tr("unenrollCourse")}
-                                className="inline-flex items-center justify-center gap-1 w-9 h-9 sm:w-auto sm:h-auto sm:px-2.5 sm:py-1.5 rounded-lg text-xs font-medium hover:bg-[var(--danger-soft)] text-[var(--muted)] hover:text-[var(--danger)] cursor-pointer disabled:opacity-50"
-                              >
-                                <UserMinus className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
-                                <span className="hidden sm:inline">{lang === "el" ? "Απεγγραφή" : "Leave"}</span>
-                              </button>
-                            ) : (
-                              <button
-                                disabled={isBusy || c.locked}
-                                onClick={async () => {
-                                  setBusyCode(c.code);
-                                  try {
-                                    await join(c);
-                                  } finally {
-                                    setBusyCode(null);
-                                  }
-                                }}
-                                title={
-                                  c.locked
-                                    ? lang === "el" ? "Οι εγγραφές είναι κλειστές" : "Registration is closed"
-                                    : c.needsPassword
-                                      ? lang === "el" ? "Θέλει κωδικό εγγραφής" : "Needs a registration code"
-                                      : undefined
-                                }
-                                aria-label={tr("enrollBtn")}
-                                className="inline-flex items-center justify-center gap-1 w-9 h-9 sm:w-auto sm:h-auto sm:px-2.5 sm:py-1.5 rounded-lg text-xs font-medium bg-[var(--surface-2)] hover:bg-[var(--accent)] hover:text-[var(--on-accent)] transition-colors cursor-pointer disabled:opacity-40"
-                              >
-                                {c.needsPassword ? (
-                                  <KeyRound className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
-                                ) : (
-                                  <UserPlus className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
-                                )}
-                                <span className="hidden sm:inline">{tr("enrollBtn")}</span>
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
+                  <ul className="border-t border-[var(--border)] divide-y divide-[var(--border)]">
+                    {list.map((c) => (
+                      <CourseRow
+                        key={c.code}
+                        lang={lang}
+                        course={c}
+                        showEnrolledMark={viewMode === "all"}
+                        pinned={false}
+                        busy={busyCode === c.code}
+                        onOpen={() => onSelectCourse(c.code, "documents")}
+                        onTogglePin={onTogglePin && c.enrolled ? () => onTogglePin(c.code) : undefined}
+                        onLeave={() => void leave(c)}
+                        onJoin={() => void enroll(c)}
+                        onLongPress={() => setSheetCourse(c)}
+                      />
+                    ))}
+                  </ul>
                 </div>
               </section>
             );
           })}
+
+          {pinned.length === 0 && onTogglePin && viewMode === "enrolled" && (
+            <p className="sm:hidden text-xs text-[var(--muted)] text-center px-4">
+              {lang === "el"
+                ? "Κράτα πατημένο ένα μάθημα για να το καρφιτσώσεις στην κορυφή."
+                : "Press and hold a course to pin it to the top."}
+            </p>
+          )}
         </div>
       )}
 
+      {sheetCourse && (
+        <CourseActionSheet
+          lang={lang}
+          course={sheetCourse}
+          pinned={pinned.includes(sheetCourse.code)}
+          onClose={() => setSheetCourse(null)}
+          onTogglePin={onTogglePin && sheetCourse.enrolled ? () => onTogglePin(sheetCourse.code) : undefined}
+          onOpen={() => onSelectCourse(sheetCourse.code, "documents")}
+          onLeave={() => void leave(sheetCourse)}
+          onJoin={() => void enroll(sheetCourse)}
+        />
+      )}
     </div>
+  );
+}
+
+/* ================================================================== */
+/* Courses list pieces: a row, its long-press menu (phones)            */
+/* ================================================================== */
+
+const PINNED_FOLDED_KEY = "myclass.pinnedFolded";
+
+/**
+ * Touch press-and-hold. Fires once after `ms` if the finger stays put (a scroll or swipe cancels
+ * it), and swallows the click that follows so the row doesn't also open. Mouse is left alone.
+ */
+function useLongPress(onLongPress: () => void, ms = 450) {
+  const timer = useRef<number | null>(null);
+  const origin = useRef<{ x: number; y: number } | null>(null);
+  const fired = useRef(false);
+  const touch = useRef(false);
+  const clear = () => {
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = null;
+    origin.current = null;
+  };
+  useEffect(() => clear, []);
+  return {
+    onPointerDown: (e: React.PointerEvent) => {
+      touch.current = e.pointerType !== "mouse";
+      fired.current = false;
+      if (!touch.current) return;
+      origin.current = { x: e.clientX, y: e.clientY };
+      timer.current = window.setTimeout(() => {
+        fired.current = true;
+        timer.current = null;
+        navigator.vibrate?.(10);
+        onLongPress();
+      }, ms);
+    },
+    onPointerMove: (e: React.PointerEvent) => {
+      const o = origin.current;
+      if (o && Math.hypot(e.clientX - o.x, e.clientY - o.y) > 10) clear();
+    },
+    onPointerUp: clear,
+    onPointerCancel: clear,
+    onPointerLeave: clear,
+    // Android opens its own menu on a long touch; the course menu replaces it
+    onContextMenu: (e: React.MouseEvent) => {
+      if (touch.current) e.preventDefault();
+    },
+    onClickCapture: (e: React.MouseEvent) => {
+      if (fired.current) {
+        e.preventDefault();
+        e.stopPropagation();
+        fired.current = false;
+      }
+    },
+  };
+}
+
+function CourseRow({
+  lang,
+  course: c,
+  showEnrolledMark,
+  pinned,
+  busy,
+  onOpen,
+  onTogglePin,
+  onLeave,
+  onJoin,
+  onLongPress,
+}: {
+  lang: Lang;
+  course: CatalogCourse;
+  showEnrolledMark: boolean;
+  pinned: boolean;
+  busy: boolean;
+  onOpen: () => void;
+  onTogglePin?: () => void;
+  onLeave: () => void;
+  onJoin: () => void;
+  onLongPress: () => void;
+}) {
+  const tr = (k: DictKey) => t(lang, k);
+  const press = useLongPress(onLongPress);
+  return (
+    <li className="group flex items-center gap-2 pl-4 pr-2 hover:bg-[var(--surface-2)] active:bg-[var(--surface-2)] sm:active:bg-[var(--surface-2)]">
+      {/* Title on its own line; code and teacher share a quiet second line */}
+      <button
+        type="button"
+        onClick={onOpen}
+        {...press}
+        className="long-press min-w-0 flex-1 py-3 text-left cursor-pointer rounded-md"
+      >
+        <span className="flex items-center gap-2 min-w-0">
+          <span
+            className={`text-[0.9375rem] leading-snug font-medium text-[var(--text)] group-hover:text-[var(--accent-text)] line-clamp-2 sm:line-clamp-1 ${
+              isAllCaps(c.title) ? "caps-title" : ""
+            }`}
+          >
+            {c.title}
+          </span>
+        </span>
+        <span className="mt-0.5 flex items-center gap-1.5 text-xs text-[var(--muted)] min-w-0">
+          {c.enrolled && showEnrolledMark && (
+            <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-[var(--ok)]" aria-label={tr("enrolledBadge")} />
+          )}
+          <span className="font-mono shrink-0">{c.publicCode ?? c.code}</span>
+          <span aria-hidden>·</span>
+          <span className="truncate">{c.professor || (lang === "el" ? "Διδάσκων Τμήματος" : "Department Instructor")}</span>
+        </span>
+      </button>
+
+      {/* Desktop: quiet icon actions. Phones: join stays (the main action in "All"); the rest is in the long-press menu */}
+      <div className="flex items-center gap-0.5 shrink-0">
+        {onTogglePin && (
+          <span className="hidden sm:inline-flex">
+            <IconButton
+              label={pinned ? (lang === "el" ? "Ξεκαρφίτσωμα" : "Unpin") : lang === "el" ? "Καρφίτσωμα στην κορυφή" : "Pin to top"}
+              onClick={onTogglePin}
+              active={pinned}
+              pressed={pinned}
+              tooltipSide="left"
+            >
+              {pinned ? <PinOff className="w-4 h-4" /> : <Pin className="w-4 h-4" />}
+            </IconButton>
+          </span>
+        )}
+        <span className="hidden sm:inline-flex">
+          <IconButton
+            label={tr("downloadCourseZip")}
+            href={`/api/courses/${encodeURIComponent(c.code)}/documents/zip`}
+            tooltipSide="left"
+          >
+            <Download className="w-4 h-4" />
+          </IconButton>
+        </span>
+        {c.enrolled ? (
+          <span className="hidden sm:inline-flex">
+            <IconButton label={tr("unenrollCourse")} onClick={onLeave} disabled={busy} tone="danger" tooltipSide="left">
+              <UserMinus className="w-4 h-4" />
+            </IconButton>
+          </span>
+        ) : (
+          <button
+            type="button"
+            disabled={busy || c.locked}
+            onClick={onJoin}
+            title={
+              c.locked
+                ? lang === "el" ? "Οι εγγραφές είναι κλειστές" : "Registration is closed"
+                : c.needsPassword
+                  ? lang === "el" ? "Θέλει κωδικό εγγραφής" : "Needs a registration code"
+                  : undefined
+            }
+            aria-label={tr("enrollBtn")}
+            className="inline-flex items-center justify-center gap-1.5 w-9 h-9 sm:w-auto sm:h-8 sm:px-3 rounded-lg text-xs font-medium border border-[var(--border)] text-[var(--text)] hover:border-[var(--accent)] hover:text-[var(--accent-text)] cursor-pointer disabled:opacity-40 disabled:cursor-default"
+          >
+            {busy ? (
+              <RefreshCw className="w-4 h-4 sm:w-3.5 sm:h-3.5 animate-spin" />
+            ) : c.needsPassword ? (
+              <KeyRound className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
+            ) : (
+              <UserPlus className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
+            )}
+            <span className="hidden sm:inline">{tr("enrollBtn")}</span>
+          </button>
+        )}
+      </div>
+    </li>
+  );
+}
+
+/** Phone menu for one course, opened by pressing and holding its row. */
+function CourseActionSheet({
+  lang,
+  course: c,
+  pinned,
+  onClose,
+  onTogglePin,
+  onOpen,
+  onLeave,
+  onJoin,
+}: {
+  lang: Lang;
+  course: CatalogCourse;
+  pinned: boolean;
+  onClose: () => void;
+  onTogglePin?: () => void;
+  onOpen: () => void;
+  onLeave: () => void;
+  onJoin: () => void;
+}) {
+  const tr = (k: DictKey) => t(lang, k);
+  const firstRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    firstRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const run = (fn: () => void) => () => {
+    onClose();
+    fn();
+  };
+  const item = "w-full flex items-center gap-3 px-4 min-h-12 py-2 rounded-xl text-[0.9375rem] text-left cursor-pointer hover:bg-[var(--surface-2)] active:bg-[var(--surface-2)]";
+  return createPortal(
+    <div
+      className="overlay-in fixed inset-0 z-[70] flex items-end bg-black/55"
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchMove={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="course-sheet-title"
+        className="sheet-up w-full rounded-t-2xl border-t border-[var(--border)] bg-[var(--surface)] px-2 pt-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))]"
+      >
+        <div aria-hidden className="mx-auto mb-2 h-1 w-10 rounded-full bg-[var(--border)]" />
+        <div className="px-4 pb-3 mb-1 border-b border-[var(--border)]">
+          <h2 id="course-sheet-title" className="text-base leading-snug line-clamp-2">
+            {c.title}
+          </h2>
+          <p className="text-xs text-[var(--muted)] mt-0.5 truncate">
+            <span className="font-mono">{c.publicCode ?? c.code}</span>
+            {c.professor ? ` · ${c.professor}` : ""}
+          </p>
+        </div>
+        {onTogglePin && (
+          <button ref={firstRef} type="button" onClick={run(onTogglePin)} className={item}>
+            {pinned ? <PinOff className="w-5 h-5 text-[var(--muted)]" /> : <Pin className="w-5 h-5 text-[var(--muted)]" />}
+            {pinned ? (lang === "el" ? "Ξεκαρφίτσωμα" : "Unpin") : lang === "el" ? "Καρφίτσωμα στην κορυφή" : "Pin to top"}
+          </button>
+        )}
+        <button ref={onTogglePin ? undefined : firstRef} type="button" onClick={run(onOpen)} className={item}>
+          <FolderOpen className="w-5 h-5 text-[var(--muted)]" />
+          {lang === "el" ? "Άνοιγμα μαθήματος" : "Open course"}
+        </button>
+        <a href={`/api/courses/${encodeURIComponent(c.code)}/documents/zip`} onClick={onClose} className={item}>
+          <Download className="w-5 h-5 text-[var(--muted)]" />
+          {lang === "el" ? "Λήψη αρχείων (.zip)" : "Download files (.zip)"}
+        </a>
+        {c.enrolled ? (
+          <button type="button" onClick={run(onLeave)} className={`${item} text-[var(--danger)]`}>
+            <UserMinus className="w-5 h-5" />
+            {tr("unenrollCourse")}
+          </button>
+        ) : (
+          <button type="button" disabled={c.locked} onClick={run(onJoin)} className={`${item} disabled:opacity-40`}>
+            {c.needsPassword ? <KeyRound className="w-5 h-5 text-[var(--muted)]" /> : <UserPlus className="w-5 h-5 text-[var(--muted)]" />}
+            {tr("enrollBtn")}
+          </button>
+        )}
+        <button type="button" onClick={onClose} className={`${item} justify-center mt-1 font-medium text-[var(--muted)]`}>
+          {lang === "el" ? "Άκυρο" : "Cancel"}
+        </button>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -2536,15 +2864,14 @@ function CourseDetailView({
   const [courseAnnouncements, setCourseAnnouncements] = useState<Announcement[]>(announcements);
   const [annLoading, setAnnLoading] = useState(false);
   const [openAssignmentId, setOpenAssignmentId] = useState<string | null>(focusAssignmentId ?? null);
-  const [summaryPath, setSummaryPath] = useState<string | null>(null);
-  const [studyPath, setStudyPath] = useState<string | null>(null);
+  /** The file open in the document window, and which of its tabs */
+  const [viewer, setViewer] = useState<{ node: DocNode; tab: DocTab } | null>(null);
   const [courseAssignments, setCourseAssignments] = useState<Assignment[]>(assignments);
   const [asgLoading, setAsgLoading] = useState(false);
 
   useEffect(() => {
     setDir("/");
-    setSummaryPath(null);
-    setStudyPath(null);
+    setViewer(null);
   }, [course.code]);
 
   useEffect(() => {
@@ -2699,6 +3026,17 @@ function CourseDetailView({
         </div>
       </div>
       {courseCodeDialog}
+      {viewer && (
+        <DocumentViewer
+          key={viewer.node.path}
+          lang={lang}
+          courseCode={course.code}
+          node={viewer.node}
+          initialTab={viewer.tab}
+          onClose={() => setViewer(null)}
+          onMeChanged={onMeChanged}
+        />
+      )}
 
       {/* eClass shows nothing of a code-protected course until you join it with its code */}
       {!course.enrolled && course.needsPassword && (
@@ -2804,86 +3142,74 @@ function CourseDetailView({
             <div className="py-10 text-center text-xs text-[var(--muted)]">{tr("noItems")}</div>
           ) : (
             <div className="divide-y divide-[var(--border)]">
-              {docs.map((node) => (
-                <div key={node.path}>
-                <div
-                  className="px-4 py-3 flex items-center justify-between gap-3 hover:bg-[var(--surface-2)]/60 transition-colors"
-                >
-                  <div
-                    onClick={() => {
-                      if (node.isDir) setDir(node.path);
-                    }}
-                    className={`flex items-center gap-3 min-w-0 ${node.isDir ? "cursor-pointer" : ""}`}
+              {docs.map((node) =>
+                node.isDir ? (
+                  <button
+                    key={node.path}
+                    type="button"
+                    onClick={() => setDir(node.path)}
+                    className="w-full text-left px-4 py-3 flex items-center gap-3 hover:bg-[var(--surface-2)] cursor-pointer"
                   >
-                    {node.isDir ? (
-                      <Folder className="w-4 h-4 text-[var(--warn)] shrink-0" />
-                    ) : (
-                      <FileText className="w-4 h-4 text-[var(--muted)] shrink-0" />
-                    )}
-                    <div className="min-w-0">
-                      <div className="text-xs font-medium truncate">{node.name}</div>
-                      {!node.isDir && (
-                        <div className="text-xs text-[var(--muted)] flex items-center gap-2">
-                          {node.size !== undefined && (
-                            <span>{Math.max(1, Math.round(node.size / 1024))} KB</span>
-                          )}
-                          {node.date && <span>{node.date}</span>}
-                        </div>
+                    <Folder className="w-[1.125rem] h-[1.125rem] text-[var(--warn)] shrink-0" />
+                    <span className="min-w-0 flex-1 text-sm font-medium truncate">{node.name}</span>
+                    <ChevronRight className="w-4 h-4 text-[var(--muted)] shrink-0" />
+                  </button>
+                ) : (
+                  <div
+                    key={node.path}
+                    className="group pl-4 pr-2 sm:pr-3 py-2.5 flex items-center gap-3 hover:bg-[var(--surface-2)]"
+                  >
+                    {/* The name opens the file in a window: preview first, AI summary and study a tab away */}
+                    <button
+                      type="button"
+                      onClick={() => setViewer({ node, tab: "preview" })}
+                      title={lang === "el" ? "Προεπισκόπηση" : "Preview"}
+                      className="min-w-0 flex-1 flex items-center gap-3 text-left cursor-pointer rounded-md"
+                    >
+                      <FileText className="w-[1.125rem] h-[1.125rem] text-[var(--muted)] shrink-0" />
+                      <span className="min-w-0">
+                        <span className="block text-sm font-medium leading-snug break-words line-clamp-2 group-hover:text-[var(--accent-text)]">
+                          {node.name}
+                        </span>
+                        <span className="block text-xs text-[var(--muted)] mt-0.5">
+                          {[
+                            node.size !== undefined
+                              ? node.size >= 1024 * 1024
+                                ? `${(node.size / 1024 / 1024).toFixed(1)} MB`
+                                : `${Math.max(1, Math.round(node.size / 1024))} KB`
+                              : null,
+                            node.date,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </span>
+                      </span>
+                    </button>
+
+                    <div className="flex items-center gap-0.5 sm:gap-1 shrink-0">
+                      {aiReadable(node.name) && (
+                        <>
+                          <DocumentSummaryButton
+                            lang={lang}
+                            courseCode={course.code}
+                            path={node.path}
+                            open={false}
+                            onToggle={() => setViewer({ node, tab: "summary" })}
+                          />
+                          <StudyButton lang={lang} open={false} onToggle={() => setViewer({ node, tab: "study" })} />
+                        </>
                       )}
+                      <IconButton
+                        label={lang === "el" ? "Λήψη" : "Download"}
+                        href={node.downloadUrl}
+                        tooltipSide="left"
+                      >
+                        <Download className="w-4 h-4" />
+                      </IconButton>
                     </div>
                   </div>
-
-                  {node.isDir ? (
-                    <button
-                      onClick={() => setDir(node.path)}
-                      className="text-xs text-[var(--accent)] hover:underline cursor-pointer shrink-0"
-                    >
-                      {lang === "el" ? "Άνοιγμα" : "Open"}
-                    </button>
-                  ) : (
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      <DocumentSummaryButton
-                        lang={lang}
-                        courseCode={course.code}
-                        path={node.path}
-                        open={summaryPath === node.path}
-                        onToggle={() => {
-                          setStudyPath(null);
-                          setSummaryPath(summaryPath === node.path ? null : node.path);
-                        }}
-                      />
-                      <StudyButton
-                        lang={lang}
-                        open={studyPath === node.path}
-                        onToggle={() => {
-                          setSummaryPath(null);
-                          setStudyPath(studyPath === node.path ? null : node.path);
-                        }}
-                      />
-                      <a
-                        href={node.downloadUrl}
-                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs bg-[var(--accent-soft)] text-[var(--accent-text)] hover:opacity-90"
-                        aria-label={lang === "el" ? "Λήψη" : "Download"}
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        <span className="hidden sm:inline">{lang === "el" ? "Λήψη" : "Download"}</span>
-                      </a>
-                    </div>
-                  )}
-                </div>
-                {studyPath === node.path && (
-                  <StudyPanel
-                    lang={lang}
-                    courseCode={course.code}
-                    path={node.path}
-                    onMeChanged={onMeChanged}
-                  />
-                )}
-                {summaryPath === node.path && (
-                  <DocumentSummaryPanel lang={lang} courseCode={course.code} path={node.path} />
-                )}
-                </div>
-              ))}
+                ),
+              )}
             </div>
           )}
         </div>

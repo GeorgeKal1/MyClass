@@ -33,6 +33,7 @@ import {
   checkServerGeminiKey,
 } from "./ai.js";
 import { buildDeadlinesIcs, markDeadlineSubmitted, rememberDeadlines, widgetData, withKnownSubmission } from "./deadlines.js";
+import { prepareDocumentForAi } from "./doctext.js";
 import { AiQuotaError, quotaFor } from "./quota.js";
 import { encrypt, randomId, sha256 } from "./crypto.js";
 import {
@@ -61,6 +62,8 @@ const SESSION_COOKIE = "myclass_sid";
 
 type Variables = {
   user: UserRecord;
+  /** The response set its own framing and CSP headers (a file shown in the app's preview frame). */
+  framable?: boolean;
 };
 
 const app = new Hono<{ Variables: Variables }>();
@@ -71,7 +74,10 @@ const CONTENT_SECURITY_POLICY = [
   "script-src 'self'",
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "font-src 'self' https://fonts.gstatic.com data:",
-  "img-src 'self' data: https:",
+  "img-src 'self' data: blob: https:",
+  // File previews: the file is fetched, then shown from a blob: address in a frame / player
+  "frame-src 'self' blob:",
+  "media-src 'self' blob:",
   "connect-src 'self'",
   "worker-src 'self'",
   "manifest-src 'self'",
@@ -85,9 +91,11 @@ const CONTENT_SECURITY_POLICY = [
 app.use("*", async (c, next) => {
   await next();
   c.header("X-Content-Type-Options", "nosniff");
-  c.header("X-Frame-Options", "DENY");
   c.header("Referrer-Policy", "no-referrer");
-  c.header("Content-Security-Policy", CONTENT_SECURITY_POLICY);
+  if (!c.get("framable")) {
+    c.header("X-Frame-Options", "DENY");
+    c.header("Content-Security-Policy", CONTENT_SECURITY_POLICY);
+  }
   if (env.secureCookies) {
     c.header("Strict-Transport-Security", "max-age=15552000; includeSubDomains");
   }
@@ -181,6 +189,7 @@ const countedFetchPaths = [
   "/api/courses/:code/documents",
   "/api/courses/:code/documents/summary",
   "/api/courses/:code/documents/study",
+  "/api/courses/:code/documents/preview",
 ];
 const requireCurrentClient: MiddlewareHandler = async (c, next) => {
   const isFeed = c.req.path === "/api/announcements" || c.req.path === "/api/assignments";
@@ -465,7 +474,8 @@ app.get("/api/assignments", async (c) => {
     // The student opened this course's assignments: its own page (one visit, theirs) also says what was handed in
     const assignments = await asStudent(() => connector.getAssignments(courseCode));
     rememberDeadlines(u, assignments, courseCode);
-    return c.json({ assignments });
+    // Read from the course's own page, so the hand-in state of each one is known (Home shows it as checked)
+    return c.json({ assignments: assignments.map((a) => ({ ...a, submissionKnown: true })) });
   }
   // Home, calendar, widget: every course at once, from the calendar feed, which eClass does not count
   // as a visit to any course (opening each course's assignment page would log a visit per course)
@@ -594,13 +604,23 @@ app.get("/api/courses/:code/documents/file", async (c) => {
   const code = c.req.param("code");
   const filePath = c.req.query("path") || "/";
   const connector = getConnectorForUser(u);
-  const file = await asStudent(() => connector.downloadFile(code, filePath));
+  // `inline=1`: the in-app preview. A copy opened in the last hours will do (no second visit on eClass)
+  const wantsInline = c.req.query("inline") === "1";
+  const file = await asStudent(() => connector.downloadFile(code, filePath, { reuseOpened: wantsInline }));
+  const inlineType = wantsInline ? previewableMime(file.filename, file.contentType) : null;
 
-  c.header("Content-Type", file.contentType);
+  c.header("Content-Type", inlineType ?? file.contentType);
   c.header(
     "Content-Disposition",
-    `attachment; filename*=UTF-8''${encodeURIComponent(file.filename)}`,
+    `${inlineType ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(file.filename)}`,
   );
+  if (inlineType) {
+    // Shown in the app's own preview frame: same-origin framing only, and the file itself may run nothing
+    c.set("framable", true);
+    c.header("X-Frame-Options", "SAMEORIGIN");
+    c.header("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'self'");
+    c.header("Cache-Control", "private, max-age=600");
+  }
 
   if (Buffer.isBuffer(file.body)) {
     return c.body(new Uint8Array(file.body));
@@ -609,6 +629,56 @@ app.get("/api/courses/:code/documents/file", async (c) => {
     for await (const chunk of file.body as AsyncIterable<Uint8Array>) {
       await s.write(chunk);
     }
+  });
+});
+
+/**
+ * Files the browser can show by itself in the preview frame. HTML, SVG and anything scriptable are
+ * never served inline: they would run on this origin.
+ */
+function previewableMime(filename: string, contentType: string): string | null {
+  const ext = (filename.split(".").pop() || "").toLowerCase();
+  const byExt: Record<string, string> = {
+    pdf: "application/pdf",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    mp4: "video/mp4",
+    webm: "video/webm",
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    ogg: "audio/ogg",
+    m4a: "audio/mp4",
+  };
+  if (byExt[ext]) return byExt[ext];
+  const ct = contentType.split(";")[0].trim().toLowerCase();
+  return Object.values(byExt).includes(ct) ? ct : null;
+}
+
+/** Text of a Word / PowerPoint / Excel / plain-text file for the in-app preview. */
+app.get("/api/courses/:code/documents/preview", async (c) => {
+  const u = requireUser(c);
+  const code = c.req.param("code");
+  const filePath = c.req.query("path");
+  if (!filePath) throw new HttpError(400, "Missing path");
+  // The student clicked the file's name; a copy opened in the last hours is reused
+  const file = await asStudent(() => getConnectorForUser(u).downloadFile(code, filePath, { reuseOpened: true }));
+  const chunks: Buffer[] = [];
+  if (Buffer.isBuffer(file.body)) chunks.push(file.body);
+  else for await (const chunk of file.body as AsyncIterable<Uint8Array>) chunks.push(Buffer.from(chunk));
+  const prepared = prepareDocumentForAi(file.filename, file.contentType, Buffer.concat(chunks), u.settings.language);
+  if (prepared.kind === "text") return c.json({ kind: "text", name: file.filename, text: prepared.text });
+  return c.json({
+    kind: "unsupported",
+    name: file.filename,
+    reason:
+      prepared.kind === "unsupported"
+        ? prepared.reason
+        : u.settings.language === "el"
+          ? "Αυτό το αρχείο δεν έχει προεπισκόπηση."
+          : "This file has no preview.",
   });
 });
 

@@ -198,7 +198,11 @@ export const api = {
     req<{ assignments: Assignment[] }>(
       `/api/assignments${course ? `?course=${encodeURIComponent(course)}` : ""}`,
     ),
-  documents: (code: string, dir = "/") =>
+  documentPreview: (code: string, path: string) =>
+    req<{ kind: "text"; name: string; text: string } | { kind: "unsupported"; name: string; reason: string }>(
+      `/api/courses/${encodeURIComponent(code)}/documents/preview?path=${encodeURIComponent(path)}`,
+    ),
+  documents:(code: string, dir = "/") =>
     req<{ nodes: DocNode[]; dir: string }>(
       `/api/courses/${encodeURIComponent(code)}/documents?dir=${encodeURIComponent(dir)}`,
     ),

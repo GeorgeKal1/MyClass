@@ -72,11 +72,14 @@ export function StudyPanel({
   courseCode,
   path,
   onMeChanged,
+  embedded = false,
 }: {
   lang: Lang;
   courseCode: string;
   path: string;
   onMeChanged: (m: Me) => void;
+  /** Inside the document window: no card of its own. */
+  embedded?: boolean;
 }) {
   const [kind, setKind] = useState<StudyKind | null>(null);
   const [material, setMaterial] = useState<StudyMaterial | null>(null);
@@ -107,7 +110,7 @@ export function StudyPanel({
   };
 
   return (
-    <div className="enter mx-4 mb-3 rounded-xl border border-[var(--border)] bg-[var(--surface-2)]/50 px-4 py-3 space-y-3">
+    <div className={embedded ? "space-y-4" : "enter mx-4 mb-3 rounded-xl border border-[var(--border)] bg-[var(--surface-2)]/50 px-4 py-3 space-y-3"}>
       <div role="tablist" aria-label={el ? "Είδος υλικού" : "Material type"} className="grid grid-cols-3 gap-1.5">
         {KINDS.map((k) => (
           <button
