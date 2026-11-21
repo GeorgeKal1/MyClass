@@ -379,6 +379,38 @@ describe("nothing but the student opens a page eClass counts", () => {
     expect(await text.json()).toMatchObject({ kind: "unsupported", name: "Guide.pdf" });
   });
 
+  it("the AI file search reuses folders opened earlier and asks eClass for nothing new", async () => {
+    // TMC106's top folder was listed in the test above: the search walks it from memory
+    fake.sent.length = 0;
+    const tree = await origin.withOrigin("interactive", () =>
+      connector.getConnectorForUser(user()).listDocumentTree("TMC106"),
+    );
+    expect(tree.files.map((f) => f.name)).toContain("Guide.pdf");
+    expect(tree.files.find((f) => f.name === "Guide.pdf")?.folder).toBe("");
+    expect(tree.opened).toBe(0);
+    expect(counted()).toEqual([]);
+    // No AI key in tests: a clear message, not a crash
+    const res = await call("/api/courses/TMC106/documents/search", { method: "POST", body: JSON.stringify({ query: "οδηγός" }) });
+    expect(res.status).toBe(422);
+    expect(counted()).toEqual([]);
+  });
+
+  it("starred files are kept in the account settings, without asking eClass anything", async () => {
+    fake.sent.length = 0;
+    const starredFiles = [
+      { courseCode: "TMC106", path: "/Guide.pdf", name: "Guide.pdf", folder: "", size: 1200, at: "2026-11-21T20:00:00.000Z" },
+    ];
+    const res = await call("/api/settings", { method: "PATCH", body: JSON.stringify({ starredFiles }) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { me: { settings: { starredFiles?: unknown[] } } };
+    expect(body.me.settings.starredFiles).toEqual(starredFiles);
+    expect(user().settings.starredFiles).toEqual(starredFiles);
+    // Something that is not a file entry is refused
+    const bad = await call("/api/settings", { method: "PATCH", body: JSON.stringify({ starredFiles: [{ path: 1 }] }) });
+    expect(bad.status).toBe(400);
+    expect(fake.sent).toEqual([]);
+  });
+
   it("a course's own assignment page marks each assignment's hand-in state as known", async () => {
     const res = await call("/api/assignments?course=TMC106");
     const body = (await res.json()) as { assignments: Array<{ submissionKnown?: boolean }> };
@@ -419,6 +451,7 @@ describe("tabs running the old app code", () => {
       "/api/courses/TMC101/tools",
       "/api/courses/TMC101/documents",
       "/api/courses/TMC101/documents/preview?path=%2Fa.docx",
+      "/api/courses/TMC101/documents/search",
     ]) {
       const res = await app.request(p, { headers: { Cookie: `myclass_sid=${SID}` } });
       expect(res.status, p).toBe(426);

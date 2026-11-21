@@ -36,6 +36,8 @@
   --accent-hover: #6654b8;
   --accent-soft: #edeaf8;
   --accent-text: #52428f;
+  /* Starred files: the one yellow in the app */
+  --star: #d99a00;
   --on-accent: #ffffff;
   --ok: #2f7a4d;
   --warn: #9a6119;
@@ -72,6 +74,7 @@ html.dark {
   --accent-hover: #c4bcee;
   --accent-soft: #26252f;
   --accent-text: #d8d3f2;
+  --star: #f2c14e;
   --on-accent: #17161d;
   --ok: #7cc79a;
   --warn: #dcb572;

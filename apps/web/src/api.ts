@@ -22,6 +22,7 @@ import type {
   NotificationItem,
   PendingAction,
   SettingsPatch,
+  DocumentSearchResponse,
 } from "@myclass/shared";
 
 /** The API server could not be reached (offline, restarting, or the dev proxy has no backend). */
@@ -198,6 +199,11 @@ export const api = {
     req<{ assignments: Assignment[] }>(
       `/api/assignments${course ? `?course=${encodeURIComponent(course)}` : ""}`,
     ),
+  searchDocuments: (code: string, query: string) =>
+    req<DocumentSearchResponse>(`/api/courses/${encodeURIComponent(code)}/documents/search`, {
+      method: "POST",
+      body: JSON.stringify({ query }),
+    }),
   documentPreview: (code: string, path: string) =>
     req<{ kind: "text"; name: string; text: string } | { kind: "unsupported"; name: string; reason: string }>(
       `/api/courses/${encodeURIComponent(code)}/documents/preview?path=${encodeURIComponent(path)}`,

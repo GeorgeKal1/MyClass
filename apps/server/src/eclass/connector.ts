@@ -96,6 +96,11 @@ export interface EclassConnector {
   getMessages(): Promise<Message[]>;
   getMessage(id: string): Promise<Message | null>;
   listDocuments(courseCode: string, dir?: string): Promise<DocNode[]>;
+  /**
+   * Every file of a course with its folder, for the AI file search. Folders listed in the last hours
+   * come from memory; the rest are opened (the student pressed search: one visit per folder, capped).
+   */
+  listDocumentTree(courseCode: string, maxFolders?: number): Promise<DocumentTree>;
   /** One course's assignment page (counts as a visit to that course on eClass). */
   getAssignments(courseCode: string): Promise<Assignment[]>;
   getAssignmentDetail(courseCode: string, assignmentId: string): Promise<AssignmentDetail>;
@@ -196,6 +201,16 @@ export class NotOpenedByStudentError extends Error {
     );
     this.name = "NotOpenedByStudentError";
   }
+}
+
+export interface DocumentTree {
+  /** Files with the folder path they sit in ("" = the course's top folder). */
+  files: Array<DocNode & { folder: string }>;
+  /** Folders looked at, and how many of them had to be opened on eClass for this. */
+  folders: number;
+  opened: number;
+  /** More folders than the cap: the deepest ones were not searched. */
+  truncated: boolean;
 }
 
 /**
@@ -1212,6 +1227,29 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
       };
     },
     listDocuments,
+    async listDocumentTree(courseCode: string, maxFolders = 30): Promise<DocumentTree> {
+      const files: DocumentTree["files"] = [];
+      const queue: Array<{ path: string; folder: string[] }> = [{ path: "/", folder: [] }];
+      let folders = 0;
+      let opened = 0;
+      let truncated = false;
+      while (queue.length) {
+        const dir = queue.shift()!;
+        if (folders >= maxFolders) {
+          truncated = true;
+          break;
+        }
+        folders++;
+        const known = openedEarlier<DocNode[]>(openedKey("docs", courseCode, dir.path));
+        if (!known) opened++;
+        const nodes = known ?? (await listDocuments(courseCode, dir.path));
+        for (const n of nodes) {
+          if (n.isDir) queue.push({ path: n.path, folder: [...dir.folder, n.name] });
+          else files.push({ ...n, folder: dir.folder.join(" / ") });
+        }
+      }
+      return { files, folders, opened, truncated };
+    },
     async getAssignments(courseCode: string): Promise<Assignment[]> {
       // One course only, never a sweep: eClass logs each course's assignment page as a visit to
       // that course. Every course at once comes from getDeadlines(), which eClass does not count.

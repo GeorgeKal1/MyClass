@@ -859,6 +859,79 @@ export async function summarizeCourseDocument(
 }
 
 /* ------------------------------------------------------------------ */
+/* File search: which of a course's files match what the student asks  */
+/* ------------------------------------------------------------------ */
+
+export interface DocumentSearchHit {
+  path: string;
+  /** Why it matches, a few words in the student's language. */
+  why: string;
+}
+
+/**
+ * Ranks a course's files against a free-text question ("the lecture on usability", "lab 3
+ * solutions"). The AI sees names, folders and dates, plus the AI summary of any file summarized
+ * recently, never the files themselves, so a search costs one small AI request and no downloads.
+ */
+export async function searchCourseDocuments(
+  user: UserRecord,
+  courseCode: string,
+  query: string,
+  files: Array<{ path: string; name: string; folder: string; date?: string }>,
+): Promise<DocumentSearchHit[]> {
+  const lang = user.settings.language;
+  if (files.length === 0) return [];
+  if (geminiAuthCandidates(user).length === 0) throw new Error(aiUnavailableText(lang, "no-key"));
+  const stamp = consumeAiQuota(user);
+
+  const list = files.slice(0, 600).map((f, i) => {
+    const summary = summaryCache.get(`${user.id}|${courseCode}|${f.path}|${lang}`);
+    return {
+      i,
+      name: f.name,
+      ...(f.folder ? { folder: f.folder } : {}),
+      ...(f.date ? { date: f.date } : {}),
+      ...(summary ? { summary: summary.summary.replace(/\s+/g, " ").slice(0, 400) } : {}),
+    };
+  });
+  try {
+    const { response } = await geminiGenerate(user, {
+      systemInstruction: {
+        parts: [
+          {
+            text:
+              "You find files in a university course's document folder for a student. You get the files (name, folder, date, " +
+              "sometimes a summary) and what the student is looking for. Match meaning, not just words: Greek and English, " +
+              'abbreviations and numbering ("εργαστήριο 3" = "Lab3", "διάλεξη" = "lecture", "λύσεις" = "solutions"), topics a ' +
+              "lecture title implies. Return only files that plausibly match, best first, at most 8; none if nothing fits. " +
+              `For each give "why": max 8 words in ${lang === "el" ? "Greek" : "English"}, what in it matches. ` +
+              'Answer with JSON only: {"results":[{"i":0,"why":"..."}]}.',
+          },
+        ],
+      },
+      contents: [{ role: "user", parts: [{ text: JSON.stringify({ query, files: list }) }] }],
+      generationConfig: { temperature: 0, maxOutputTokens: 2048, responseMimeType: "application/json" },
+    });
+    const parsed = parseJsonLoose(textOf(response)) as { results?: Array<{ i?: number; why?: string }> };
+    const seen = new Set<number>();
+    const hits: DocumentSearchHit[] = [];
+    for (const r of parsed.results ?? []) {
+      if (typeof r.i !== "number" || !files[r.i] || seen.has(r.i)) continue;
+      seen.add(r.i);
+      hits.push({ path: files[r.i].path, why: typeof r.why === "string" ? r.why.trim().slice(0, 80) : "" });
+      if (hits.length >= 8) break;
+    }
+    return hits;
+  } catch (err) {
+    refundAiQuota(user, stamp);
+    if (err instanceof GeminiError) throw new Error(aiUnavailableText(lang, err.reason));
+    throw new Error(
+      lang === "el" ? "Η αναζήτηση δεν ολοκληρώθηκε. Δοκίμασε ξανά." : "The search didn't finish. Try again.",
+    );
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Study material: flashcards, quiz, exam-style questions              */
 /* ------------------------------------------------------------------ */
 

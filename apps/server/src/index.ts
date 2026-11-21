@@ -15,12 +15,14 @@ import {
   ActionDecision,
   ChatRequest,
   CourseMetaPatch,
+  DocumentSearchRequest,
   DocumentSummaryRequest,
   LoginRequest,
   SettingsPatch,
   StudyRequest,
   TriageRequest,
   type ChatMessage,
+  type DocumentSearchResponse,
   type Me,
   type MyStats,
 } from "@myclass/shared";
@@ -28,6 +30,7 @@ import {
   executeConfirmedAction,
   generateStudyMaterial,
   runAssistantTurn,
+  searchCourseDocuments,
   summarizeCourseDocument,
   triageAnnouncements,
   checkServerGeminiKey,
@@ -190,6 +193,7 @@ const countedFetchPaths = [
   "/api/courses/:code/documents/summary",
   "/api/courses/:code/documents/study",
   "/api/courses/:code/documents/preview",
+  "/api/courses/:code/documents/search",
 ];
 const requireCurrentClient: MiddlewareHandler = async (c, next) => {
   const isFeed = c.req.path === "/api/announcements" || c.req.path === "/api/assignments";
@@ -575,6 +579,33 @@ app.post("/api/courses/:code/documents/summary", async (c) => {
     if (err instanceof AiQuotaError) throw err;
     throw new HttpError(422, (err as Error).message);
   }
+});
+
+/** AI file search: the student typed what they are looking for in this course's files. */
+app.post("/api/courses/:code/documents/search", async (c) => {
+  const u = requireUser(c);
+  const code = c.req.param("code");
+  const { query } = DocumentSearchRequest.parse(await c.req.json());
+  // The student pressed search: folders not opened in the last hours are opened now, one visit each
+  const tree = await asStudent(() => getConnectorForUser(u).listDocumentTree(code));
+  let hits: Awaited<ReturnType<typeof searchCourseDocuments>>;
+  try {
+    hits = await searchCourseDocuments(u, code, query, tree.files);
+  } catch (err) {
+    if (err instanceof AiQuotaError) throw err;
+    throw new HttpError(422, (err as Error).message);
+  }
+  const byPath = new Map(tree.files.map((f) => [f.path, f]));
+  const body: DocumentSearchResponse = {
+    results: hits.flatMap((h) => {
+      const node = byPath.get(h.path);
+      return node ? [{ node, why: h.why }] : [];
+    }),
+    searchedFiles: tree.files.length,
+    searchedFolders: tree.folders,
+    truncated: tree.truncated,
+  };
+  return c.json(body);
 });
 
 app.post("/api/courses/:code/documents/study", async (c) => {

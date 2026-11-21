@@ -302,6 +302,19 @@ export type Lang = "el" | "en";
 /** "server": the shared myClass Gemini key; "apiKey": the student's own Gemini key. */
 export type AiMode = "server" | "apiKey";
 
+/** A course file starred as important: enough to list and open it without asking eClass again. */
+export interface StarredFile {
+  courseCode: string;
+  path: string;
+  name: string;
+  /** Folder names it sits in ("Διαλέξεις / Εβδομάδα 3"); empty = the course's top folder. */
+  folder?: string;
+  size?: number;
+  date?: string;
+  /** When it was starred (ISO). */
+  at: string;
+}
+
 export interface UserSettings {
   theme: ThemePref;
   language: Lang;
@@ -323,6 +336,8 @@ export interface UserSettings {
   mutedCourses: string[];
   /** Courses pinned to the top of the Courses list (course codes, in pin order). */
   pinnedCourses?: string[];
+  /** Course files the student starred as important (newest first), shown in the course's "Highlighted" tab. */
+  starredFiles?: StarredFile[];
   downloads: {
     /** How "download all courses" packages files. */
     allCoursesMode: "single-zip" | "zip-per-course";
@@ -440,6 +455,19 @@ export const SettingsPatch = z
       .partial(),
     mutedCourses: z.array(z.string()),
     pinnedCourses: z.array(z.string().max(60)).max(60),
+    starredFiles: z
+      .array(
+        z.object({
+          courseCode: z.string().max(60),
+          path: z.string().max(2000),
+          name: z.string().max(400),
+          folder: z.string().max(600).optional(),
+          size: z.number().nonnegative().optional(),
+          date: z.string().max(40).optional(),
+          at: z.string().max(40),
+        }),
+      )
+      .max(400),
     downloads: z.object({ allCoursesMode: z.enum(["single-zip", "zip-per-course"]) }),
     ai: z.object({ mode: z.enum(["server", "apiKey"]), model: z.string().max(80).optional().default("") }),
     departmentId: z.string().max(20),
@@ -455,6 +483,24 @@ export const ActionDecision = z.object({
   actionId: z.string(),
   decision: z.enum(["confirm", "cancel"]),
 });
+
+export const DocumentSearchRequest = z.object({
+  query: z.string().trim().min(2).max(200),
+});
+
+/** One file the AI file search found, with the folder it sits in and why it matches. */
+export interface DocumentSearchResult {
+  node: DocNode & { folder: string };
+  why: string;
+}
+
+export interface DocumentSearchResponse {
+  results: DocumentSearchResult[];
+  /** How much was searched: files and folders, and whether some deep folders were left out. */
+  searchedFiles: number;
+  searchedFolders: number;
+  truncated: boolean;
+}
 
 export const DocumentSummaryRequest = z.object({
   path: z.string().min(1).max(2000),

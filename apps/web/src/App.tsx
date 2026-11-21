@@ -32,6 +32,8 @@ import {
   RefreshCw,
   Search,
   Send,
+  Sparkle,
+  Star,
   Settings,
   ShieldCheck,
   Sun,
@@ -51,6 +53,8 @@ import type {
   Course,
   DepartmentInfo,
   DocNode,
+  StarredFile,
+  DocumentSearchResponse,
   Lang,
   Me,
   Message,
@@ -78,8 +82,8 @@ type Tab = "home" | "courses" | "inbox" | "assistant" | "stats" | "settings";
 const TAB_ORDER: Tab[] = ["home", "courses", "inbox", "assistant", "stats", "settings"];
 /** Pages a horizontal swipe moves between: the phone's bottom bar (Settings sits in the top bar). */
 const SWIPE_ORDER: Tab[] = ["home", "courses", "inbox", "assistant", "stats"];
-type CourseSubTab = "announcements" | "documents" | "assignments" | "info";
-const COURSE_SUB_TABS: CourseSubTab[] = ["announcements", "documents", "assignments", "info"];
+type CourseSubTab = "announcements" | "documents" | "starred" | "assignments" | "info";
+const COURSE_SUB_TABS: CourseSubTab[] = ["announcements", "documents", "starred", "assignments", "info"];
 
 interface Route {
   tab: Tab;
@@ -551,6 +555,38 @@ function Workspace({
       }
     },
     [me, pinnedCourses, setMe, showToast],
+  );
+
+  /** Starred files live in the account settings too: starred on the PC, there on the phone. */
+  const starredFiles = useMemo(() => me.settings.starredFiles ?? [], [me.settings.starredFiles]);
+  const toggleStar = useCallback(
+    async (courseCode: string, node: DocNode, folder: string) => {
+      const before = me;
+      const isStarred = starredFiles.some((f) => f.courseCode === courseCode && f.path === node.path);
+      const next: StarredFile[] = isStarred
+        ? starredFiles.filter((f) => !(f.courseCode === courseCode && f.path === node.path))
+        : [
+            {
+              courseCode,
+              path: node.path,
+              name: node.name,
+              ...(folder ? { folder } : {}),
+              ...(node.size !== undefined ? { size: node.size } : {}),
+              ...(node.date ? { date: node.date } : {}),
+              at: new Date().toISOString(),
+            },
+            ...starredFiles,
+          ].slice(0, 400);
+      setMe({ ...me, settings: { ...me.settings, starredFiles: next } });
+      try {
+        const res = await api.patchSettings({ starredFiles: next });
+        setMe(res.me);
+      } catch (err) {
+        setMe(before);
+        showToast((err as Error).message);
+      }
+    },
+    [me, starredFiles, setMe, showToast],
   );
 
   /** Everything the Refresh button does: poll eClass now, then reload every list. */
@@ -1055,6 +1091,8 @@ function Workspace({
                 onMeChanged={setMe}
                 assignments={activeCourseAssignments}
                 onAssignmentsLoaded={mergeCourseAssignments}
+                starred={starredFiles.filter((f) => f.courseCode === activeCourse.code)}
+                onToggleStar={(code, node, folder) => void toggleStar(code, node, folder)}
                 focusAssignmentId={focusAssignmentId}
                 onOpenInbox={() => navigateTab("inbox", "left")}
                 onBack={goBack}
@@ -1588,7 +1626,7 @@ function HomeView({
   lastPollAt?: string;
   onOpenCourse: (
     code: string,
-    sub?: "announcements" | "documents" | "assignments" | "info",
+    sub?: CourseSubTab,
     assignmentId?: string,
   ) => void;
   onCheckSubmissions?: (courseCodes: string[]) => Promise<void>;
@@ -2013,7 +2051,7 @@ function CoursesView({
   syncing?: boolean;
   initialViewMode?: "enrolled" | "all";
   onChangeDepartment?: (deptId: string) => Promise<void>;
-  onSelectCourse: (code: string, sub?: "announcements" | "documents" | "assignments" | "info") => void;
+  onSelectCourse: (code: string, sub?: CourseSubTab) => void;
   onChanged: () => Promise<void>;
   showToast: (m: string) => void;
   /** Course codes pinned to the top, in pin order. */
@@ -2551,6 +2589,7 @@ function CoursesView({
           onClose={() => setSheetCourse(null)}
           onTogglePin={onTogglePin && sheetCourse.enrolled ? () => onTogglePin(sheetCourse.code) : undefined}
           onOpen={() => onSelectCourse(sheetCourse.code, "documents")}
+          onOpenStarred={() => onSelectCourse(sheetCourse.code, "starred")}
           onLeave={() => void leave(sheetCourse)}
           onJoin={() => void enroll(sheetCourse)}
         />
@@ -2735,6 +2774,7 @@ function CourseActionSheet({
   onClose,
   onTogglePin,
   onOpen,
+  onOpenStarred,
   onLeave,
   onJoin,
 }: {
@@ -2744,6 +2784,7 @@ function CourseActionSheet({
   onClose: () => void;
   onTogglePin?: () => void;
   onOpen: () => void;
+  onOpenStarred: () => void;
   onLeave: () => void;
   onJoin: () => void;
 }) {
@@ -2796,6 +2837,12 @@ function CourseActionSheet({
           <FolderOpen className="w-5 h-5 text-[var(--muted)]" />
           {lang === "el" ? "Άνοιγμα μαθήματος" : "Open course"}
         </button>
+        {c.enrolled && (
+          <button type="button" onClick={run(onOpenStarred)} className={item}>
+            <Star className="w-5 h-5 text-[var(--muted)]" />
+            {lang === "el" ? "Επισημασμένα αρχεία" : "Highlighted files"}
+          </button>
+        )}
         <a href={`/api/courses/${encodeURIComponent(c.code)}/documents/zip`} onClick={onClose} className={item}>
           <Download className="w-5 h-5 text-[var(--muted)]" />
           {lang === "el" ? "Λήψη αρχείων (.zip)" : "Download files (.zip)"}
@@ -2821,6 +2868,96 @@ function CourseActionSheet({
 }
 
 /* ================================================================== */
+/* Course documents: one file row, and the AI search icon              */
+/* ================================================================== */
+
+/** A magnifier with a small star on it: search that the AI does. */
+function AiSearchIcon({ className = "" }: { className?: string }) {
+  return (
+    <span aria-hidden className={`relative inline-flex w-4 h-4 ${className}`}>
+      <Search className="w-4 h-4" />
+      <Sparkle className="absolute -top-1 -right-1 w-2.5 h-2.5 fill-current text-[var(--accent)]" strokeWidth={2.5} />
+    </span>
+  );
+}
+
+function formatDocSize(bytes: number | undefined): string | null {
+  if (bytes === undefined) return null;
+  return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+/**
+ * One course file: the name opens the preview window (download is there); summary, study and the
+ * star (highlight as important) sit at the end.
+ */
+function DocFileRow({
+  lang,
+  courseCode,
+  node,
+  detail,
+  onOpen,
+  starred,
+  onToggleStar,
+}: {
+  lang: Lang;
+  courseCode: string;
+  node: DocNode;
+  /** Second line instead of size and date (search results: folder and why it matches). */
+  detail?: string;
+  onOpen: (tab: DocTab) => void;
+  starred: boolean;
+  onToggleStar: () => void;
+}) {
+  const starRef = useRef<HTMLSpanElement>(null);
+  return (
+    <div className="group pl-4 pr-2 sm:pr-3 py-2.5 flex items-center gap-3 hover:bg-[var(--surface-2)]">
+      <button
+        type="button"
+        onClick={() => onOpen("preview")}
+        title={lang === "el" ? "Προεπισκόπηση" : "Preview"}
+        className="min-w-0 flex-1 flex items-center gap-3 text-left cursor-pointer rounded-md"
+      >
+        <FileText className="w-[1.125rem] h-[1.125rem] text-[var(--muted)] shrink-0" />
+        <span className="min-w-0">
+          <span className="block text-sm font-medium leading-snug break-words line-clamp-2 group-hover:text-[var(--accent-text)]">
+            {node.name}
+          </span>
+          <span className="block text-xs text-[var(--muted)] mt-0.5 line-clamp-2">
+            {detail ?? [formatDocSize(node.size), node.date].filter(Boolean).join(" · ")}
+          </span>
+        </span>
+      </button>
+
+      <div className="flex items-center gap-0.5 sm:gap-1 shrink-0">
+        {/* Phones: summary and study are tabs in the file window, so the name keeps the room */}
+        {aiReadable(node.name) && (
+          <span className="hidden sm:contents">
+            <DocumentSummaryButton lang={lang} courseCode={courseCode} path={node.path} open={false} onToggle={() => onOpen("summary")} />
+            <StudyButton lang={lang} open={false} onToggle={() => onOpen("study")} />
+          </span>
+        )}
+        <IconButton
+          label={starred ? (lang === "el" ? "Αφαίρεση επισήμανσης" : "Remove highlight") : lang === "el" ? "Επισήμανση ως σημαντικό" : "Highlight as important"}
+          pressed={starred}
+          tooltipSide="left"
+          onClick={() => {
+            // Turning on: the star gives a small pop
+            if (!starred && !reducedMotion()) {
+              starRef.current?.animate([{ scale: 1 }, { scale: 1.3 }, { scale: 1 }], { duration: 280, easing: "cubic-bezier(0.22, 1, 0.36, 1)" });
+            }
+            onToggleStar();
+          }}
+        >
+          <span ref={starRef} className="inline-flex">
+            <Star className={`w-4 h-4 ${starred ? "fill-[var(--star)] text-[var(--star)]" : ""}`} />
+          </span>
+        </IconButton>
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== */
 /* Course Detail View (Announcements · Documents · Assignments · Info) */
 /* ================================================================== */
 
@@ -2839,13 +2976,18 @@ function CourseDetailView({
   onBack,
   onEnrolledOrUnenrolled,
   showToast,
+  starred,
+  onToggleStar,
 }: {
   lang: Lang;
   course: Course;
   triage: Record<string, AnnouncementTriage>;
   onMeChanged: (m: Me) => void;
-  subTab: "announcements" | "documents" | "assignments" | "info";
-  onChangeSubTab: (t: "announcements" | "documents" | "assignments" | "info") => void;
+  subTab: CourseSubTab;
+  onChangeSubTab: (t: CourseSubTab) => void;
+  /** This course's starred files, newest first. */
+  starred: StarredFile[];
+  onToggleStar: (courseCode: string, node: DocNode, folder: string) => void;
   announcements: Announcement[];
   assignments: Assignment[];
   /** The course page told which assignments were handed in: Home and the calendar learn it too. */
@@ -2858,7 +3000,15 @@ function CourseDetailView({
 }) {
   const tr = (k: DictKey) => t(lang, k);
   const { join, dialog: courseCodeDialog, askCode } = useJoinCourse({ lang, showToast, onJoined: onEnrolledOrUnenrolled });
-  const [dir, setDir] = useState("/");
+  const [dir, setDirPath] = useState("/");
+  /** Names of the folders from the top down to `dir` */
+  const [dirTrail, setDirTrail] = useState<string[]>([]);
+  const setDir = (path: string, name?: string) => {
+    setDirPath(path);
+    setDirTrail((trail) => (path === "/" ? [] : name ? [...trail, name] : trail.slice(0, -1)));
+  };
+  const folderLabel = dirTrail.join(" / ");
+  const starredPaths = useMemo(() => new Set(starred.map((f) => f.path)), [starred]);
   const [docs, setDocs] = useState<DocNode[]>([]);
   const [docsLoading, setDocsLoading] = useState(false);
   const [courseAnnouncements, setCourseAnnouncements] = useState<Announcement[]>(announcements);
@@ -2866,12 +3016,52 @@ function CourseDetailView({
   const [openAssignmentId, setOpenAssignmentId] = useState<string | null>(focusAssignmentId ?? null);
   /** The file open in the document window, and which of its tabs */
   const [viewer, setViewer] = useState<{ node: DocNode; tab: DocTab } | null>(null);
+  // AI file search over the whole course (Documents header, magnifier at the end)
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [searchResults, setSearchResults] = useState<DocumentSearchResponse | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchRun = useRef(0);
+  const openSearch = () => {
+    setSearchOpen(true);
+    requestAnimationFrame(() => searchInputRef.current?.focus());
+  };
+  const closeSearch = () => {
+    searchRun.current++;
+    setSearchOpen(false);
+    setSearchQuery("");
+    setSearchResults(null);
+    setSearchError(null);
+    setSearching(false);
+  };
+  const runSearch = async () => {
+    const q = searchQuery.trim();
+    if (q.length < 2 || searching) return;
+    const run = ++searchRun.current;
+    setSearching(true);
+    setSearchError(null);
+    try {
+      const res = await api.searchDocuments(course.code, q);
+      if (run === searchRun.current) setSearchResults(res);
+    } catch (err) {
+      if (run === searchRun.current) {
+        setSearchResults(null);
+        setSearchError((err as Error).message);
+      }
+    } finally {
+      if (run === searchRun.current) setSearching(false);
+    }
+  };
   const [courseAssignments, setCourseAssignments] = useState<Assignment[]>(assignments);
   const [asgLoading, setAsgLoading] = useState(false);
 
   useEffect(() => {
     setDir("/");
     setViewer(null);
+    closeSearch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [course.code]);
 
   useEffect(() => {
@@ -3062,6 +3252,7 @@ function CourseDetailView({
         {(
           [
             ["documents", tr("tabDocuments")],
+            ["starred", lang === "el" ? "Επισημασμένα" : "Highlighted"],
             ["announcements", tr("tabAnnouncements")],
             ["assignments", tr("tabAssignments")],
             ["info", tr("tabInfo")],
@@ -3077,9 +3268,52 @@ function CourseDetailView({
             }`}
           >
             {label}
+            {key === "starred" && starred.length > 0 && <span className="ml-1.5 tabular-nums opacity-70">{starred.length}</span>}
           </button>
         ))}
       </div>
+
+      {subTab === "starred" && (
+        <div className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
+          {starred.length === 0 ? (
+            <div className="px-6 py-10 text-center space-y-2">
+              <Star className="w-6 h-6 mx-auto text-[var(--muted)]" />
+              <p className="text-sm text-[var(--muted)] max-w-xs mx-auto">
+                {lang === "el"
+                  ? "Πάτησε το αστέρι δίπλα σε ένα αρχείο για να το βρίσκεις εδώ."
+                  : "Tap the star next to a file to keep it here."}
+              </p>
+            </div>
+          ) : (
+            <div className="divide-y divide-[var(--border)]">
+              {starred.map((f) => {
+                const node: DocNode = {
+                  path: f.path,
+                  name: f.name,
+                  isDir: false,
+                  size: f.size,
+                  date: f.date,
+                  downloadUrl: `/api/courses/${encodeURIComponent(course.code)}/documents/file?path=${encodeURIComponent(f.path)}`,
+                };
+                return (
+                  <DocFileRow
+                    key={f.path}
+                    lang={lang}
+                    courseCode={course.code}
+                    node={node}
+                    detail={[f.folder || (lang === "el" ? "Αρχικός φάκελος" : "Top folder"), formatDocSize(f.size), f.date]
+                      .filter(Boolean)
+                      .join(" · ")}
+                    onOpen={(tab) => setViewer({ node, tab })}
+                    starred
+                    onToggleStar={() => onToggleStar(course.code, node, f.folder ?? "")}
+                  />
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {subTab === "announcements" && (
         <div className="space-y-3">
@@ -3121,22 +3355,108 @@ function CourseDetailView({
 
       {subTab === "documents" && (
         <div className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
-          <div className="px-4 py-3 border-b border-[var(--border)] bg-[var(--surface-2)] flex items-center justify-between gap-2">
-            <div className="text-xs font-medium truncate">
-              <span className="text-[var(--muted)]">{tr("rootFolder")}:</span> {dir}
-            </div>
-            {parentDir && (
-              <button
-                onClick={() => setDir(parentDir)}
-                className="inline-flex items-center gap-1 text-xs text-[var(--accent)] hover:underline cursor-pointer"
+          {/* Header: where you are, up a folder, and the AI file search at the end */}
+          <div className="min-h-[3.25rem] pl-4 pr-2 py-2 border-b border-[var(--border)] bg-[var(--surface-2)] flex items-center gap-2">
+            {searchOpen ? (
+              <form
+                className="flex-1 min-w-0 flex items-center gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void runSearch();
+                }}
               >
-                <FolderUp className="w-3.5 h-3.5" />
-                <span>{tr("upFolder")}</span>
-              </button>
+                <AiSearchIcon className="text-[var(--accent-text)] shrink-0" />
+                <input
+                  ref={searchInputRef}
+                  type="search"
+                  enterKeyHint="search"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      closeSearch();
+                    }
+                  }}
+                  maxLength={200}
+                  aria-label={lang === "el" ? "Αναζήτηση στα αρχεία με AI" : "Search the files with AI"}
+                  placeholder={lang === "el" ? "Τι ψάχνεις; π.χ. η διάλεξη για τη χρηστικότητα" : "What are you looking for? e.g. the lecture on usability"}
+                  className="flex-1 min-w-0 bg-transparent text-sm py-1.5 focus:outline-none placeholder:text-[var(--muted)] [&::-webkit-search-cancel-button]:hidden"
+                />
+                {searching ? (
+                  <RefreshCw className="w-4 h-4 animate-spin text-[var(--muted)] shrink-0" aria-label={lang === "el" ? "Αναζήτηση…" : "Searching…"} />
+                ) : (
+                  searchQuery.trim().length >= 2 && (
+                    <button
+                      type="submit"
+                      className="hidden sm:inline-flex shrink-0 px-2.5 py-1 rounded-lg text-xs font-medium text-[var(--accent-text)] hover:bg-[var(--accent-soft)] cursor-pointer"
+                    >
+                      {lang === "el" ? "Αναζήτηση" : "Search"}
+                    </button>
+                  )
+                )}
+                <IconButton label={lang === "el" ? "Κλείσιμο αναζήτησης" : "Close search"} onClick={closeSearch} tooltipSide="left">
+                  <X className="w-4 h-4" />
+                </IconButton>
+              </form>
+            ) : (
+              <>
+                <div className="flex-1 min-w-0 text-xs font-medium truncate">
+                  <span className="text-[var(--muted)]">{tr("rootFolder")}:</span> {folderLabel || "/"}
+                </div>
+                {parentDir && (
+                  <button
+                    onClick={() => setDir(parentDir)}
+                    className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs text-[var(--accent-text)] hover:bg-[var(--surface)] cursor-pointer"
+                  >
+                    <FolderUp className="w-3.5 h-3.5" />
+                    <span>{tr("upFolder")}</span>
+                  </button>
+                )}
+                <IconButton
+                  label={lang === "el" ? "Αναζήτηση στα αρχεία με AI" : "Search the files with AI"}
+                  onClick={openSearch}
+                  tooltipSide="left"
+                >
+                  <AiSearchIcon />
+                </IconButton>
+              </>
             )}
           </div>
 
-          {docsLoading ? (
+          {searchOpen && (searchResults || searchError) ? (
+            <div>
+              {searchError ? (
+                <p className="px-4 py-8 text-center text-sm text-[var(--danger)]">{searchError}</p>
+              ) : searchResults && searchResults.results.length === 0 ? (
+                <p className="px-4 py-8 text-center text-sm text-[var(--muted)]">
+                  {lang === "el" ? "Δεν βρέθηκε αρχείο που να ταιριάζει." : "No file matches that."}
+                </p>
+              ) : (
+                <div className="divide-y divide-[var(--border)]">
+                  {searchResults!.results.map((r) => (
+                    <DocFileRow
+                      key={r.node.path}
+                      lang={lang}
+                      courseCode={course.code}
+                      node={r.node}
+                      detail={[r.node.folder || (lang === "el" ? "Αρχικός φάκελος" : "Top folder"), r.why].filter(Boolean).join(" · ")}
+                      onOpen={(tab) => setViewer({ node: r.node, tab })}
+                      starred={starredPaths.has(r.node.path)}
+                      onToggleStar={() => onToggleStar(course.code, r.node, r.node.folder)}
+                    />
+                  ))}
+                </div>
+              )}
+              {searchResults && (
+                <p className="px-4 py-2.5 border-t border-[var(--border)] text-xs text-[var(--muted)]">
+                  {lang === "el"
+                    ? `Έψαξε ${searchResults.searchedFiles} αρχεία σε ${searchResults.searchedFolders} φακέλους${searchResults.truncated ? " (όχι σε όλους: πολλοί φάκελοι)" : ""}. Το AI βλέπει ονόματα και φακέλους, όχι το περιεχόμενο.`
+                    : `Searched ${searchResults.searchedFiles} files in ${searchResults.searchedFolders} folders${searchResults.truncated ? " (not all: too many folders)" : ""}. The AI sees names and folders, not the contents.`}
+                </p>
+              )}
+            </div>
+          ) : docsLoading ? (
             <div className="py-10 flex justify-center"><RefreshCw className="w-4 h-4 animate-spin text-[var(--accent)]" /></div>
           ) : docs.length === 0 ? (
             <div className="py-10 text-center text-xs text-[var(--muted)]">{tr("noItems")}</div>
@@ -3147,7 +3467,7 @@ function CourseDetailView({
                   <button
                     key={node.path}
                     type="button"
-                    onClick={() => setDir(node.path)}
+                    onClick={() => setDir(node.path, node.name)}
                     className="w-full text-left px-4 py-3 flex items-center gap-3 hover:bg-[var(--surface-2)] cursor-pointer"
                   >
                     <Folder className="w-[1.125rem] h-[1.125rem] text-[var(--warn)] shrink-0" />
@@ -3155,59 +3475,15 @@ function CourseDetailView({
                     <ChevronRight className="w-4 h-4 text-[var(--muted)] shrink-0" />
                   </button>
                 ) : (
-                  <div
+                  <DocFileRow
                     key={node.path}
-                    className="group pl-4 pr-2 sm:pr-3 py-2.5 flex items-center gap-3 hover:bg-[var(--surface-2)]"
-                  >
-                    {/* The name opens the file in a window: preview first, AI summary and study a tab away */}
-                    <button
-                      type="button"
-                      onClick={() => setViewer({ node, tab: "preview" })}
-                      title={lang === "el" ? "Προεπισκόπηση" : "Preview"}
-                      className="min-w-0 flex-1 flex items-center gap-3 text-left cursor-pointer rounded-md"
-                    >
-                      <FileText className="w-[1.125rem] h-[1.125rem] text-[var(--muted)] shrink-0" />
-                      <span className="min-w-0">
-                        <span className="block text-sm font-medium leading-snug break-words line-clamp-2 group-hover:text-[var(--accent-text)]">
-                          {node.name}
-                        </span>
-                        <span className="block text-xs text-[var(--muted)] mt-0.5">
-                          {[
-                            node.size !== undefined
-                              ? node.size >= 1024 * 1024
-                                ? `${(node.size / 1024 / 1024).toFixed(1)} MB`
-                                : `${Math.max(1, Math.round(node.size / 1024))} KB`
-                              : null,
-                            node.date,
-                          ]
-                            .filter(Boolean)
-                            .join(" · ")}
-                        </span>
-                      </span>
-                    </button>
-
-                    <div className="flex items-center gap-0.5 sm:gap-1 shrink-0">
-                      {aiReadable(node.name) && (
-                        <>
-                          <DocumentSummaryButton
-                            lang={lang}
-                            courseCode={course.code}
-                            path={node.path}
-                            open={false}
-                            onToggle={() => setViewer({ node, tab: "summary" })}
-                          />
-                          <StudyButton lang={lang} open={false} onToggle={() => setViewer({ node, tab: "study" })} />
-                        </>
-                      )}
-                      <IconButton
-                        label={lang === "el" ? "Λήψη" : "Download"}
-                        href={node.downloadUrl}
-                        tooltipSide="left"
-                      >
-                        <Download className="w-4 h-4" />
-                      </IconButton>
-                    </div>
-                  </div>
+                    lang={lang}
+                    courseCode={course.code}
+                    node={node}
+                    onOpen={(tab) => setViewer({ node, tab })}
+                    starred={starredPaths.has(node.path)}
+                    onToggleStar={() => onToggleStar(course.code, node, folderLabel)}
+                  />
                 ),
               )}
             </div>
