@@ -21,7 +21,8 @@ const isProd = process.env.NODE_ENV === "production";
 
 /**
  * Where users, sessions and (when not provided via env) generated secrets are stored.
- * On hosts with an ephemeral filesystem, point DATA_DIR at a persistent volume.
+ * With Supabase configured, users and sessions live in Postgres instead (see store.ts);
+ * otherwise, on hosts with an ephemeral filesystem, point DATA_DIR at a persistent volume.
  */
 export const DATA_DIR = path.resolve(process.cwd(), str("DATA_DIR", ".data"));
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -60,6 +61,11 @@ export const env = {
     /** AI requests per student per hour on the shared key (0 = no limit). Own keys are never limited. */
     hourlyLimit: ((n) => (Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 15))(Number(str("AI_HOURLY_LIMIT", "15"))),
   },
+  /** Server-side only. The service role key bypasses RLS and must never reach the web app or logs. */
+  supabase: {
+    url: str("SUPABASE_URL").replace(/\/+$/, ""),
+    serviceRoleKey: str("SUPABASE_SERVICE_ROLE_KEY"),
+  },
   vapid: {
     publicKey: str("VAPID_PUBLIC_KEY"),
     privateKey: str("VAPID_PRIVATE_KEY"),
@@ -71,6 +77,16 @@ if (env.encryptionKey.length !== 32) {
   throw new Error("ENCRYPTION_KEY must be 32 bytes, base64-encoded");
 }
 
+/** Users and sessions are kept in Supabase (never during tests, which stay offline). */
+export const supabaseConfigured = Boolean(env.supabase.url && env.supabase.serviceRoleKey) && !process.env.VITEST;
+
+if (Boolean(env.supabase.url) !== Boolean(env.supabase.serviceRoleKey)) {
+  console.warn("[env] WARNING: set both SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, or neither. Using DATA_DIR/db.json.");
+}
+if (env.supabase.url && !env.supabase.url.startsWith("https://")) {
+  throw new Error("SUPABASE_URL must be an https:// address");
+}
+
 if (isProd) {
   const problems: string[] = [];
   if (!process.env.PUBLIC_URL?.trim()) {
@@ -79,19 +95,27 @@ if (isProd) {
     problems.push("PUBLIC_URL is not https:// (session cookies are marked Secure, so browsers may drop them)");
   }
   if (!str("ENCRYPTION_KEY")) {
-    problems.push("ENCRYPTION_KEY is not set (the key is stored next to the data it protects in DATA_DIR)");
+    problems.push(
+      supabaseConfigured
+        ? "ENCRYPTION_KEY is not set: a key was generated on this disk, so stored eClass passwords and sessions cannot be decrypted after the next redeploy"
+        : "ENCRYPTION_KEY is not set (the key is stored next to the data it protects in DATA_DIR)",
+    );
   }
   if (!str("VAPID_PUBLIC_KEY") || !str("VAPID_PRIVATE_KEY")) {
-    problems.push("VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY are not set (push keys live only in DATA_DIR)");
+    problems.push(
+      supabaseConfigured
+        ? "VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY are not set: push keys are regenerated on every redeploy, so saved push subscriptions stop working"
+        : "VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY are not set (push keys live only in DATA_DIR)",
+    );
   }
   if (!str("GEMINI_API_KEY")) {
     problems.push(
       "GEMINI_API_KEY is not set: the assistant, summaries and study material only work for students who add their own key",
     );
   }
-  if (!str("DATA_DIR")) {
+  if (!supabaseConfigured && !str("DATA_DIR")) {
     problems.push(
-      `DATA_DIR is not set (using ${DATA_DIR}); on hosts with an ephemeral disk all users and sessions are lost on every redeploy`,
+      `DATA_DIR is not set (using ${DATA_DIR}); on hosts with an ephemeral disk all users and sessions are lost on every redeploy. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY to keep them in Supabase`,
     );
   }
   for (const p of problems) console.warn(`[env] WARNING: ${p}`);

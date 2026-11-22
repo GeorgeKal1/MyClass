@@ -7,13 +7,23 @@ import {
   type PendingAction,
   type UserSettings,
 } from "@myclass/shared";
-import { DATA_DIR } from "./env.js";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import { sha256 } from "./crypto.js";
+import { DATA_DIR, env, supabaseConfigured } from "./env.js";
+import {
+  deleteRows,
+  describeError,
+  loadAll,
+  supabaseClient,
+  upsertSessions,
+  upsertUsers,
+  type RemoteSessionRow,
+} from "./store-remote.js";
 
 /**
- * Minimal JSON-file persistence for development.
+ * Persistence for users and sessions: db.json in development, Supabase in production.
  *
- * The rest of the server only talks to the functions exported here, so this can
- * be swapped for SQLite/Postgres (e.g. via Drizzle) without touching routes.
+ * The rest of the server only talks to the synchronous functions exported here.
  */
 
 export interface CourseMeta {
@@ -126,6 +136,18 @@ interface DbShape {
 
 const DB_FILE = path.join(DATA_DIR, "db.json");
 
+/**
+ * Two backends behind the same synchronous API:
+ * - file (default, dev and tests): db.json is loaded at import and rewritten 250 ms after a change.
+ * - Supabase (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY): a write-through cache. initStore() loads
+ *   everything before the server listens; persist() sends only the users and sessions whose JSON
+ *   changed since the last successful write. Session rows are keyed by sha256(cookie value).
+ */
+const remote = supabaseConfigured ? supabaseClient(env.supabase.url, env.supabase.serviceRoleKey) : null;
+
+/** Name of the active backend, for the startup log. */
+export const storeBackend: "supabase" | "file" = remote ? "supabase" : "file";
+
 function load(): DbShape {
   try {
     const raw = JSON.parse(fs.readFileSync(DB_FILE, "utf8")) as Partial<DbShape>;
@@ -135,8 +157,106 @@ function load(): DbShape {
   }
 }
 
-const db: DbShape = load();
+const db: DbShape = remote ? { users: {}, sessions: {} } : load();
 let writeTimer: NodeJS.Timeout | null = null;
+
+/** Key of a session in `db.sessions`: the raw cookie value in db.json, its hash in Supabase. */
+function sessionKey(sid: string): string {
+  return remote ? sha256(sid) : sid;
+}
+
+/* ---- Supabase write-through state ---- */
+
+let remoteReady = false;
+/** JSON last written (or loaded) per user id / session key: what Supabase holds. */
+const savedUsers = new Map<string, string>();
+const savedSessions = new Map<string, string>();
+let remoteFlush: Promise<void> = Promise.resolve();
+
+/** Loads all users and live sessions from Supabase. Must finish before the server listens. */
+export async function initStore(): Promise<void> {
+  if (!remote || remoteReady) return;
+  const { users: userRows, sessions: sessionRows } = await loadAll(remote);
+  for (const row of userRows) {
+    db.users[row.id] = row.data as UserRecord;
+    savedUsers.set(row.id, JSON.stringify(row.data));
+  }
+  for (const row of sessionRows) {
+    const rec: SessionRecord = {
+      userId: row.user_id,
+      createdAt: Number(row.data?.createdAt) || Date.now(),
+      expiresAt: Date.parse(row.expires_at),
+    };
+    db.sessions[row.token_hash] = rec;
+    savedSessions.set(row.token_hash, JSON.stringify(rec));
+  }
+  remoteReady = true;
+  console.log(`[store] loaded ${userRows.length} users and ${sessionRows.length} sessions from Supabase`);
+}
+
+async function flushRemote(client: SupabaseClient) {
+  if (!remoteReady) return;
+  const userRows: { id: string; data: unknown; json: string }[] = [];
+  for (const [id, u] of Object.entries(db.users)) {
+    const json = JSON.stringify(u);
+    if (savedUsers.get(id) !== json) userRows.push({ id, data: JSON.parse(json), json });
+  }
+  const sessionRows: { row: RemoteSessionRow; json: string }[] = [];
+  for (const [key, s] of Object.entries(db.sessions)) {
+    const json = JSON.stringify(s);
+    if (savedSessions.get(key) !== json) {
+      sessionRows.push({
+        json,
+        row: {
+          token_hash: key,
+          user_id: s.userId,
+          expires_at: new Date(s.expiresAt).toISOString(),
+          data: { createdAt: s.createdAt },
+        },
+      });
+    }
+  }
+  const goneSessions = [...savedSessions.keys()].filter((k) => !(k in db.sessions));
+  const goneUsers = [...savedUsers.keys()].filter((id) => !(id in db.users));
+  if (!userRows.length && !sessionRows.length && !goneSessions.length && !goneUsers.length) return;
+
+  // Users before sessions (foreign key); session deletes before user deletes
+  if (userRows.length) {
+    await upsertUsers(client, userRows.map(({ id, data }) => ({ id, data })));
+    for (const r of userRows) savedUsers.set(r.id, r.json);
+  }
+  if (sessionRows.length) {
+    await upsertSessions(client, sessionRows.map((r) => r.row));
+    for (const r of sessionRows) savedSessions.set(r.row.token_hash, r.json);
+  }
+  if (goneSessions.length) {
+    await deleteRows(client, "sessions", goneSessions);
+    for (const k of goneSessions) savedSessions.delete(k);
+  }
+  if (goneUsers.length) {
+    await deleteRows(client, "users", goneUsers);
+    for (const id of goneUsers) savedUsers.delete(id);
+  }
+}
+
+let retryTimer: NodeJS.Timeout | null = null;
+
+/** Queues a Supabase write after any in-flight one. Unsaved changes stay unsaved and are retried. */
+function queueRemoteFlush(client: SupabaseClient): Promise<void> {
+  remoteFlush = remoteFlush.then(() =>
+    flushRemote(client).catch((e) => {
+      console.error(`[store] failed to persist to Supabase: ${describeError(e)}`);
+      // Retry in 5 s even if nothing else changes
+      if (!retryTimer) {
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          persist();
+        }, 5000);
+      }
+    }),
+  );
+  return remoteFlush;
+}
 
 function flushNow() {
   const tmp = DB_FILE + ".tmp";
@@ -148,6 +268,10 @@ export function persist() {
   if (writeTimer) return;
   writeTimer = setTimeout(() => {
     writeTimer = null;
+    if (remote) {
+      void queueRemoteFlush(remote);
+      return;
+    }
     try {
       flushNow();
     } catch (e) {
@@ -163,12 +287,35 @@ function flushPending() {
   flushNow();
 }
 
-process.on("exit", flushPending);
+/** Writes everything still unsaved to Supabase and waits for it. */
+async function flushRemoteNow(client: SupabaseClient) {
+  if (writeTimer) {
+    clearTimeout(writeTimer);
+    writeTimer = null;
+  }
+  await queueRemoteFlush(client);
+}
 
-// Hosts stop the process with SIGTERM on redeploy; Ctrl+C sends SIGINT. Neither runs
+if (!remote) process.on("exit", flushPending);
+
+// Hosts stop the process with SIGTERM on redeploy and sleep; Ctrl+C sends SIGINT. Neither runs
 // the "exit" handler by default, so flush pending writes before exiting.
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   process.once(signal, () => {
+    if (remote) {
+      // Render allows 30 s after SIGTERM; give up after 20 s rather than be killed mid-write
+      const giveUp = setTimeout(() => {
+        console.error("[store] Supabase flush on shutdown timed out");
+        process.exit(1);
+      }, 20_000);
+      flushRemoteNow(remote)
+        .catch((e) => console.error(`[store] failed to persist on shutdown: ${describeError(e)}`))
+        .finally(() => {
+          clearTimeout(giveUp);
+          process.exit(0);
+        });
+      return;
+    }
     try {
       flushPending();
     } catch (e) {
@@ -252,21 +399,22 @@ const SESSION_TTL = 1000 * 60 * 60 * 24 * 30; // 30 days
 
 export const sessions = {
   create(sid: string, userId: string) {
-    db.sessions[sid] = { userId, createdAt: Date.now(), expiresAt: Date.now() + SESSION_TTL };
+    db.sessions[sessionKey(sid)] = { userId, createdAt: Date.now(), expiresAt: Date.now() + SESSION_TTL };
     persist();
   },
   get(sid: string): SessionRecord | undefined {
-    const s = db.sessions[sid];
+    const key = sessionKey(sid);
+    const s = db.sessions[key];
     if (!s) return undefined;
     if (s.expiresAt < Date.now()) {
-      delete db.sessions[sid];
+      delete db.sessions[key];
       persist();
       return undefined;
     }
     return s;
   },
   delete(sid: string) {
-    delete db.sessions[sid];
+    delete db.sessions[sessionKey(sid)];
     persist();
   },
 };

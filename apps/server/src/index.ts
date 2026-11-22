@@ -59,7 +59,7 @@ import {
   subscribeNotifications,
   vapidKeys,
 } from "./poller.js";
-import { newUser, sessions, users, type PushSub, type UserRecord } from "./store.js";
+import { initStore, newUser, sessions, storeBackend, users, type PushSub, type UserRecord } from "./store.js";
 
 const SESSION_COOKIE = "myclass_sid";
 
@@ -231,6 +231,7 @@ app.onError((err, c) => {
 /* Public / Auth routes                                                */
 /* ------------------------------------------------------------------ */
 
+// For uptime pingers: never touches the store, Supabase or eClass
 app.get("/api/health", (c) => c.json({ ok: true, time: new Date().toISOString() }));
 
 app.post("/api/auth/login", async (c) => {
@@ -1070,10 +1071,21 @@ export { app };
 
 // Tests import the app without starting the poller or listening on a port
 if (!process.env.VITEST) {
+  // Users and sessions must be in memory before the first request or poll, so a login never
+  // overwrites a stored account with a fresh record
+  try {
+    await initStore();
+  } catch (e) {
+    console.error(`[store] could not load data from Supabase, not starting: ${(e as Error).message}`);
+    process.exit(1);
+  }
+
   startBackgroundPoller();
 
   serve({ fetch: app.fetch, port: env.port }, (info) => {
-    console.log(`myClass server listening on http://localhost:${info.port} (pid ${process.pid})`);
+    console.log(
+      `myClass server listening on http://localhost:${info.port} (pid ${process.pid}, store: ${storeBackend})`,
+    );
     void checkServerGeminiKey();
   });
 }

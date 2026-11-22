@@ -1,6 +1,6 @@
 {
   "name": "@myclass/server",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,11 +9,13 @@
     "build": "tsc -p tsconfig.json --noEmit",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "probe": "tsx scripts/probe.ts"
+    "probe": "tsx scripts/probe.ts",
+    "migrate:supabase": "tsx scripts/migrate-to-supabase.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",
     "@myclass/shared": "*",
+    "@supabase/supabase-js": "^2.119.2",
     "@types/archiver": "^6.0.3",
     "@types/node": "^22.10.2",
     "@types/web-push": "^3.6.4",
