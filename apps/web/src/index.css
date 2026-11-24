@@ -36,6 +36,14 @@
   --accent-hover: #6654b8;
   --accent-soft: #edeaf8;
   --accent-text: #52428f;
+  /* Field outlines and control tracks: stronger than card borders */
+  --border-strong: #b9bac6;
+  /* Segmented controls: the chosen option sits on a raised pill */
+  --pill: #ffffff;
+  --skeleton: #e9e9ef;
+  /* Per-course colours: hue from the course code, saturation and lightness from the theme */
+  --course-s: 42%;
+  --course-l: 50%;
   /* Starred files: the one yellow in the app */
   --star: #d99a00;
   --on-accent: #ffffff;
@@ -74,6 +82,11 @@ html.dark {
   --accent-hover: #c4bcee;
   --accent-soft: #26252f;
   --accent-text: #d8d3f2;
+  --border-strong: #4c4f5c;
+  --pill: #33363f;
+  --skeleton: #24262d;
+  --course-s: 40%;
+  --course-l: 68%;
   --star: #f2c14e;
   --on-accent: #17161d;
   --ok: #7cc79a;
@@ -147,6 +160,45 @@ h2,
 }
 h2 {
   font-weight: 500;
+}
+/* Larger, more readable section and card titles (rem-based, so Settings > Text size scales them) */
+.section-title {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 1.1875rem;
+  line-height: 1.3;
+}
+.card-title {
+  font-weight: 600;
+  font-size: 0.9375rem;
+  line-height: 1.4;
+  text-wrap: pretty;
+}
+/* Times, dates and counts line up */
+time,
+.num {
+  font-variant-numeric: tabular-nums;
+}
+.nowrap {
+  white-space: nowrap;
+}
+.measure {
+  max-width: 68ch;
+}
+
+/* Loading placeholders: the shape of what is coming, a slow pulse (none with reduced motion) */
+@keyframes skeleton-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+.skeleton {
+  background: var(--skeleton);
+  border-radius: 8px;
+  animation: skeleton-pulse 1.6s ease-in-out infinite;
+}
+html.reduce-motion .skeleton {
+  animation: none !important;
 }
 
 /* ------------------------------------------------------------------ */

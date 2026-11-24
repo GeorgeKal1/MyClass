@@ -71,7 +71,9 @@ import {
   CourseToolsPanel,
   DeadlineCalendar,
   DocumentSummaryButton,
+  relativeDue,
 } from "./features";
+import { courseColor } from "./ui";
 import { StatsView } from "./stats";
 import { StudyButton } from "./study";
 import { aiReadable, DocumentViewer, type DocTab } from "./docviewer";
@@ -437,6 +439,19 @@ function Workspace({
   const [lastPollAt, setLastPollAt] = useState<string | undefined>();
   const [syncing, setSyncing] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+
+  // Ctrl/Cmd + K opens search from anywhere
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((o) => !o);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const [quickChatOpen, setQuickChatOpen] = useState(false);
 
   const theme: ThemePref = me.settings.theme;
@@ -902,7 +917,20 @@ function Workspace({
           </div>
         </div>
 
-        <nav className="space-y-0.5 flex-1">
+        <button
+          type="button"
+          onClick={() => setPaletteOpen(true)}
+          aria-keyshortcuts="Control+K Meta+K"
+          className="mb-3 w-full flex items-center justify-between gap-2 min-h-10 px-3 rounded-lg border border-[var(--border)] text-sm text-[var(--muted)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] cursor-pointer"
+        >
+          <span className="flex items-center gap-2">
+            <Search className="w-4 h-4" aria-hidden />
+            <span>{lang === "el" ? "Αναζήτηση" : "Search"}</span>
+          </span>
+          <kbd className="text-xs font-sans text-[var(--muted)]">Ctrl K</kbd>
+        </button>
+
+        <nav className="space-y-1 flex-1">
           <NavButton
             icon={<HomeIcon className="w-4 h-4" />}
             label={tr("navHome")}
@@ -991,6 +1019,9 @@ function Workspace({
             </span>
           </div>
           <div className="flex items-center gap-0.5">
+            <IconButton label={lang === "el" ? "Αναζήτηση" : "Search"} onClick={() => setPaletteOpen(true)}>
+              <Search className="w-4 h-4" />
+            </IconButton>
             <IconButton label={syncing ? tr("syncing") : tr("syncNow")} onClick={() => void syncNow()} disabled={syncing}>
               <RefreshCw className={`w-4 h-4 ${syncing ? "animate-spin text-[var(--accent)]" : ""}`} />
             </IconButton>
@@ -1015,6 +1046,19 @@ function Workspace({
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
+        )}
+
+        {paletteOpen && (
+          <CommandPalette
+            lang={lang}
+            courses={courses}
+            announcements={announcements}
+            assignments={assignments}
+            tabLabels={tabLabels}
+            onClose={() => setPaletteOpen(false)}
+            onGoTab={(next) => navigateTab(next)}
+            onOpenCourse={(code, sub, id) => openCourse(code, sub, id)}
+          />
         )}
 
         {/* Active View with Touch Swipe Gesture Support */}
@@ -1226,6 +1270,196 @@ function Workspace({
 }
 
 /* ================================================================== */
+/* Search everywhere (Ctrl/Cmd + K): pages, courses, announcements,    */
+/* deadlines. Only what is already loaded: it never asks eClass.       */
+/* ================================================================== */
+
+/** Folds Greek and Latin text for matching: no accents, lower case, single spaces. */
+const foldTitle = (s: string) =>
+  s
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLocaleLowerCase("el")
+    .replace(/\s+/g, " ")
+    .trim();
+
+/** The course code a student recognises, or null when eClass only has an internal folder id. */
+function displayCourseCode(c: { code: string; publicCode?: string }): string | null {
+  const isInternal = (x: string) => /-COURSES?-/i.test(x);
+  if (c.publicCode && !isInternal(c.publicCode)) return c.publicCode;
+  return isInternal(c.code) ? null : c.code;
+}
+
+type PaletteHit =
+  | { kind: "page"; key: string; label: string; tab: Tab }
+  | { kind: "course"; key: string; label: string; detail?: string; code: string }
+  | { kind: "announcement"; key: string; label: string; detail?: string; code: string }
+  | { kind: "deadline"; key: string; label: string; detail?: string; code: string; id: string };
+
+function CommandPalette({
+  lang,
+  courses,
+  announcements,
+  assignments,
+  tabLabels,
+  onClose,
+  onGoTab,
+  onOpenCourse,
+}: {
+  lang: Lang;
+  courses: Course[];
+  announcements: Announcement[];
+  assignments: Assignment[];
+  tabLabels: Record<Tab, string>;
+  onClose: () => void;
+  onGoTab: (tab: Tab) => void;
+  onOpenCourse: (code: string, sub: CourseSubTab, assignmentId?: string) => void;
+}) {
+  const el = lang === "el";
+  const [q, setQ] = useState("");
+  const [active, setActive] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listId = useMemo(() => `palette-${Math.random().toString(36).slice(2, 8)}`, []);
+  useEffect(() => {
+    const restore = document.activeElement as HTMLElement | null;
+    inputRef.current?.focus();
+    return () => restore?.focus?.();
+  }, []);
+
+  const hits = useMemo<PaletteHit[]>(() => {
+    const needle = foldTitle(q);
+    const has = (...parts: Array<string | undefined>) => !needle || parts.some((x) => x && foldTitle(x).includes(needle));
+    const pages: PaletteHit[] = TAB_ORDER.filter((tab) => has(tabLabels[tab])).map((tab) => ({ kind: "page", key: `p-${tab}`, label: tabLabels[tab], tab }));
+    const cs: PaletteHit[] = courses
+      .filter((c) => !c.archived && has(c.title, c.publicCode, c.professor))
+      .slice(0, 8)
+      .map((c) => ({ kind: "course", key: `c-${c.code}`, label: c.title, detail: [displayCourseCode(c), c.professor].filter(Boolean).join(" · "), code: c.code }));
+    const anns: PaletteHit[] = needle
+      ? announcements
+          .filter((a) => has(a.title, a.courseTitle))
+          .slice(0, 6)
+          .map((a) => ({ kind: "announcement", key: `a-${a.id}`, label: a.title, detail: `${a.courseTitle ?? a.courseCode} · ${shortDate(a.date, lang)}`, code: a.courseCode }))
+      : [];
+    const now = Date.now();
+    const dls: PaletteHit[] = assignments
+      .filter((a) => a.deadline && new Date(a.deadline).getTime() >= now - 86_400_000 && has(a.title, a.courseTitle))
+      .sort((a, b) => new Date(a.deadline!).getTime() - new Date(b.deadline!).getTime())
+      .slice(0, needle ? 6 : 3)
+      .map((a) => ({
+        kind: "deadline",
+        key: `d-${a.id}`,
+        label: a.title,
+        detail: `${a.courseTitle ?? a.courseCode} · ${relativeDue(a.deadline!, lang)}`,
+        code: a.courseCode,
+        id: a.id,
+      }));
+    return [...pages, ...cs, ...dls, ...anns];
+  }, [q, courses, announcements, assignments, tabLabels, lang]);
+
+  useEffect(() => setActive(0), [q]);
+
+  const choose = (h: PaletteHit | undefined) => {
+    if (!h) return;
+    onClose();
+    if (h.kind === "page") onGoTab(h.tab);
+    else if (h.kind === "course") onOpenCourse(h.code, "documents");
+    else if (h.kind === "announcement") onOpenCourse(h.code, "announcements");
+    else onOpenCourse(h.code, "assignments", h.id);
+  };
+
+  const groupLabel: Record<PaletteHit["kind"], string> = {
+    page: el ? "Σελίδες" : "Pages",
+    course: el ? "Μαθήματα" : "Courses",
+    deadline: el ? "Προθεσμίες" : "Deadlines",
+    announcement: el ? "Ανακοινώσεις" : "Announcements",
+  };
+  const icon = (k: PaletteHit["kind"]) =>
+    k === "page" ? <ArrowUpRight className="w-4 h-4" /> : k === "course" ? <BookOpen className="w-4 h-4" /> : k === "deadline" ? <Clock className="w-4 h-4" /> : <Megaphone className="w-4 h-4" />;
+
+  return createPortal(
+    <div
+      className="overlay-in fixed inset-0 z-[95] bg-black/50 flex items-start justify-center p-3 sm:pt-[12vh]"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchMove={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+    >
+      <div role="dialog" aria-modal="true" aria-label={el ? "Αναζήτηση" : "Search"} className="enter w-full max-w-xl rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-xl shadow-black/20 overflow-hidden">
+        <div className="flex items-center gap-2 px-3 border-b border-[var(--border)]">
+          <Search className="w-4 h-4 text-[var(--muted)] shrink-0" aria-hidden />
+          <input
+            ref={inputRef}
+            role="combobox"
+            aria-expanded="true"
+            aria-controls={listId}
+            aria-activedescendant={hits[active] ? `${listId}-${active}` : undefined}
+            aria-autocomplete="list"
+            aria-label={el ? "Αναζήτηση σε μαθήματα, ανακοινώσεις και προθεσμίες" : "Search courses, announcements and deadlines"}
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                onClose();
+              } else if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setActive((i) => Math.min(hits.length - 1, i + 1));
+              } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setActive((i) => Math.max(0, i - 1));
+              } else if (e.key === "Enter") {
+                e.preventDefault();
+                choose(hits[active]);
+              }
+            }}
+            placeholder={el ? "Μάθημα, ανακοίνωση, προθεσμία ή σελίδα…" : "Course, announcement, deadline or page…"}
+            className="flex-1 min-w-0 min-h-14 bg-transparent text-base outline-none placeholder:text-[var(--muted)]"
+          />
+          <kbd className="hidden sm:inline text-xs text-[var(--muted)] border border-[var(--border)] rounded px-1.5 py-0.5 font-sans">Esc</kbd>
+        </div>
+        <ul id={listId} role="listbox" aria-label={el ? "Αποτελέσματα" : "Results"} className="max-h-[60vh] overflow-y-auto p-1.5">
+          {hits.length === 0 ? (
+            <li className="px-3 py-8 text-center text-sm text-[var(--muted)]">
+              {el ? `Τίποτα για «${q.trim()}».` : `Nothing for “${q.trim()}”.`}
+            </li>
+          ) : (
+            hits.map((h, i) => (
+              <React.Fragment key={h.key}>
+                {(i === 0 || hits[i - 1].kind !== h.kind) && (
+                  <li role="presentation" className="px-3 pt-2.5 pb-1 text-xs font-semibold text-[var(--muted)]">
+                    {groupLabel[h.kind]}
+                  </li>
+                )}
+                <li
+                  id={`${listId}-${i}`}
+                  role="option"
+                  aria-selected={i === active}
+                  onMouseEnter={() => setActive(i)}
+                  onClick={() => choose(h)}
+                  className={`flex items-center gap-3 px-3 min-h-11 py-2 rounded-lg cursor-pointer ${i === active ? "bg-[var(--surface-2)]" : ""}`}
+                >
+                  <span className="text-[var(--muted)] shrink-0" aria-hidden>
+                    {icon(h.kind)}
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium truncate">{h.label}</span>
+                    {"detail" in h && h.detail && <span className="block text-xs text-[var(--muted)] truncate">{h.detail}</span>}
+                  </span>
+                </li>
+              </React.Fragment>
+            ))
+          )}
+        </ul>
+        <p className="px-4 py-2 border-t border-[var(--border)] text-xs text-[var(--muted)]">
+          {el ? "Τα αρχεία ψάχνονται μέσα σε κάθε μάθημα (Αρχεία → αναζήτηση με AI)." : "Files are searched inside each course (Files → AI search)."}
+        </p>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+/* ================================================================== */
 /* Notifications bell (sidebar on desktop, top bar on phones)          */
 /* ================================================================== */
 
@@ -1390,7 +1624,8 @@ function IconButton({
     });
   };
 
-  const className = `relative inline-flex p-2 rounded-lg transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-default ${
+  // 40 x 40: a comfortable touch target everywhere
+  const className = `relative inline-flex items-center justify-center w-10 h-10 shrink-0 rounded-lg transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-default ${
     active
       ? "text-[var(--accent)] bg-[var(--accent-soft)]"
       : tone === "danger"
@@ -1658,41 +1893,127 @@ function HomeView({
     }
   }, []);
 
+  const isAction = (a: Announcement) => triage[a.id]?.label === "action";
+  const el = lang === "el";
+  // The next deadline still open; when everything ahead is handed in, the next one anyway (marked as handed in)
+  const upcoming = assignments
+    .filter((a) => a.deadline && new Date(a.deadline).getTime() >= now)
+    .sort((a, b) => new Date(a.deadline!).getTime() - new Date(b.deadline!).getTime());
+  const nextDue = upcoming.find((a) => !a.submitted) ?? upcoming[0];
+  const scrollTo = (ref: React.RefObject<HTMLElement | null>) =>
+    ref.current?.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+  const annRef = useRef<HTMLElement>(null);
+
   const chip =
-    "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-[var(--surface)] border border-[var(--border)] hover:border-[var(--accent)] cursor-pointer";
+    "shrink-0 whitespace-nowrap inline-flex items-center gap-1.5 min-h-10 px-3.5 rounded-full text-sm font-medium bg-[var(--surface)] border border-[var(--border)] hover:border-[var(--accent)] cursor-pointer tabular-nums";
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-6">
+      {/* Today: the next deadline, what needs action, new messages */}
+      <section aria-label={el ? "Σήμερα" : "Today"} className="grid grid-cols-2 md:grid-cols-3 gap-3">
+        <div className="col-span-2 md:col-span-1 rounded-2xl bg-[var(--accent-soft)] border border-[var(--accent)]/25 p-4 min-h-[7.5rem] flex flex-col">
+          <div className="text-xs font-semibold text-[var(--accent-text)] flex items-center gap-1.5">
+            <Clock className="w-3.5 h-3.5" aria-hidden />
+            {el ? "Επόμενη προθεσμία" : "Next deadline"}
+          </div>
+          {nextDue ? (
+            <button
+              type="button"
+              onClick={() => onOpenCourse(nextDue.courseCode, "assignments", nextDue.id)}
+              className="mt-2 group block text-left cursor-pointer"
+            >
+              <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                <span className="font-display text-2xl leading-tight tabular-nums text-[var(--text)]">
+                  {countdown(nextDue.deadline!, lang, now)}
+                </span>
+                {nextDue.submitted && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium bg-[var(--ok-soft)] text-[var(--ok)]">
+                    <CheckCircle2 className="w-3.5 h-3.5" aria-hidden />
+                    {el ? "Παραδόθηκε" : "Handed in"}
+                  </span>
+                )}
+              </span>
+              <span className="block text-sm font-medium mt-1 line-clamp-2 group-hover:underline" title={nextDue.title}>
+                {nextDue.title}
+              </span>
+              <span className="block text-xs text-[var(--muted)] mt-0.5 truncate">
+                {nextDue.courseTitle ?? nextDue.courseCode} ·{" "}
+                <time dateTime={nextDue.deadline}>
+                  {new Date(nextDue.deadline!).toLocaleString(el ? "el-GR" : "en-GB", {
+                    weekday: "short",
+                    day: "numeric",
+                    month: "short",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </time>
+              </span>
+            </button>
+          ) : (
+            <p className="mt-3 text-sm text-[var(--muted)]">
+              {assignmentsLoading && assignments.length === 0
+                ? el
+                  ? "Φόρτωση εργασιών…"
+                  : "Loading assignments…"
+                : el
+                  ? "Καμία προθεσμία μπροστά σου."
+                  : "No deadlines ahead."}
+            </p>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            setAnnFilter("action");
+            scrollTo(annRef);
+          }}
+          className="text-left rounded-2xl bg-[var(--surface)] border border-[var(--border)] hover:border-[var(--accent)] p-4 min-h-[7.5rem] flex flex-col cursor-pointer"
+        >
+          <span className="text-xs font-semibold text-[var(--muted)] flex items-center gap-1.5">
+            <CircleAlert className="w-3.5 h-3.5 text-[var(--warn)]" aria-hidden />
+            {el ? "Χρειάζεται ενέργεια" : "Action needed"}
+          </span>
+          <span className="font-display text-3xl leading-none mt-3 tabular-nums">{actionCount}</span>
+          <span className="text-xs text-[var(--muted)] mt-auto pt-2">{el ? "ανακοινώσεις" : "announcements"}</span>
+        </button>
+        <button
+          type="button"
+          onClick={onOpenInbox}
+          className="text-left rounded-2xl bg-[var(--surface)] border border-[var(--border)] hover:border-[var(--accent)] p-4 min-h-[7.5rem] flex flex-col cursor-pointer"
+        >
+          <span className="text-xs font-semibold text-[var(--muted)] flex items-center gap-1.5">
+            <Mail className="w-3.5 h-3.5" aria-hidden />
+            {tr("unreadMessages")}
+          </span>
+          <span className="font-display text-3xl leading-none mt-3 tabular-nums">{unreadMessages.length}</span>
+          <span className="text-xs text-[var(--muted)] mt-auto pt-2">{el ? "στα Εισερχόμενα" : "in Inbox"}</span>
+        </button>
+      </section>
+
       {/* Quick stats */}
       <div className="flex flex-wrap items-center gap-2">
-        <button onClick={onOpenEnrolledCourses} className={chip}>
-          <BookOpen className="w-3.5 h-3.5 text-[var(--muted)]" />
-          {activeCourses.length} {lang === "el" ? "μαθήματα" : "courses"}
+        <button type="button" onClick={onOpenEnrolledCourses} className={chip}>
+          <BookOpen className="w-4 h-4 text-[var(--muted)]" aria-hidden />
+          {activeCourses.length} {el ? "μαθήματα" : "courses"}
         </button>
-        <span className={chip.replace("hover:border-[var(--accent)] cursor-pointer", "")}>
-          <Clock className="w-3.5 h-3.5 text-[var(--warn)]" />
-          {dueThisWeek.length} {lang === "el" ? (dueThisWeek.length === 1 ? "προθεσμία αυτή την εβδομάδα" : "προθεσμίες αυτή την εβδομάδα") : "due this week"}
+        <button type="button" onClick={() => scrollTo(calendarRef)} className={chip}>
+          <Clock className="w-4 h-4 text-[var(--warn)]" aria-hidden />
+          {dueThisWeek.length} {el ? (dueThisWeek.length === 1 ? "προθεσμία αυτή την εβδομάδα" : "προθεσμίες αυτή την εβδομάδα") : "due this week"}
           {openThisWeek < dueThisWeek.length && (
             <span className="ml-1 text-[var(--muted)] font-normal">
               · {dueThisWeek.length - openThisWeek}{" "}
-              {lang === "el" ? (dueThisWeek.length - openThisWeek === 1 ? "παραδόθηκε" : "παραδόθηκαν") : "handed in"}
+              {el ? (dueThisWeek.length - openThisWeek === 1 ? "παραδόθηκε" : "παραδόθηκαν") : "handed in"}
             </span>
           )}
-        </span>
-        {unreadMessages.length > 0 && (
-          <button onClick={onOpenInbox} className={chip}>
-            <Mail className="w-3.5 h-3.5 text-[var(--muted)]" />
-            {unreadMessages.length} {lang === "el" ? "νέα μηνύματα" : "new messages"}
-          </button>
-        )}
-        <button onClick={onOpenAssistant} className={chip}>
-          <Bot className="w-3.5 h-3.5 text-[var(--muted)]" />
-          {lang === "el" ? "Ρώτα τον βοηθό" : "Ask the assistant"}
+        </button>
+        <button type="button" onClick={onOpenAssistant} className={chip}>
+          <Bot className="w-4 h-4 text-[var(--muted)]" aria-hidden />
+          {el ? "Ρώτα τον βοηθό" : "Ask the assistant"}
         </button>
         {lastPollAt && (
           <span className="text-xs text-[var(--muted)] ml-auto">
-            {lang === "el" ? "Ενημέρωση" : "Updated"}{" "}
-            {new Date(lastPollAt).toLocaleTimeString(lang === "el" ? "el-GR" : "en-US", {
+            {el ? "Ενημέρωση" : "Updated"}{" "}
+            {new Date(lastPollAt).toLocaleTimeString(el ? "el-GR" : "en-US", {
               hour: "2-digit",
               minute: "2-digit",
             })}
@@ -1700,9 +2021,9 @@ function HomeView({
         )}
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-5 gap-5">
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-6">
         {/* Calendar first on phones (deadlines are the most actionable), right column on desktop */}
-        <div ref={calendarRef} className="xl:col-span-2 xl:order-2 space-y-5 scroll-mt-4">
+        <div ref={calendarRef} className="xl:col-span-2 xl:order-2 space-y-6 scroll-mt-4 min-w-0">
           <DeadlineCalendar
             lang={lang}
             assignments={assignments}
@@ -1712,18 +2033,19 @@ function HomeView({
           />
 
           {unreadMessages.length > 0 && (
-            <section className="space-y-2">
-              <h2 className="text-sm font-semibold flex items-center gap-2">
-                <Mail className="w-4 h-4 text-[var(--muted)]" />
+            <section aria-labelledby="home-msg-title" className="space-y-2.5">
+              <h2 id="home-msg-title" className="section-title flex items-center gap-2">
+                <Mail className="w-[1.125rem] h-[1.125rem] text-[var(--muted)]" aria-hidden />
                 <span>{tr("unreadMessages")}</span>
               </h2>
               {unreadMessages.slice(0, 4).map((m) => (
                 <button
                   key={m.id}
+                  type="button"
                   onClick={onOpenInbox}
                   className="w-full text-left p-3.5 rounded-2xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50 transition-colors cursor-pointer"
                 >
-                  <div className="text-sm font-medium truncate">{m.subject}</div>
+                  <div className="card-title truncate">{m.subject}</div>
                   <div className="text-xs text-[var(--muted)] mt-0.5 truncate">
                     {m.sender} · {m.courseTitle ?? "eClass"}
                   </div>
@@ -1733,10 +2055,10 @@ function HomeView({
           )}
         </div>
 
-        <section className="xl:col-span-3 xl:order-1 space-y-3">
+        <section ref={annRef} aria-labelledby="home-ann-title" className="xl:col-span-3 xl:order-1 space-y-3 scroll-mt-4 min-w-0">
           <div className="flex items-center justify-between gap-3 flex-wrap">
-            <h2 className="text-sm font-semibold flex items-center gap-2">
-              <Bell className="w-4 h-4 text-[var(--muted)]" />
+            <h2 id="home-ann-title" className="section-title flex items-center gap-2">
+              <Megaphone className="w-[1.125rem] h-[1.125rem] text-[var(--muted)]" aria-hidden />
               <span>{tr("recentAnnouncements")}</span>
             </h2>
             {announcements.length > 0 && (
@@ -1744,83 +2066,133 @@ function HomeView({
                 value={annFilter}
                 onChange={setAnnFilter}
                 options={[
-                  { value: "all", label: lang === "el" ? "Όλες" : "All" },
+                  { value: "all", label: el ? "Όλες" : "All" },
                   {
                     value: "action",
-                    label: `${lang === "el" ? "Χρειάζεται ενέργεια" : "Action needed"}${actionCount ? ` ${actionCount}` : ""}`,
+                    label: `${el ? "Χρειάζεται ενέργεια" : "Action needed"}${actionCount ? ` ${actionCount}` : ""}`,
                   },
-                  { value: "fyi", label: lang === "el" ? "Για ενημέρωση" : "FYI" },
+                  { value: "fyi", label: el ? "Για ενημέρωση" : "FYI" },
                 ]}
               />
             )}
           </div>
-          <div className="space-y-2.5">
-            {shownAnnouncements.length === 0 ? (
-              <EmptyCard
-                text={
-                  annFilter === "action"
-                    ? lang === "el"
-                      ? "Καμία ανακοίνωση δεν ζητά κάτι από σένα."
-                      : "No announcement asks anything of you."
-                    : tr("noItems")
-                }
-              />
-            ) : (
-              shownAnnouncements.map((a) => (
-                <button
+          {shownAnnouncements.length === 0 ? (
+            <EmptyCard
+              text={
+                annFilter === "action"
+                  ? el
+                    ? "Καμία ανακοίνωση δεν ζητά κάτι από σένα."
+                    : "No announcement asks anything of you."
+                  : tr("noItems")
+              }
+            />
+          ) : (
+            <ul className="space-y-2.5">
+              {shownAnnouncements.map((a) => (
+                <AnnouncementCard
                   key={a.id}
-                  onClick={() => onOpenCourse(a.courseCode, "announcements")}
-                  className="w-full text-left px-4 py-3 rounded-2xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]/50 transition-colors cursor-pointer"
-                >
-                  {/* Home stays a glance: the title, then one line. The full text is a tap away. */}
-                  <div className="flex items-baseline justify-between gap-3">
-                    <div className="text-sm font-semibold leading-snug truncate">{a.title}</div>
-                    <span className="shrink-0 text-xs text-[var(--muted)] tabular-nums">
-                      {new Date(a.date).toLocaleDateString(lang === "el" ? "el-GR" : "en-US", {
-                        day: "numeric",
-                        month: "short",
-                      })}
-                    </span>
-                  </div>
-                  {triage[a.id]?.label === "action" ? (
-                    <p className="mt-0.5 flex items-center gap-1.5 text-xs font-medium text-[var(--warn)] min-w-0">
-                      <CircleAlert className="w-3.5 h-3.5 shrink-0" />
-                      <span className="truncate">
-                        {triage[a.id]?.reason ?? (lang === "el" ? "Χρειάζεται ενέργεια" : "Action needed")}
-                        <span className="font-normal text-[var(--muted)]"> · {a.courseTitle ?? a.courseCode}</span>
-                      </span>
-                    </p>
-                  ) : (
-                    <p className="mt-0.5 text-xs text-[var(--muted)] truncate">
-                      <span className="font-medium text-[var(--accent-text)]">{a.courseTitle ?? a.courseCode}</span>
-                      {a.contentText ? ` · ${a.contentText}` : ""}
-                    </p>
-                  )}
-                </button>
-              ))
-            )}
-          </div>
+                  lang={lang}
+                  a={a}
+                  action={isAction(a)}
+                  reason={triage[a.id]?.reason}
+                  onOpen={() => onOpenCourse(a.courseCode, "announcements")}
+                />
+              ))}
+            </ul>
+          )}
 
           <div className="flex flex-wrap items-center gap-2 pt-2">
             <button
+              type="button"
               onClick={onOpenAllCourses}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)] cursor-pointer"
+              className="inline-flex items-center gap-1.5 min-h-10 px-3.5 rounded-xl text-sm font-medium border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)] cursor-pointer"
             >
-              <FolderOpen className="w-3.5 h-3.5 text-[var(--muted)]" />
+              <FolderOpen className="w-4 h-4 text-[var(--muted)]" aria-hidden />
               {tr("coursesTitle")}
               {catalogCount > 0 && <span className="text-[var(--muted)]">{catalogCount}</span>}
             </button>
             <a
               href="/api/documents/zip-all"
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]"
+              className="inline-flex items-center gap-1.5 min-h-10 px-3.5 rounded-xl text-sm font-medium border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)]"
             >
-              <Download className="w-3.5 h-3.5 text-[var(--muted)]" />
+              <Download className="w-4 h-4 text-[var(--muted)]" aria-hidden />
               {tr("downloadAllCourses")}
             </a>
           </div>
         </section>
       </div>
     </div>
+  );
+}
+
+/** Time left until a deadline, for the "Next deadline" box on Home. */
+function countdown(iso: string, lang: Lang, now = Date.now()): string {
+  const ms = new Date(iso).getTime() - now;
+  const min = Math.max(0, Math.round(ms / 60_000));
+  const d = Math.floor(min / 1440);
+  const h = Math.floor((min % 1440) / 60);
+  const m = min % 60;
+  if (lang === "el") {
+    if (d > 0) return `σε ${d} ${d === 1 ? "ημέρα" : "ημέρες"}${h ? ` ${h} ${h === 1 ? "ώρα" : "ώρες"}` : ""}`;
+    if (h > 0) return `σε ${h} ${h === 1 ? "ώρα" : "ώρες"}${m ? ` ${m} λ.` : ""}`;
+    return `σε ${m} λεπτά`;
+  }
+  if (d > 0) return `in ${d} ${d === 1 ? "day" : "days"}${h ? ` ${h} h` : ""}`;
+  if (h > 0) return `in ${h} h${m ? ` ${m} min` : ""}`;
+  return `in ${m} min`;
+}
+
+/**
+ * One announcement on Home: a bar in the course's colour, a two-line title (whole title on hover),
+ * the course, and for requests the reason.
+ */
+function AnnouncementCard({
+  lang,
+  a,
+  action,
+  reason,
+  onOpen,
+}: {
+  lang: Lang;
+  a: Announcement;
+  action: boolean;
+  reason?: string;
+  onOpen: () => void;
+}) {
+  const el = lang === "el";
+  const preview = a.contentText.replace(/\s+/g, " ").trim();
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onOpen}
+        className={`w-full text-left flex gap-3 px-3 py-3 rounded-2xl border bg-[var(--surface)] transition-colors hover:border-[var(--accent)]/50 cursor-pointer ${
+          action ? "border-[var(--warn)]/40" : "border-[var(--border)]"
+        }`}
+      >
+        <span aria-hidden className="w-1 self-stretch rounded-full shrink-0" style={{ background: courseColor(a.courseCode) }} />
+        <span className="min-w-0 flex-1">
+          <span className="flex items-start justify-between gap-3">
+            <span className="card-title line-clamp-2 min-w-0" title={a.title}>
+              {a.title}
+            </span>
+            <time dateTime={a.date} className="shrink-0 text-xs text-[var(--muted)] tabular-nums pt-0.5">
+              {new Date(a.date).toLocaleDateString(el ? "el-GR" : "en-US", { day: "numeric", month: "short" })}
+            </time>
+          </span>
+          <span className="block mt-0.5 text-xs text-[var(--muted)] line-clamp-1">
+            <span className="font-medium">{a.courseTitle ?? a.courseCode}</span>
+            {preview && !action ? ` · ${preview}` : ""}
+          </span>
+          {action && (
+            <span className="mt-2 inline-flex items-center gap-1.5 max-w-full px-2 py-0.5 rounded-md text-xs font-medium bg-[var(--warn-soft)] text-[var(--warn)]">
+              <CircleAlert className="w-3.5 h-3.5 shrink-0" aria-hidden />
+              <span className="line-clamp-1">{reason || (el ? "Χρειάζεται ενέργεια" : "Action needed")}</span>
+            </span>
+          )}
+        </span>
+      </button>
+    </li>
   );
 }
 
@@ -2679,7 +3051,8 @@ function CourseRow({
   const tr = (k: DictKey) => t(lang, k);
   const press = useLongPress(onLongPress);
   return (
-    <li className="group flex items-center gap-2 pl-4 pr-2 hover:bg-[var(--surface-2)] active:bg-[var(--surface-2)] sm:active:bg-[var(--surface-2)]">
+    <li className="group flex items-center gap-3 pl-4 pr-2 hover:bg-[var(--surface-2)] active:bg-[var(--surface-2)] sm:active:bg-[var(--surface-2)]">
+      <span aria-hidden className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: courseColor(c.code) }} />
       {/* Title on its own line; code and teacher share a quiet second line */}
       <button
         type="button"
@@ -2749,7 +3122,7 @@ function CourseRow({
                   : undefined
             }
             aria-label={tr("enrollBtn")}
-            className="inline-flex items-center justify-center gap-1.5 w-9 h-9 sm:w-auto sm:h-8 sm:px-3 rounded-lg text-xs font-medium border border-[var(--border)] text-[var(--text)] hover:border-[var(--accent)] hover:text-[var(--accent-text)] cursor-pointer disabled:opacity-40 disabled:cursor-default"
+            className="inline-flex items-center justify-center gap-1.5 w-10 h-10 sm:w-auto sm:px-3 rounded-lg text-sm font-medium border border-[var(--border-strong)] text-[var(--text)] hover:border-[var(--accent)] hover:text-[var(--accent-text)] cursor-pointer disabled:opacity-40 disabled:cursor-default"
           >
             {busy ? (
               <RefreshCw className="w-4 h-4 sm:w-3.5 sm:h-3.5 animate-spin" />
@@ -3631,57 +4004,6 @@ function shortDate(iso: string, lang: Lang): string {
     : d.toLocaleDateString(locale, { day: "numeric", month: "short" });
 }
 
-/** A section heading; with `open` + `onToggle` the whole title folds its section open and shut. */
-function SectionTitle({
-  icon,
-  title,
-  count,
-  action,
-  open,
-  onToggle,
-  controls,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  count?: number;
-  action?: React.ReactNode;
-  open?: boolean;
-  onToggle?: () => void;
-  /** id of the region the toggle shows and hides */
-  controls?: string;
-}) {
-  const label = (
-    <>
-      <span className="text-[var(--muted)]">{icon}</span>
-      <span>{title}</span>
-      {!!count && <span className="text-xs font-normal text-[var(--muted)] tabular-nums">{count}</span>}
-    </>
-  );
-  return (
-    <div className={`flex items-center justify-between gap-2 shrink-0 ${open === false ? "" : "mb-2"}`}>
-      <h2 className="text-sm font-semibold min-w-0">
-        {onToggle ? (
-          <button
-            type="button"
-            onClick={onToggle}
-            aria-expanded={open}
-            aria-controls={controls}
-            className="flex items-center gap-2 -ml-1 px-1 py-1 rounded-lg hover:bg-[var(--surface-2)] cursor-pointer"
-          >
-            <ChevronRight
-              className={`w-4 h-4 text-[var(--muted)] shrink-0 transition-transform duration-200 ${open ? "rotate-90" : ""}`}
-            />
-            {label}
-          </button>
-        ) : (
-          <span className="flex items-center gap-2">{label}</span>
-        )}
-      </h2>
-      {open !== false && action}
-    </div>
-  );
-}
-
 /** One row of the Inbox feed: an eClass announcement, or a myClass notification. */
 type FeedItem =
   | { type: "ann"; key: string; date: string; a: Announcement; notif?: NotificationItem }
@@ -3730,14 +4052,12 @@ function InboxView({
   const [selected, setSelected] = useState<Message | null>(messages[0] ?? null);
   /** Phones and narrow windows show the list or the open message, one at a time. */
   const [readerOpen, setReaderOpen] = useState(false);
-  const messagesRef = useRef<HTMLElement>(null);
   const unreadNotifs = notifications.filter((n) => !n.read).length;
   const unreadMsgs = messages.filter((m) => !m.read).length;
   const [feedFilter, setFeedFilter] = useState<"all" | "announcements" | "action">("all");
   const [feedLimit, setFeedLimit] = useState(FEED_PAGE);
-  // Both sections start open; either one folds away to give the other the page
-  const [feedOpen, setFeedOpen] = useState(true);
-  const [messagesOpen, setMessagesOpen] = useState(true);
+  // Two options at the top; the chosen one shows its own content below
+  const [view, setView] = useState<"feed" | "messages">("feed");
 
   /*
    * Announcements and notifications in one list, newest first. A notification about an
@@ -3799,8 +4119,7 @@ function InboxView({
   const openNotif = (n: NotificationItem) => {
     void dismiss(n.id);
     if (n.kind === "message") {
-      setMessagesOpen(true);
-      messagesRef.current?.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+      setView("messages");
     } else {
       onOpenNotification(n);
     }
@@ -3810,34 +4129,47 @@ function InboxView({
 
   return (
     <div className="flex-1 flex flex-col gap-6 md:gap-5 md:h-[calc(100dvh-2.5rem)] md:min-h-0">
-      {/* Notifications and announcements in one feed, capped so messages always keep room below */}
-      <section
-        className={`flex flex-col min-h-0 shrink-0 ${feedOpen && messagesOpen ? "md:max-h-[45%]" : feedOpen ? "md:flex-1" : ""}`}
-      >
-        <SectionTitle
-          icon={<Bell className="w-4 h-4" />}
-          title={el ? "Ειδοποιήσεις και ανακοινώσεις" : "Notifications and announcements"}
-          count={unreadNotifs}
-          open={feedOpen}
-          onToggle={() => setFeedOpen((o) => !o)}
-          controls="inbox-feed"
-          action={
-            notifications.some((n) => !n.read) && (
-              <button
-                onClick={async () => {
-                  const res = await api.markAllNotificationsRead();
-                  setNotifications(res.notifications ?? []);
-                }}
-                className="text-xs text-[var(--muted)] hover:text-[var(--text)] cursor-pointer"
-              >
-                {tr("markAllRead")}
-              </button>
-            )
-          }
-        />
-        <div id="inbox-feed" hidden={!feedOpen} className="contents">
-        {feed.length > 0 && (
-          <div className="mb-2 shrink-0 overflow-x-auto">
+      {/* The two parts of the Inbox: pick one, its own options and list appear below */}
+      <div role="tablist" aria-label={el ? "Εισερχόμενα" : "Inbox"} className="grid grid-cols-2 gap-2 shrink-0">
+        {(
+          [
+            ["feed", <Bell key="b" className="w-4 h-4" />, el ? "Ειδοποιήσεις και ανακοινώσεις" : "Notifications and announcements", unreadNotifs],
+            ["messages", <Mail key="m" className="w-4 h-4" />, tr("messagesSection"), unreadMsgs],
+          ] as const
+        ).map(([key, icon, label, count]) => {
+          const on = view === key;
+          return (
+            <button
+              key={key}
+              type="button"
+              role="tab"
+              id={`inbox-tab-${key}`}
+              aria-selected={on}
+              aria-controls={`inbox-${key}`}
+              onClick={() => setView(key)}
+              className={`flex items-center gap-2 min-h-12 px-3.5 py-2 rounded-xl border text-left text-sm font-semibold transition-colors cursor-pointer ${
+                on
+                  ? "bg-[var(--accent-soft)] border-[var(--accent)]/50 text-[var(--accent-text)]"
+                  : "bg-[var(--surface)] border-[var(--border)] text-[var(--muted)] hover:text-[var(--text)] hover:border-[var(--accent)]/40"
+              }`}
+            >
+              <span className="shrink-0">{icon}</span>
+              <span className="min-w-0 flex-1 leading-tight">{label}</span>
+              {count > 0 && (
+                <span className="shrink-0 min-w-5 h-5 px-1.5 rounded-full bg-[var(--accent)] text-[var(--on-accent)] text-xs font-semibold tabular-nums inline-flex items-center justify-center">
+                  {count}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {view === "feed" && (
+      <section id="inbox-feed" role="tabpanel" aria-labelledby="inbox-tab-feed" className="flex flex-col min-h-0 flex-1">
+        {(feed.length > 0 || notifications.some((n) => !n.read)) && (
+          <div className="mb-2 shrink-0 flex flex-wrap items-center justify-between gap-2">
+            <div className="overflow-x-auto">
             <Segmented
               value={feedFilter}
               onChange={(v) => {
@@ -3853,9 +4185,22 @@ function InboxView({
                 },
               ]}
             />
+            </div>
+            {notifications.some((n) => !n.read) && (
+              <button
+                type="button"
+                onClick={async () => {
+                  const res = await api.markAllNotificationsRead();
+                  setNotifications(res.notifications ?? []);
+                }}
+                className="min-h-10 px-2.5 rounded-lg text-sm text-[var(--muted)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] cursor-pointer"
+              >
+                {tr("markAllRead")}
+              </button>
+            )}
           </div>
         )}
-        <div className={`${panel} min-h-0 max-h-[55vh] md:max-h-none overflow-y-auto divide-y divide-[var(--border)]`}>
+        <div className={`${panel} min-h-0 md:flex-1 overflow-y-auto divide-y divide-[var(--border)]`}>
           {shownFeed.length === 0 ? (
             <div className="p-5 text-xs text-[var(--muted)] text-center">
               {feedFilter === "action"
@@ -3935,23 +4280,17 @@ function InboxView({
             </button>
           )}
         </div>
-        </div>
       </section>
+      )}
 
       {/* Messages: list + reader side by side on wide screens, one at a time on phones */}
+      {view === "messages" && (
       <section
-        ref={messagesRef}
-        className={`flex flex-col min-h-0 scroll-mt-16 md:scroll-mt-0 ${messagesOpen ? "flex-1" : "shrink-0"}`}
+        role="tabpanel"
+        aria-labelledby="inbox-tab-messages"
+        className="flex flex-col min-h-0 flex-1"
       >
-        <SectionTitle
-          icon={<Mail className="w-4 h-4" />}
-          title={tr("messagesSection")}
-          count={unreadMsgs}
-          open={messagesOpen}
-          onToggle={() => setMessagesOpen((o) => !o)}
-          controls="inbox-messages"
-        />
-        <div id="inbox-messages" hidden={!messagesOpen} className="flex-1 min-h-0 grid grid-cols-1 md:grid-rows-[minmax(0,1fr)] lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-4">
+        <div id="inbox-messages" className="flex-1 min-h-0 grid grid-cols-1 md:grid-rows-[minmax(0,1fr)] lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-4">
           <div
             className={`${panel} min-h-0 overflow-y-auto divide-y divide-[var(--border)] ${
               readerOpen ? "hidden lg:block" : ""
@@ -4024,6 +4363,7 @@ function InboxView({
           </div>
         </div>
       </section>
+      )}
     </div>
   );
 }
@@ -4890,15 +5230,17 @@ function Toggle({
       aria-label={label}
       disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`relative w-11 h-6 rounded-full transition-colors cursor-pointer disabled:opacity-60 ${
-        checked ? "bg-[var(--accent)]" : "bg-[var(--border)]"
-      }`}
+      // The track is 44 x 24; the button around it is 52 x 44, so the tap target is big enough
+      className="group relative inline-flex items-center justify-center w-[52px] h-11 -my-2.5 cursor-pointer disabled:opacity-60 disabled:cursor-default"
     >
       <span
-        className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${
-          checked ? "translate-x-5" : ""
-        }`}
-      />
+        aria-hidden
+        className={`relative w-11 h-6 rounded-full transition-colors ${checked ? "bg-[var(--accent)]" : "bg-[var(--border-strong)]"}`}
+      >
+        <span
+          className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${checked ? "translate-x-5" : ""}`}
+        />
+      </span>
     </button>
   );
 }
@@ -4929,9 +5271,11 @@ function Segmented<T extends string>({
           aria-checked={value === o.value}
           disabled={disabled}
           onClick={() => value !== o.value && onChange(o.value)}
-          className={`${grow} inline-flex items-center justify-center gap-1.5 px-2.5 py-2 sm:py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:cursor-default ${
+          className={`${grow} inline-flex items-center justify-center gap-1.5 min-h-10 min-w-10 px-3 py-1 rounded-lg text-sm font-medium leading-tight text-center ${
+            stretch ? "sm:whitespace-nowrap" : "whitespace-nowrap"
+          } transition-colors cursor-pointer disabled:cursor-default ${
             value === o.value
-              ? "bg-[var(--surface)] text-[var(--text)] shadow-sm"
+              ? "bg-[var(--pill)] text-[var(--text)] shadow-sm"
               : "text-[var(--muted)] hover:text-[var(--text)]"
           }`}
         >
@@ -4964,7 +5308,7 @@ function NavButton({
   return (
     <button
       onClick={onClick}
-      className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+      className={`w-full flex items-center justify-between min-h-11 px-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
         active
           ? "bg-[var(--accent-soft)] text-[var(--accent-text)]"
           : "text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"

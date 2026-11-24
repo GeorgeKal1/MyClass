@@ -17,6 +17,8 @@ import {
 import type { Assignment, AssignmentDetail, CourseTool, Lang } from "@myclass/shared";
 import { api } from "./api";
 import { safeHref, sanitizeHtml } from "./sanitize";
+import { weekdayShort } from "./format";
+import { SectionError, Skeleton } from "./ui";
 
 const locale = (lang: Lang) => (lang === "el" ? "el-GR" : "en-GB");
 
@@ -65,14 +67,51 @@ function dueState(a: Assignment, now = Date.now()): DueState {
   return t - now < 3 * 86_400_000 ? "soon" : "later";
 }
 
-const DOT_CLASS: Record<DueState, string> = {
-  submitted: "bg-[var(--ok)]",
-  overdue: "bg-[var(--danger)]",
-  // Hollow: the hand-in state is not known yet
-  unknown: "bg-transparent ring-[1.5px] ring-inset ring-[var(--muted)]",
-  soon: "bg-[var(--warn)]",
-  later: "bg-[var(--muted)]",
-};
+/**
+ * Each state has its own shape as well as its colour, so it reads without colour too:
+ * a tick (handed in), an exclamation (overdue), a ring (not checked), a filled dot (pending),
+ * a filled diamond (due within 3 days).
+ */
+function DueMarker({ state, size = 10 }: { state: DueState; size?: number }) {
+  const common = { width: size, height: size, viewBox: "0 0 10 10", "aria-hidden": true as const, className: "shrink-0" };
+  switch (state) {
+    case "submitted":
+      return (
+        <svg {...common}>
+          <circle cx="5" cy="5" r="5" fill="var(--ok)" />
+          <path d="M2.7 5.2 4.3 6.7 7.4 3.5" fill="none" stroke="var(--surface)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+    case "overdue":
+      return (
+        <svg {...common}>
+          <circle cx="5" cy="5" r="5" fill="var(--danger)" />
+          <path d="M5 2.4v3.1" stroke="var(--surface)" strokeWidth="1.5" strokeLinecap="round" />
+          <circle cx="5" cy="7.4" r="0.85" fill="var(--surface)" />
+        </svg>
+      );
+    case "unknown":
+      return (
+        <svg {...common}>
+          <circle cx="5" cy="5" r="4.1" fill="none" stroke="var(--muted)" strokeWidth="1.6" />
+        </svg>
+      );
+    case "soon":
+      return (
+        <svg {...common}>
+          <path d="M5 0.6 9.4 5 5 9.4 0.6 5Z" fill="var(--warn)" />
+        </svg>
+      );
+    default:
+      return (
+        <svg {...common}>
+          <circle cx="5" cy="5" r="4" fill="var(--muted)" />
+        </svg>
+      );
+  }
+}
+
+const STATE_ORDER: DueState[] = ["overdue", "soon", "unknown", "later", "submitted"];
 
 /* ================================================================== */
 /* Home: month calendar of assignment deadlines + agenda               */
@@ -82,18 +121,45 @@ export function DeadlineCalendar({
   lang,
   assignments,
   loading,
+  ready = true,
+  error,
+  onRetry,
   onOpenAssignment,
   onCheckSubmissions,
 }: {
   lang: Lang;
   assignments: Assignment[];
   loading?: boolean;
+  /** The list has arrived (this visit, or the last one on this device) */
+  ready?: boolean;
+  error?: string;
+  onRetry?: () => void;
   onOpenAssignment: (a: Assignment) => void;
   /** Reads these courses' assignment pages (the student's own visits) to learn what was handed in. */
   onCheckSubmissions?: (courseCodes: string[]) => Promise<void>;
 }) {
+  const el = lang === "el";
   const today = startOfDay(new Date());
   const [checking, setChecking] = useState(false);
+  // Phones: the month grid is folded away by default, so the list comes first (remembered)
+  const [gridOpen, setGridOpen] = useState(() => {
+    try {
+      const saved = localStorage.getItem("myclass.calendarOpen");
+      if (saved !== null) return saved === "1";
+    } catch {
+      /* storage unavailable */
+    }
+    return typeof window === "undefined" || window.matchMedia("(min-width: 768px)").matches;
+  });
+  const toggleGrid = () =>
+    setGridOpen((o) => {
+      try {
+        localStorage.setItem("myclass.calendarOpen", o ? "0" : "1");
+      } catch {
+        /* not remembered */
+      }
+      return !o;
+    });
   const [month, setMonth] = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
   const [selected, setSelected] = useState<string | null>(null);
 
@@ -124,26 +190,21 @@ export function DeadlineCalendar({
     return Array.from({ length: total }, (_, i) => new Date(start.getFullYear(), start.getMonth(), start.getDate() + i));
   }, [month]);
 
-  const weekdayNames = useMemo(() => {
-    const monday = new Date(2024, 0, 1); // a Monday
-    return Array.from({ length: 7 }, (_, i) =>
-      new Date(monday.getFullYear(), 0, 1 + i).toLocaleDateString(locale(lang), { weekday: "narrow" }),
-    );
-  }, [lang]);
+  // Two letters, Monday first: the same labels as the stats ("Τ Τ / Π Π" was ambiguous)
+  const weekdayNames = useMemo(() => weekdayShort(lang), [lang]);
 
   const now = Date.now();
+  // Past and not handed in (or not checked yet): their own group, with what to do about them
+  const pastOpen = selected
+    ? []
+    : withDeadline.filter((a) => !a.submitted && new Date(a.deadline!).getTime() < now && new Date(a.deadline!).getTime() > now - 14 * 86_400_000);
   const agenda: Assignment[] = selected
     ? (byDay.get(selected) ?? [])
     : // Every deadline still ahead, handed-in ones too (marked "submitted"), so none silently disappears
-      withDeadline
-        .filter((a) => {
-          const t = new Date(a.deadline!).getTime();
-          return a.submitted ? t >= now : t >= now - 86_400_000;
-        })
-        .slice(0, 6);
+      withDeadline.filter((a) => new Date(a.deadline!).getTime() >= now).slice(0, 6);
   const undated = assignments.filter((a) => !a.deadline && !a.submitted);
   // Courses whose shown deadlines have no known hand-in state yet (one check per course)
-  const uncheckedCodes = [...new Set([...agenda, ...(selected ? [] : undated)].filter(isUnchecked).map((a) => a.courseCode))];
+  const uncheckedCodes = [...new Set([...agenda, ...pastOpen, ...(selected ? [] : undated)].filter(isUnchecked).map((a) => a.courseCode))];
 
   const monthLabel = month.toLocaleDateString(locale(lang), { month: "long", year: "numeric" });
   const selectedLabel = selected
@@ -153,160 +214,221 @@ export function DeadlineCalendar({
       })()
     : null;
 
+  const arrow =
+    "w-10 h-10 inline-flex items-center justify-center rounded-lg hover:bg-[var(--surface-2)] text-[var(--muted)] hover:text-[var(--text)] cursor-pointer";
+  // Always offered: unchecked courses first; otherwise re-check every course with a deadline shown
+  const shownCodes = [...new Set([...agenda, ...pastOpen, ...(selected ? [] : undated)].map((a) => a.courseCode))];
+  const checkCodes = uncheckedCodes.length
+    ? uncheckedCodes
+    : shownCodes.length
+      ? shownCodes
+      : [...new Set(assignments.map((a) => a.courseCode))];
+  const checkButton = onCheckSubmissions && checkCodes.length > 0 && (
+    <button
+      type="button"
+      disabled={checking}
+      onClick={async () => {
+        setChecking(true);
+        try {
+          await onCheckSubmissions(checkCodes);
+        } finally {
+          setChecking(false);
+        }
+      }}
+      title={
+        el
+          ? "Ανοίγει τη σελίδα εργασιών κάθε μαθήματος στο eClass για να δει τι έχεις παραδώσει (μετράει ως δική σου επίσκεψη)"
+          : "Opens each course's assignment page on eClass to see what you handed in (counts as your own visit)"
+      }
+      className="shrink-0 whitespace-nowrap inline-flex items-center gap-1.5 min-h-10 px-2.5 -mr-1 rounded-lg text-xs font-medium text-[var(--accent-text)] hover:bg-[var(--accent-soft)] cursor-pointer disabled:opacity-60 disabled:cursor-default"
+    >
+      <RefreshCw className={`w-3.5 h-3.5 ${checking ? "animate-spin" : ""}`} aria-hidden />
+      <span>{checking ? (el ? "Έλεγχος…" : "Checking…") : el ? "Έλεγχος παραδόσεων" : "Check hand-ins"}</span>
+    </button>
+  );
+
   return (
-    <section className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
-      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-4 pt-4">
-        <h2 className="text-sm font-semibold flex items-center gap-2 whitespace-nowrap">
-          <CalendarDays className="w-4 h-4 text-[var(--muted)]" />
-          <span>{lang === "el" ? "Προθεσμίες" : "Deadlines"}</span>
-          {loading && <RefreshCw className="w-3.5 h-3.5 animate-spin text-[var(--muted)]" />}
+    <section aria-labelledby="deadlines-title" className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-4 pt-3.5">
+        <h2 id="deadlines-title" className="section-title flex items-center gap-2 whitespace-nowrap">
+          <CalendarDays className="w-[1.125rem] h-[1.125rem] text-[var(--muted)]" aria-hidden />
+          <span>{el ? "Προθεσμίες" : "Deadlines"}</span>
+          {loading && ready && <RefreshCw className="w-3.5 h-3.5 animate-spin text-[var(--muted)]" aria-label={el ? "Ενημέρωση…" : "Updating…"} />}
         </h2>
-        <div className="flex items-center gap-0.5 ml-auto">
-          <button
-            onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() - 1, 1))}
-            className="p-1.5 rounded-lg hover:bg-[var(--surface-2)] text-[var(--muted)] cursor-pointer"
-            aria-label={lang === "el" ? "Προηγούμενος μήνας" : "Previous month"}
-          >
-            <ChevronLeft className="w-4 h-4" />
-          </button>
-          <button
-            onClick={() => {
-              setMonth(new Date(today.getFullYear(), today.getMonth(), 1));
-              setSelected(null);
-            }}
-            className="px-2 py-1 rounded-lg text-xs font-medium capitalize hover:bg-[var(--surface-2)] cursor-pointer whitespace-nowrap text-center"
-            title={lang === "el" ? "Σήμερα" : "Today"}
-          >
-            {monthLabel}
-          </button>
-          <button
-            onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() + 1, 1))}
-            className="p-1.5 rounded-lg hover:bg-[var(--surface-2)] text-[var(--muted)] cursor-pointer"
-            aria-label={lang === "el" ? "Επόμενος μήνας" : "Next month"}
-          >
-            <ChevronRight className="w-4 h-4" />
-          </button>
-        </div>
-      </div>
-
-      <div className="px-3 pt-3 pb-2">
-        <div className="grid grid-cols-7 text-center text-xs text-[var(--muted)] mb-1">
-          {weekdayNames.map((w, i) => (
-            <div key={i} className="py-1">
-              {w}
-            </div>
-          ))}
-        </div>
-        <div className="grid grid-cols-7 gap-0.5">
-          {cells.map((d) => {
-            const k = dayKey(d);
-            const items = byDay.get(k) ?? [];
-            const inMonth = d.getMonth() === month.getMonth();
-            const isToday = k === dayKey(today);
-            const isSelected = k === selected;
-            return (
+        <div className="flex items-center ml-auto">
+          {gridOpen && (
+            <>
               <button
-                key={k}
-                onClick={() => setSelected(isSelected ? null : k)}
-                className={`relative h-11 rounded-lg flex flex-col items-center justify-center gap-1 text-xs transition-colors cursor-pointer ${
-                  isToday
-                    ? "bg-[var(--accent-soft)] text-[var(--accent-text)] font-semibold ring-1 ring-inset ring-[var(--accent)]/60"
-                    : isSelected
-                      ? "bg-[var(--surface-2)]"
-                      : "hover:bg-[var(--surface-2)]"
-                } ${isSelected ? "ring-1 ring-inset ring-[var(--muted)]/40" : ""} ${inMonth ? "" : "opacity-35"}`}
-                aria-label={`${d.toLocaleDateString(locale(lang))}${items.length ? ` · ${items.length}` : ""}`}
+                type="button"
+                onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() - 1, 1))}
+                className={arrow}
+                aria-label={el ? "Προηγούμενος μήνας" : "Previous month"}
               >
-                <span>{d.getDate()}</span>
-                <span className="flex gap-0.5 h-1.5">
-                  {items.slice(0, 3).map((a) => (
-                    <span
-                      key={a.id}
-                      className={`w-1.5 h-1.5 rounded-full ${DOT_CLASS[dueState(a, now)]}`}
-                    />
-                  ))}
-                </span>
+                <ChevronLeft className="w-4 h-4" />
               </button>
-            );
-          })}
-        </div>
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 px-1 text-xs text-[var(--muted)]">
-          {(
-            [
-              ["soon", lang === "el" ? "< 3 ημέρες" : "< 3 days"],
-              ["later", lang === "el" ? "Εκκρεμεί" : "Pending"],
-              ["overdue", lang === "el" ? "Έληξε" : "Overdue"],
-              ["unknown", lang === "el" ? "Δεν ελέγχθηκε" : "Not checked"],
-              ["submitted", lang === "el" ? "Παραδόθηκε" : "Submitted"],
-            ] as const
-          ).map(([k, label]) => (
-            <span key={k} className="inline-flex items-center gap-1.5">
-              <span className={`w-2 h-2 rounded-full ${DOT_CLASS[k]}`} />
-              {label}
-            </span>
-          ))}
+              <button
+                type="button"
+                onClick={() => {
+                  setMonth(new Date(today.getFullYear(), today.getMonth(), 1));
+                  setSelected(null);
+                }}
+                className="min-h-10 px-2 rounded-lg text-sm font-medium capitalize hover:bg-[var(--surface-2)] cursor-pointer whitespace-nowrap text-center"
+                title={el ? "Σήμερα" : "Today"}
+              >
+                {monthLabel}
+              </button>
+              <button
+                type="button"
+                onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() + 1, 1))}
+                className={arrow}
+                aria-label={el ? "Επόμενος μήνας" : "Next month"}
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </>
+          )}
+          <button
+            type="button"
+            onClick={toggleGrid}
+            aria-expanded={gridOpen}
+            aria-controls="deadline-grid"
+            className="min-h-10 px-2.5 rounded-lg text-xs font-medium text-[var(--muted)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] cursor-pointer"
+          >
+            {gridOpen ? (el ? "Απόκρυψη μήνα" : "Hide month") : el ? "Εμφάνιση μήνα" : "Show month"}
+          </button>
         </div>
       </div>
 
-      <div className="border-t border-[var(--border)] px-4 py-3 space-y-1">
-        <div className="flex items-center justify-between gap-2 mb-1">
-          <div className="text-xs font-medium text-[var(--muted)] capitalize truncate">
-            {selectedLabel ?? (lang === "el" ? "Επόμενες προθεσμίες" : "Coming up")}
-          </div>
-          {onCheckSubmissions && uncheckedCodes.length > 0 && (
-            <button
-              type="button"
-              disabled={checking}
-              onClick={async () => {
-                setChecking(true);
-                try {
-                  await onCheckSubmissions(uncheckedCodes);
-                } finally {
-                  setChecking(false);
-                }
-              }}
-              title={
-                lang === "el"
-                  ? "Ανοίγει τη σελίδα εργασιών κάθε μαθήματος στο eClass για να δει τι έχεις παραδώσει (μετράει ως δική σου επίσκεψη)"
-                  : "Opens each course's assignment page on eClass to see what you handed in (counts as your own visit)"
-              }
-              className="shrink-0 whitespace-nowrap inline-flex items-center gap-1.5 px-2 py-1 -mr-1 rounded-lg text-xs font-medium text-[var(--accent-text)] hover:bg-[var(--accent-soft)] cursor-pointer disabled:opacity-60 disabled:cursor-default"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${checking ? "animate-spin" : ""}`} />
-              <span>
-                {checking
-                  ? lang === "el" ? "Έλεγχος…" : "Checking…"
-                  : lang === "el" ? "Έλεγχος" : "Check"}
-              </span>
-            </button>
-          )}
-        </div>
-        {agenda.length === 0 ? (
-          <p className="text-sm text-[var(--muted)] py-2">
-            {loading
-              ? lang === "el"
-                ? "Φόρτωση εργασιών…"
-                : "Loading assignments…"
-              : selected
-                ? lang === "el"
-                  ? "Καμία προθεσμία αυτή την ημέρα."
-                  : "No deadlines on this day."
-                : lang === "el"
-                  ? "Δεν έχεις προθεσμίες μπροστά σου."
-                  : "No deadlines coming up."}
-          </p>
-        ) : (
-          agenda.map((a) => <AgendaRow key={a.id} a={a} lang={lang} onClick={() => onOpenAssignment(a)} />)
-        )}
-        {!selected && undated.length > 0 && (
-          <div className="pt-2">
-            <div className="text-xs font-medium text-[var(--muted)] mb-1">
-              {lang === "el" ? "Χωρίς προθεσμία" : "No deadline"}
-            </div>
-            {undated.slice(0, 4).map((a) => (
-              <AgendaRow key={a.id} a={a} lang={lang} onClick={() => onOpenAssignment(a)} />
+      {gridOpen && (
+        <div id="deadline-grid" className="px-3 pt-2 pb-2">
+          <div className="grid grid-cols-7 text-center text-xs text-[var(--muted)] mb-1" aria-hidden>
+            {weekdayNames.map((w, i) => (
+              <div key={i} className="py-1">
+                {w}
+              </div>
             ))}
           </div>
+          <div className="grid grid-cols-7 gap-0.5">
+            {cells.map((d) => {
+              const k = dayKey(d);
+              const items = byDay.get(k) ?? [];
+              const inMonth = d.getMonth() === month.getMonth();
+              const isToday = k === dayKey(today);
+              const isSelected = k === selected;
+              // The most urgent state of the day decides its marker; several deadlines add a count
+              const top = items.map((a) => dueState(a, now)).sort((x, y) => STATE_ORDER.indexOf(x) - STATE_ORDER.indexOf(y))[0];
+              return (
+                <button
+                  key={k}
+                  type="button"
+                  onClick={() => setSelected(isSelected ? null : k)}
+                  aria-pressed={isSelected}
+                  className={`relative h-12 rounded-lg flex flex-col items-center justify-center gap-1 text-sm num transition-colors cursor-pointer ${
+                    isToday
+                      ? "bg-[var(--accent-soft)] text-[var(--accent-text)] font-semibold ring-1 ring-inset ring-[var(--accent)]/60"
+                      : isSelected
+                        ? "bg-[var(--surface-2)]"
+                        : "hover:bg-[var(--surface-2)]"
+                  } ${isSelected ? "ring-1 ring-inset ring-[var(--muted)]/50" : ""} ${inMonth ? "" : "opacity-60"}`}
+                  aria-label={`${d.toLocaleDateString(locale(lang), { weekday: "long", day: "numeric", month: "long" })}${
+                    items.length ? ` · ${items.length} ${el ? (items.length === 1 ? "προθεσμία" : "προθεσμίες") : items.length === 1 ? "deadline" : "deadlines"}` : ""
+                  }`}
+                >
+                  <span>{d.getDate()}</span>
+                  <span className="flex items-center gap-0.5 h-2.5">
+                    {top && <DueMarker state={top} size={9} />}
+                    {items.length > 1 && <span className="text-[0.625rem] leading-none font-semibold text-[var(--muted)]">{items.length}</span>}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      <ul className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5 px-4 pb-3 pt-1 text-xs text-[var(--muted)]" aria-label={el ? "Υπόμνημα" : "Legend"}>
+        {(
+          [
+            ["soon", el ? "< 3 ημέρες" : "< 3 days"],
+            ["later", el ? "Εκκρεμεί" : "Pending"],
+            ["overdue", el ? "Έληξε" : "Overdue"],
+            ["unknown", el ? "Δεν ελέγχθηκε" : "Not checked"],
+            ["submitted", el ? "Παραδόθηκε" : "Submitted"],
+          ] as const
+        ).map(([k, label]) => (
+          <li key={k} className="inline-flex items-center gap-1 whitespace-nowrap">
+            <DueMarker state={k} size={10} />
+            {label}
+          </li>
+        ))}
+      </ul>
+
+      <div className="border-t border-[var(--border)] px-4 py-3 space-y-1">
+        {!ready ? (
+          error ? (
+            <SectionError lang={lang} detail={error} onRetry={() => onRetry?.()} />
+          ) : (
+            <div className="space-y-3 py-1" aria-busy="true">
+              <span className="sr-only" role="status">
+                {el ? "Φόρτωση προθεσμιών…" : "Loading deadlines…"}
+              </span>
+              {[0, 1, 2].map((i) => (
+                <div key={i} className="flex items-center gap-3" aria-hidden>
+                  <Skeleton className="w-2.5 h-2.5 rounded-full" />
+                  <div className="flex-1 space-y-1.5">
+                    <Skeleton className="h-3.5" style={{ width: `${70 - i * 12}%` }} />
+                    <Skeleton className="h-3 w-2/5" />
+                  </div>
+                  <Skeleton className="h-3.5 w-14" />
+                </div>
+              ))}
+            </div>
+          )
+        ) : (
+          <>
+            {pastOpen.length > 0 && (
+              <div className="pb-2 mb-1 border-b border-[var(--border)]">
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <h3 className="text-xs font-semibold text-[var(--danger)]">{el ? "Εκπρόθεσμα / Προς έλεγχο" : "Overdue / To check"}</h3>
+                  {checkButton}
+                </div>
+                <p className="text-xs text-[var(--muted)] mb-1 measure">
+                  {el
+                    ? "Η προθεσμία πέρασε. Με «Έλεγχος παραδόσεων» βλέπεις αν τα παρέδωσες· αν όχι, άνοιξε την εργασία για να δεις αν δέχεται ακόμα υποβολές."
+                    : "These are past due. “Check hand-ins” shows whether you submitted them; if not, open the assignment to see if it still accepts submissions."}
+                </p>
+                {pastOpen.slice(0, 4).map((a) => (
+                  <AgendaRow key={a.id} a={a} lang={lang} onClick={() => onOpenAssignment(a)} />
+                ))}
+              </div>
+            )}
+            <div className="flex items-center justify-between gap-2 mb-1">
+              <h3 className="text-xs font-semibold text-[var(--muted)] capitalize truncate">
+                {selectedLabel ?? (el ? "Επόμενες προθεσμίες" : "Coming up")}
+              </h3>
+              {pastOpen.length === 0 && checkButton}
+            </div>
+            {agenda.length === 0 ? (
+              <p className="text-sm text-[var(--muted)] py-2">
+                {selected
+                  ? el
+                    ? "Καμία προθεσμία αυτή την ημέρα."
+                    : "No deadlines on this day."
+                  : el
+                    ? "Δεν έχεις προθεσμίες μπροστά σου."
+                    : "No deadlines coming up."}
+              </p>
+            ) : (
+              agenda.map((a) => <AgendaRow key={a.id} a={a} lang={lang} onClick={() => onOpenAssignment(a)} />)
+            )}
+            {!selected && undated.length > 0 && (
+              <div className="pt-2">
+                <h3 className="text-xs font-semibold text-[var(--muted)] mb-1">{el ? "Χωρίς προθεσμία" : "No deadline"}</h3>
+                {undated.slice(0, 4).map((a) => (
+                  <AgendaRow key={a.id} a={a} lang={lang} onClick={() => onOpenAssignment(a)} />
+                ))}
+              </div>
+            )}
+          </>
         )}
       </div>
     </section>
@@ -317,21 +439,24 @@ function AgendaRow({ a, lang, onClick }: { a: Assignment; lang: Lang; onClick: (
   const state = dueState(a);
   return (
     <button
+      type="button"
       onClick={onClick}
-      className="w-full text-left flex items-start gap-3 px-2 py-2 -mx-2 rounded-xl hover:bg-[var(--surface-2)] transition-colors cursor-pointer"
+      className="w-full text-left flex items-start gap-3 px-2 py-2 -mx-2 min-h-11 rounded-xl hover:bg-[var(--surface-2)] transition-colors cursor-pointer"
     >
-      <span className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${DOT_CLASS[state]}`} />
+      <span className="mt-1">
+        <DueMarker state={state} size={10} />
+      </span>
       <span className="min-w-0 flex-1">
-        <span className="block text-sm font-medium leading-snug">{a.title}</span>
+        <span className="block text-sm font-medium leading-snug line-clamp-2" title={a.title}>{a.title}</span>
         <span className="block text-xs text-[var(--muted)] truncate">{a.courseTitle ?? a.courseCode}</span>
       </span>
       {a.deadline && (
         <span
-          className={`text-xs shrink-0 text-right ${
+          className={`text-xs shrink-0 text-right num nowrap ${
             state === "overdue" ? "text-[var(--danger)]" : state === "soon" ? "text-[var(--warn)] font-medium" : "text-[var(--muted)]"
           }`}
         >
-          {a.submitted ? (lang === "el" ? "παραδόθηκε" : "submitted") : relativeDue(a.deadline, lang)}
+          {a.submitted ? (lang === "el" ? "παραδόθηκε" : "submitted") : isUnchecked(a) && new Date(a.deadline).getTime() < Date.now() ? (lang === "el" ? "δεν ελέγχθηκε" : "not checked") : relativeDue(a.deadline, lang)}
           <span className="block text-[var(--muted)] font-normal">
             {new Date(a.deadline).toLocaleDateString(locale(lang), { day: "numeric", month: "short" })}
           </span>
