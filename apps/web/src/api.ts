@@ -322,23 +322,65 @@ export async function registerWebPush(): Promise<{
   }
 
   try {
-    await navigator.serviceWorker.register("/sw.js", { scope: "/" });
-    const reg = await navigator.serviceWorker.ready;
-    const { publicKey } = await req<{ publicKey: string }>("/api/notifications/vapid-public-key");
-    let sub = await reg.pushManager.getSubscription();
-    if (!sub) {
-      sub = await reg.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(publicKey) as unknown as BufferSource,
-      });
-    }
-    await req("/api/notifications/subscribe", {
-      method: "POST",
-      body: JSON.stringify(sub.toJSON()),
-    });
+    await subscribeWithCurrentKey();
     return { ok: true };
   } catch {
     return { ok: false, reason: "error" };
+  }
+}
+
+/** Same bytes? (the key the subscription was made with vs the server's key now) */
+function sameKey(a: ArrayBuffer | null | undefined, b: Uint8Array): boolean {
+  if (!a) return false;
+  const x = new Uint8Array(a);
+  return x.length === b.length && x.every((v, i) => v === b[i]);
+}
+
+/**
+ * Subscribes this device with the server's current push key and sends the subscription to the
+ * server. A subscription made with an older key (the server's keys changed) can never deliver
+ * (the push service answers 403), so it is replaced instead of being reused.
+ */
+async function subscribeWithCurrentKey(): Promise<void> {
+  await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+  const reg = await navigator.serviceWorker.ready;
+  const { publicKey } = await req<{ publicKey: string }>("/api/notifications/vapid-public-key");
+  const key = urlBase64ToUint8Array(publicKey);
+  let sub = await reg.pushManager.getSubscription();
+  if (sub && !sameKey(sub.options.applicationServerKey, key)) {
+    await sub.unsubscribe().catch(() => false);
+    sub = null;
+  }
+  if (!sub) {
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: key as unknown as BufferSource,
+    });
+  }
+  await req("/api/notifications/subscribe", {
+    method: "POST",
+    body: JSON.stringify(sub.toJSON()),
+  });
+}
+
+/**
+ * On every app start, for a student who turned push on and already allowed notifications: make sure
+ * the server has a working subscription for this device. Never asks for permission.
+ */
+export async function refreshWebPush(): Promise<void> {
+  if (
+    typeof window === "undefined" ||
+    !("serviceWorker" in navigator) ||
+    !("PushManager" in window) ||
+    !("Notification" in window) ||
+    Notification.permission !== "granted"
+  ) {
+    return;
+  }
+  try {
+    await subscribeWithCurrentKey();
+  } catch {
+    /* tried again next start */
   }
 }
 

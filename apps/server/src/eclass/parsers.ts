@@ -558,7 +558,12 @@ export function parseAssignmentsHtml(
 
     const deadlineCell = tds.eq(1).clone();
     deadlineCell.find("div, small").remove();
-    const deadlineRaw = deadlineCell.text().replace(/\s+/g, " ").trim();
+    let deadlineRaw = deadlineCell.text().replace(/\s+/g, " ").trim();
+    // Some eClass themes wrap the date itself in a <div>: take the date from the whole cell then
+    if (!/\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}/.test(deadlineRaw)) {
+      const m = fullDeadlineCellText.match(/\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}(?:[\s,]+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[πμ]\.?\s?μ\.?)?)?/i);
+      if (m) deadlineRaw = m[0];
+    }
     const hasDeadline =
       Boolean(deadlineRaw) &&
       /\d/.test(deadlineRaw) &&

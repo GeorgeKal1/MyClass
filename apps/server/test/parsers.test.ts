@@ -218,3 +218,21 @@ describe("Open eClass 4.x parsers", () => {
     expect(name).toBe("ΕΦΡΑΙΜ ΓΕΩΡΓΙΟΣ ΚΑΛΛΙΟΝΤΖΗΣ");
   });
 });
+
+describe("parseAssignmentsHtml: date wrapped in a div", () => {
+  it("still reads the deadline, so a hand-in check never drops it", () => {
+    const html = `
+      <table id="assignment_table"><tbody>
+        <tr>
+          <td><a href="/modules/work/index.php?course=TMC106&amp;id=9">Εργασία 1</a></td>
+          <td><div>26-11-2026 23:59</div><small>(σε 2 ημέρες)</small></td>
+          <td><i class="fa-solid fa-check"></i></td>
+          <td>-</td>
+        </tr>
+      </tbody></table>`;
+    const [a] = parseAssignmentsHtml(html, "https://thales.cs.unipi.gr/modules/work/index.php", "TMC106");
+    expect(a.id).toBe("TMC106:9");
+    expect(a.submitted).toBe(true);
+    expect(a.deadline).toBe(new Date(2026, 10, 26, 23, 59).toISOString());
+  });
+});

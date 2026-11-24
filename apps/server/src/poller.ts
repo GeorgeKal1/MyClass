@@ -8,7 +8,7 @@ import { rememberDeadlines, sendDeadlineReminders, withKnownSubmission } from ".
 import { getConnectorForUser } from "./eclass/connector.js";
 import { withOrigin } from "./eclass/request-origin.js";
 import { DATA_DIR, env } from "./env.js";
-import { users, type UserRecord } from "./store.js";
+import { remoteSetting, users, type UserRecord } from "./store.js";
 
 /* ------------------------------------------------------------------ */
 /* VAPID setup (auto-generates dev keys in .data/vapid.json)           */
@@ -32,8 +32,23 @@ function loadOrCreateVapid(): VapidKeys {
   return generated;
 }
 
-export const vapidKeys = loadOrCreateVapid();
+// Replaced once by initVapid() before the server listens (imports see the new value)
+export let vapidKeys = loadOrCreateVapid();
 webpush.setVapidDetails(env.vapid.subject, vapidKeys.publicKey, vapidKeys.privateKey);
+
+/**
+ * Without VAPID_* env vars, a host with a throwaway disk (Render free) would make new push keys on
+ * every restart, and every phone's subscription would then fail with 403. With Supabase the keys
+ * live in its kv table instead, so they survive restarts and redeploys.
+ */
+export async function initVapid(): Promise<void> {
+  if (env.vapid.publicKey && env.vapid.privateKey) return;
+  const stored = await remoteSetting<VapidKeys>("vapid", () => webpush.generateVAPIDKeys());
+  if (!stored?.publicKey || !stored.privateKey) return;
+  vapidKeys = { publicKey: stored.publicKey, privateKey: stored.privateKey };
+  webpush.setVapidDetails(env.vapid.subject, vapidKeys.publicKey, vapidKeys.privateKey);
+  console.log("[push] VAPID keys loaded from Supabase");
+}
 
 /* ------------------------------------------------------------------ */
 /* SSE listeners for live connected tabs                               */
@@ -89,7 +104,8 @@ export async function emitNotification(user: UserRecord, item: NotificationItem)
           await webpush.sendNotification(sub, payload);
         } catch (err: unknown) {
           const status = (err as { statusCode?: number })?.statusCode;
-          if (status === 404 || status === 410) deadEndpoints.push(sub.endpoint);
+          // 403: made with other push keys, so it can never work again; the app subscribes anew when opened
+          if (status === 404 || status === 410 || status === 403) deadEndpoints.push(sub.endpoint);
           // Anything else (403 = push keys changed or a rejected VAPID subject, 429, 5xx) used to vanish silently
           console.warn(`[push] ${new URL(sub.endpoint).host}: ${status ?? (err as Error).message}${status === 403 ? " (VAPID keys or subject rejected)" : ""}`);
         }

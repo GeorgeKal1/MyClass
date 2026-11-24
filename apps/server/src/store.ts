@@ -173,6 +173,23 @@ const savedUsers = new Map<string, string>();
 const savedSessions = new Map<string, string>();
 let remoteFlush: Promise<void> = Promise.resolve();
 
+/**
+ * A server-wide value kept in Supabase's kv table: read it, or store `create()` the first time.
+ * Null without Supabase (the caller keeps its file in DATA_DIR then). Never log the value.
+ */
+export async function remoteSetting<T>(key: string, create: () => T): Promise<T | null> {
+  if (!remote) return null;
+  const { data, error } = await remote.from("kv").select("value").eq("key", key).maybeSingle();
+  if (error) throw new Error(`kv ${key}: ${error.code ?? ""} ${error.message}`);
+  if (data?.value) return data.value as T;
+  const value = create();
+  // ignoreDuplicates: if another instance stored one first, read that instead of overwriting it
+  const ins = await remote.from("kv").upsert({ key, value }, { onConflict: "key", ignoreDuplicates: true });
+  if (ins.error) throw new Error(`kv ${key}: ${ins.error.code ?? ""} ${ins.error.message}`);
+  const again = await remote.from("kv").select("value").eq("key", key).maybeSingle();
+  return ((again.data?.value as T | undefined) ?? value);
+}
+
 /** Loads all users and live sessions from Supabase. Must finish before the server listens. */
 export async function initStore(): Promise<void> {
   if (!remote || remoteReady) return;

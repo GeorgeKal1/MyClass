@@ -62,7 +62,7 @@ import type {
   ThemePref,
   UserSettings,
 } from "@myclass/shared";
-import { api, ApiError, ensureServiceWorker, isIosNeedsHomeScreen, registerWebPush, ServerUnavailableError } from "./api";
+import { api, ApiError, ensureServiceWorker, isIosNeedsHomeScreen, refreshWebPush, registerWebPush, ServerUnavailableError } from "./api";
 import { Logo } from "./Logo";
 import { safeHref, sanitizeHtml } from "./sanitize";
 import { t, type DictKey } from "./i18n";
@@ -452,6 +452,12 @@ function Workspace({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // Push on: every start re-checks this device's subscription (it heals after the server's keys change)
+  const pushOn = me.settings.notify.push;
+  useEffect(() => {
+    if (pushOn) void refreshWebPush();
+  }, [pushOn]);
   const [quickChatOpen, setQuickChatOpen] = useState(false);
 
   const theme: ThemePref = me.settings.theme;
@@ -521,9 +527,21 @@ function Workspace({
   const mergeCourseAssignments = useCallback((code: string, list: Assignment[]) => {
     if (list.length === 0) return;
     setAssignments((prev) => {
-      const titles = new Map(prev.filter((a) => a.courseCode === code).map((a) => [a.id, a.courseTitle]));
-      const fresh = list.map((n) => ({ ...n, courseTitle: n.courseTitle ?? titles.get(n.id) ?? prev.find((a) => a.courseCode === code)?.courseTitle }));
-      return [...prev.filter((a) => a.courseCode !== code || !list.some((n) => n.id === a.id)), ...fresh];
+      const key = (id: string) => id.toUpperCase();
+      const before = new Map(prev.map((a) => [key(a.id), a]));
+      const courseTitle = prev.find((a) => a.courseCode.toUpperCase() === code.toUpperCase())?.courseTitle;
+      // The course page updates the hand-in state; a deadline or title it does not show is kept, never dropped
+      const fresh = list.map((n) => {
+        const old = before.get(key(n.id));
+        return {
+          ...n,
+          courseCode: old?.courseCode ?? n.courseCode,
+          courseTitle: n.courseTitle ?? old?.courseTitle ?? courseTitle,
+          deadline: n.deadline ?? old?.deadline,
+        };
+      });
+      const freshIds = new Set(list.map((n) => key(n.id)));
+      return [...prev.filter((a) => !freshIds.has(key(a.id))), ...fresh];
     });
   }, []);
 

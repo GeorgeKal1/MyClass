@@ -55,6 +55,7 @@ import { env, publicUrl } from "./env.js";
 import {
   emitNotification,
   pollUserNow,
+  initVapid,
   startBackgroundPoller,
   subscribeNotifications,
   vapidKeys,
@@ -477,7 +478,11 @@ app.get("/api/assignments", async (c) => {
   const connector = getConnectorForUser(u);
   if (courseCode) {
     // The student opened this course's assignments: its own page (one visit, theirs) also says what was handed in
-    const assignments = await asStudent(() => connector.getAssignments(courseCode));
+    const known = new Map((u.deadlines ?? []).map((d) => [d.id.toUpperCase(), d]));
+    // A date the course page did not show comes from what is already known (the calendar feed)
+    const assignments = (await asStudent(() => connector.getAssignments(courseCode))).map((a) =>
+      a.deadline ? a : { ...a, deadline: known.get(a.id.toUpperCase())?.deadline },
+    );
     rememberDeadlines(u, assignments, courseCode);
     // Read from the course's own page, so the hand-in state of each one is known (Home shows it as checked)
     return c.json({ assignments: assignments.map((a) => ({ ...a, submissionKnown: true })) });
@@ -1078,6 +1083,12 @@ if (!process.env.VITEST) {
   } catch (e) {
     console.error(`[store] could not load data from Supabase, not starting: ${(e as Error).message}`);
     process.exit(1);
+  }
+
+  try {
+    await initVapid();
+  } catch (e) {
+    console.warn(`[push] could not load VAPID keys from Supabase, using local ones: ${(e as Error).message}`);
   }
 
   startBackgroundPoller();

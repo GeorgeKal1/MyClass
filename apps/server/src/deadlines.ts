@@ -10,7 +10,11 @@ import { users, type KnownDeadline, type UserRecord } from "./store.js";
 
 /** Stores assignments just loaded. `courseCode` set = only that course was loaded. */
 export function rememberDeadlines(user: UserRecord, assignments: Assignment[], courseCode?: string): void {
+  // A course page that shows no readable date for an assignment keeps the deadline already known
+  // (from the calendar feed), so checking hand-ins never makes a deadline disappear
+  const knownById = new Map((user.deadlines ?? []).map((d) => [d.id.toUpperCase(), d]));
   const loaded: KnownDeadline[] = assignments
+    .map((a) => (a.deadline ? a : { ...a, deadline: knownById.get(a.id.toUpperCase())?.deadline }))
     .filter((a) => a.deadline && !Number.isNaN(new Date(a.deadline).getTime()))
     .map((a) => ({
       id: a.id,
