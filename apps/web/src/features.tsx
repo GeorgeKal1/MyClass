@@ -315,8 +315,10 @@ export function DeadlineCalendar({
               const inMonth = d.getMonth() === month.getMonth();
               const isToday = k === dayKey(today);
               const isSelected = k === selected;
-              // The most urgent state of the day decides its marker; several deadlines add a count
-              const top = items.map((a) => dueState(a, now)).sort((x, y) => STATE_ORDER.indexOf(x) - STATE_ORDER.indexOf(y))[0];
+              // One marker per deadline, most urgent first, so a day with one open and one handed-in
+              // deadline shows both instead of looking like two open ones; past three, a "+n"
+              const states = items.map((a) => dueState(a, now)).sort((x, y) => STATE_ORDER.indexOf(x) - STATE_ORDER.indexOf(y));
+              const shownStates = states.slice(0, states.length > 3 ? 2 : 3);
               return (
                 <button
                   key={k}
@@ -336,8 +338,12 @@ export function DeadlineCalendar({
                 >
                   <span>{d.getDate()}</span>
                   <span className="flex items-center gap-0.5 h-2.5">
-                    {top && <DueMarker state={top} size={9} />}
-                    {items.length > 1 && <span className="text-[0.625rem] leading-none font-semibold text-[var(--muted)]">{items.length}</span>}
+                    {shownStates.map((s, i) => (
+                      <DueMarker key={i} state={s} size={8} />
+                    ))}
+                    {states.length > shownStates.length && (
+                      <span className="text-[0.625rem] leading-none font-semibold text-[var(--muted)]">+{states.length - shownStates.length}</span>
+                    )}
                   </span>
                 </button>
               );

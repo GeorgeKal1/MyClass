@@ -1,7 +1,7 @@
 {
   "name": "myclass",
   "private": true,
-  "version": "4.3.1",
+  "version": "4.3.2",
   "description": "myClass – a personal assistant for Open eClass (Greek universities)",
   "workspaces": [
     "packages/*",
