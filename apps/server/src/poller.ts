@@ -214,6 +214,7 @@ async function pollUserNowInContext(user: UserRecord): Promise<NotificationItem[
             date: m.date,
             read: false,
             route: "/inbox",
+            messageId: m.id,
           });
         }
       }

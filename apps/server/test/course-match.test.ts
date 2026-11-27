@@ -127,6 +127,14 @@ describe("assistant: checking a join before the confirmation card", () => {
     expect("reply" in already && String(already.reply.result)).toMatch(/already enrolled/);
   });
 
+  it("sums up each tool's result for the assistant's step list", () => {
+    expect(ai.summarizeToolResult([1, 2, 3])).toEqual({ ok: true, count: 3 });
+    expect(ai.summarizeToolResult({ error: "nope" })).toEqual({ ok: false });
+    expect(ai.summarizeToolResult({ course: "TMA117", title: "ΑΝΑΛΥΣΗ Ι" })).toEqual({ ok: true, item: "ΑΝΑΛΥΣΗ Ι" });
+    expect(ai.summarizeToolResult({ candidates: [1, 2] })).toEqual({ ok: true, count: 2 });
+    expect(ai.summarizeToolResult({ folder: "/", files: [1, 2, 3, 4] })).toEqual({ ok: true, count: 4 });
+  });
+
   it("resolves leaving a course against the enrolled list", async () => {
     const enrolled: Course[] = [{ code: "TMC106", title: "Βάσεις Δεδομένων", enrolled: true }];
     const ok = await ai.prepareMutatingAction(lookup(CATALOG, enrolled), "unenroll_course", { course: "βάσεις" });

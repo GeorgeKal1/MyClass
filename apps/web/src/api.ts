@@ -201,7 +201,9 @@ export const api = {
       `/api/announcements${course ? `?course=${encodeURIComponent(course)}` : ""}`,
     ),
   messages: () => req<{ messages: Message[] }>("/api/messages"),
-  message: (id: string) => req<{ message: Message }>(`/api/messages/${encodeURIComponent(id)}`),
+  /** Opening a message marks it read; `notifications` comes back without its "new message" item. */
+  message: (id: string) =>
+    req<{ message: Message; notifications?: NotificationItem[] }>(`/api/messages/${encodeURIComponent(id)}`),
   assignments: (course?: string) =>
     req<{ assignments: Assignment[] }>(
       `/api/assignments${course ? `?course=${encodeURIComponent(course)}` : ""}`,

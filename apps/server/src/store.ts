@@ -75,8 +75,8 @@ export interface KnownDeadline {
 
 export interface UserRecord {
   id: string;
-  /** Set once the account moved to the "reduce motion on" default. */
-  reduceMotionDefaultOn?: boolean;
+  /** Set once the account moved to the "reduce motion off" default (v4.3.0). */
+  reduceMotionDefaultOff?: boolean;
   universityId: string;
   username: string;
   displayName: string;
@@ -105,6 +105,8 @@ export interface UserRecord {
   /** What myClass' own automatic requests added to eClass' usage log (see eclass/hit-ledger.ts). */
   eclassHits?: EclassHitLedger;
   notifications: NotificationItem[];
+  /** eClass message ids opened in myClass: they show as read even if eClass still lists them as new. */
+  readMessages?: string[];
   pushSubscriptions: PushSub[];
   /** Times (ms) of AI requests on the shared key within the last hour (see quota.ts). */
   aiUsage?: number[];
@@ -376,11 +378,16 @@ export const users = {
         notify: { ...defaults.notify, ...u.settings?.notify },
         accessibility: { ...defaults.accessibility, ...u.settings?.accessibility },
       };
-      // "Reduce motion" became on by default (2026-11-19); accounts still on the old default follow once
-      if (!u.reduceMotionDefaultOn) {
-        if (u.settings.accessibility.reduceMotion === "system") u.settings.accessibility.reduceMotion = "on";
-        u.reduceMotionDefaultOn = true;
+      // "Reduce motion" is off by default and the "Device" option is gone (2026-11-27). The old
+      // default was "on", so every account starts with motion once; a choice made after that stays
+      const motion = String(u.settings.accessibility.reduceMotion);
+      if (!u.reduceMotionDefaultOff) {
+        u.settings.accessibility.reduceMotion = "off";
+        u.reduceMotionDefaultOff = true;
+      } else if (motion !== "on" && motion !== "off") {
+        u.settings.accessibility.reduceMotion = "off";
       }
+      delete (u as { reduceMotionDefaultOn?: boolean }).reduceMotionDefaultOn;
       // Older records: removed "google" AI mode and the old hard-coded model name
       const ai = u.settings.ai ?? DEFAULT_SETTINGS.ai;
       u.settings.ai = {

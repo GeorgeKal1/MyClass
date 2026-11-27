@@ -61,6 +61,7 @@ import {
   vapidKeys,
 } from "./poller.js";
 import { initStore, newUser, sessions, storeBackend, users, type PushSub, type UserRecord } from "./store.js";
+import { markMessageRead } from "./read-state.js";
 
 const SESSION_COOKIE = "myclass_sid";
 
@@ -463,7 +464,8 @@ app.post("/api/announcements/triage", async (c) => {
 app.get("/api/messages", async (c) => {
   const u = requireUser(c);
   const connector = getConnectorForUser(u);
-  const messages = await connector.getMessages();
+  const opened = new Set(u.readMessages ?? []);
+  const messages = (await connector.getMessages()).map((m) => (opened.has(m.id) && !m.read ? { ...m, read: true } : m));
   return c.json({ messages });
 });
 
@@ -473,7 +475,9 @@ app.get("/api/messages/:id", async (c) => {
   const connector = getConnectorForUser(u);
   const message = await connector.getMessage(id);
   if (!message) throw new HttpError(404, "Message not found");
-  return c.json({ message });
+  // Opened here = read: remember it (eClass may still list it as new) and clear its notification
+  users.update(u.id, (rec) => markMessageRead(rec, message));
+  return c.json({ message, notifications: users.get(u.id)!.notifications });
 });
 
 app.get("/api/assignments", async (c) => {

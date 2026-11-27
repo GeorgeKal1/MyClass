@@ -226,6 +226,19 @@ function describePendingAction(tool: string, args: Record<string, unknown>, lang
 
 type CourseLookup = Pick<EclassConnector, "findCatalogCourse" | "listCourses">;
 
+/** One line for the assistant's step list: a count of what a tool found, or the course it settled on. */
+export function summarizeToolResult(result: unknown): { ok: boolean; count?: number; item?: string } {
+  if (Array.isArray(result)) return { ok: true, count: result.length };
+  if (!result || typeof result !== "object") return { ok: true };
+  const r = result as Record<string, unknown>;
+  if (typeof r.error === "string") return { ok: false };
+  if (Array.isArray(r.candidates)) return { ok: true, count: r.candidates.length };
+  if (typeof r.title === "string") return { ok: true, item: r.title.slice(0, 80) };
+  const lists = Object.values(r).filter(Array.isArray);
+  if (lists.length === 1) return { ok: true, count: lists[0].length };
+  return { ok: true };
+}
+
 /**
  * What to do with a joining/leaving request before the student sees a confirmation card. The
  * course is looked up first, so a card only ever names one real course the student can join:
@@ -1458,6 +1471,7 @@ async function runAssistantTurnNow(
           } catch (prepErr) {
             prepared = { reply: { error: `Could not check the course on eClass: ${(prepErr as Error).message}` } };
           }
+          emit({ type: "tool_done", name: fc.name, ...summarizeToolResult("reply" in prepared ? prepared.reply : prepared.args) });
           if ("reply" in prepared) {
             // No card for a course that can't be joined/left: the assistant gets the reason instead
             results.push({
@@ -1491,6 +1505,7 @@ async function runAssistantTurnNow(
           // Let the model explain the failure instead of aborting the whole answer
           toolResult = { error: (toolErr as Error).message || "Tool failed" };
         }
+        emit({ type: "tool_done", name: fc.name, ...summarizeToolResult(toolResult) });
         results.push({
           functionResponse: {
             ...(fc.id ? { id: fc.id } : {}),

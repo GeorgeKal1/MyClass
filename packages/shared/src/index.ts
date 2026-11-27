@@ -226,6 +226,8 @@ export interface NotificationItem {
   route?: string;
   /** Announcements only: whether the student has to do something. */
   triage?: TriageLabel;
+  /** Messages only: the eClass message it is about, so opening that message clears it. */
+  messageId?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -330,8 +332,8 @@ export interface UserSettings {
   accessibility: {
     /** Text size multiplier: 0.9, 1, 1.15 or 1.3. */
     fontScale: number;
-    /** "system" follows the device's reduced-motion setting. */
-    reduceMotion: "system" | "on" | "off";
+    /** Off by default; "on" stops animations and transitions. */
+    reduceMotion: "on" | "off";
   };
   mutedCourses: string[];
   /** Courses pinned to the top of the Courses list (course codes, in pin order). */
@@ -356,7 +358,7 @@ export const DEFAULT_SETTINGS: UserSettings = {
   language: "el",
   pollIntervalMin: 15,
   notify: { announcements: true, messages: true, assignments: true, deadlines: true, push: false },
-  accessibility: { fontScale: 1, reduceMotion: "on" },
+  accessibility: { fontScale: 1, reduceMotion: "off" },
   mutedCourses: [],
   downloads: { allCoursesMode: "single-zip" },
   ai: { mode: "server", model: "" },
@@ -418,6 +420,8 @@ export interface ChatMessage {
 export type ChatStreamEvent =
   | { type: "text"; delta: string }
   | { type: "tool"; name: string }
+  /** A tool finished: how many things it found, or the one course it settled on */
+  | { type: "tool_done"; name: string; ok: boolean; count?: number; item?: string }
   | { type: "action"; action: PendingAction }
   | { type: "done"; message: ChatMessage }
   | { type: "error"; error: string };
@@ -450,7 +454,7 @@ export const SettingsPatch = z
     accessibility: z
       .object({
         fontScale: z.union([z.literal(0.9), z.literal(1), z.literal(1.15), z.literal(1.3)]),
-        reduceMotion: z.enum(["system", "on", "off"]),
+        reduceMotion: z.enum(["on", "off"]),
       })
       .partial(),
     mutedCourses: z.array(z.string()),

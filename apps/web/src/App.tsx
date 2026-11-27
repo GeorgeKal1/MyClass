@@ -4,7 +4,6 @@ import {
   ArrowUpRight,
   Bell,
   BookOpen,
-  Bot,
   Calendar,
   ChartNoAxesColumn,
   Check,
@@ -74,6 +73,7 @@ import {
   relativeDue,
 } from "./features";
 import { courseColor } from "./ui";
+import { AiBot, BumpBadge, DrawCheck, FloatingIcons, NavIcon, setAiMood, type NavAnim } from "./motion";
 import { StatsView } from "./stats";
 import { StudyButton } from "./study";
 import { aiReadable, DocumentViewer, type DocTab } from "./docviewer";
@@ -106,20 +106,21 @@ function routeFromLocation(): Route {
 }
 
 type Accessibility = UserSettings["accessibility"];
-const A11Y_KEY = "myclass.a11y";
+// v2: the old cache held "on" as the default; motion is now on unless the student turns it off
+const A11Y_KEY = "myclass.a11y.v2";
 
 /** Last accessibility settings on this device, so text size and motion apply before sign-in loads. */
 function cachedAccessibility(): Accessibility {
   try {
     const raw = JSON.parse(localStorage.getItem(A11Y_KEY) ?? "null") as Partial<Accessibility> | null;
     if (raw && typeof raw.fontScale === "number") {
-      return { fontScale: raw.fontScale, reduceMotion: raw.reduceMotion ?? "on" };
+      return { fontScale: raw.fontScale, reduceMotion: raw.reduceMotion === "on" ? "on" : "off" };
     }
   } catch {
     /* storage unavailable */
   }
-  // Less motion is the default; Settings > Accessibility turns movement back on
-  return { fontScale: 1, reduceMotion: "on" };
+  // Motion is on by default; Settings > Accessibility > Reduce motion turns it off
+  return { fontScale: 1, reduceMotion: "off" };
 }
 
 /** True when movement should be skipped (Settings > Accessibility, or the device setting). */
@@ -267,17 +268,12 @@ export function App() {
     } else {
       root.style.setProperty("--font-scale", scale);
     }
-    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const apply = () =>
-      root.classList.toggle("reduce-motion", access.reduceMotion === "on" || (access.reduceMotion === "system" && mq.matches));
-    apply();
-    mq.addEventListener("change", apply);
+    root.classList.toggle("reduce-motion", access.reduceMotion === "on");
     try {
       localStorage.setItem(A11Y_KEY, JSON.stringify(access));
     } catch {
       /* storage unavailable */
     }
-    return () => mq.removeEventListener("change", apply);
   }, [access.fontScale, access.reduceMotion]);
 
   // Apply light / dark theme class to <html>
@@ -952,12 +948,14 @@ function Workspace({
           <NavButton
             icon={<HomeIcon className="w-4 h-4" />}
             label={tr("navHome")}
+            anim="home"
             active={tab === "home"}
             onClick={() => navigateTab("home")}
           />
           <NavButton
             icon={<BookOpen className="w-4 h-4" />}
             label={tr("navCourses")}
+            anim="courses"
             badge={enrolledCount || undefined}
             active={tab === "courses"}
             onClick={() => navigateTab("courses", null, "enrolled")}
@@ -965,19 +963,22 @@ function Workspace({
           <NavButton
             icon={<Bell className="w-4 h-4" />}
             label={tr("navInbox")}
+            anim="inbox"
             badge={inboxBadge || undefined}
             active={tab === "inbox"}
             onClick={() => navigateTab("inbox")}
           />
           <NavButton
-            icon={<Bot className="w-4 h-4" />}
+            icon={<AiBot className="w-4 h-4" />}
             label={tr("navAssistant")}
+            anim="assistant"
             active={tab === "assistant"}
             onClick={() => navigateTab("assistant")}
           />
           <NavButton
             icon={<ChartNoAxesColumn className="w-4 h-4" />}
             label={tr("navStats")}
+            anim="stats"
             active={tab === "stats"}
             onClick={() => navigateTab("stats")}
           />
@@ -1169,6 +1170,7 @@ function Workspace({
               <InboxView
                 lang={lang}
                 messages={messages}
+                setMessages={setMessages}
                 announcements={announcements}
                 triage={triage}
                 notifications={notifications}
@@ -1208,14 +1210,14 @@ function Workspace({
             onClick={() => setQuickChatOpen((o) => !o)}
             className="hidden md:inline-flex fixed bottom-6 right-6 z-30 items-center gap-2 px-4 h-10 rounded-full bg-[var(--accent)] text-[var(--on-accent)] font-medium text-xs hover:bg-[var(--accent-hover)] cursor-pointer"
           >
-            <Bot className="w-4 h-4" />
+            <AiBot className="w-4 h-4" />
             <span>{tr("navAssistant")}</span>
           </button>
           {quickChatOpen && (
             <div className="enter origin-bottom-right hidden md:flex fixed bottom-20 right-6 z-40 w-[400px] h-[460px] rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-lg shadow-black/15 flex-col overflow-hidden">
               <div className="px-4 py-3 border-b border-[var(--border)] flex items-center justify-between bg-[var(--surface-2)]">
                 <div className="flex items-center gap-2 text-xs font-semibold">
-                  <Bot className="w-4 h-4 text-[var(--muted)]" />
+                  <AiBot className="w-4 h-4 text-[var(--muted)]" />
                   <span>{tr("assistantTitle")}</span>
                 </div>
                 <div className="flex items-center gap-1">
@@ -1253,12 +1255,14 @@ function Workspace({
         <MobileTab
           icon={<HomeIcon className="w-5 h-5" />}
           label={tr("navHome")}
+          anim="home"
           active={tab === "home"}
           onClick={() => navigateTab("home")}
         />
         <MobileTab
           icon={<BookOpen className="w-5 h-5" />}
           label={tr("navCourses")}
+          anim="courses"
           badge={enrolledCount || undefined}
           active={tab === "courses"}
           onClick={() => navigateTab("courses", null, "enrolled")}
@@ -1266,19 +1270,22 @@ function Workspace({
         <MobileTab
           icon={<Bell className="w-5 h-5" />}
           label={tr("navInbox")}
+          anim="inbox"
           badge={inboxBadge || undefined}
           active={tab === "inbox"}
           onClick={() => navigateTab("inbox")}
         />
         <MobileTab
-          icon={<Bot className="w-5 h-5" />}
+          icon={<AiBot className="w-5 h-5" />}
           label={tr("navAssistant")}
+          anim="assistant"
           active={tab === "assistant"}
           onClick={() => navigateTab("assistant")}
         />
         <MobileTab
           icon={<ChartNoAxesColumn className="w-5 h-5" />}
           label={tr("navStats")}
+          anim="stats"
           active={tab === "stats"}
           onClick={() => navigateTab("stats")}
         />
@@ -1751,8 +1758,9 @@ function LoginScreen({
     "w-full px-3.5 py-2.5 rounded-xl text-sm border border-[var(--border)] bg-[var(--surface-2)] text-[var(--text)] focus:outline-none focus:border-[var(--accent)]";
 
   return (
-    <div className="min-h-screen flex flex-col bg-[var(--bg)] text-[var(--text)] px-4 py-5">
-      <div className="max-w-md w-full mx-auto flex items-center justify-between">
+    <div className="relative isolate min-h-screen flex flex-col bg-[var(--bg)] text-[var(--text)] px-4 py-5 overflow-hidden">
+      <FloatingIcons />
+      <div className="relative max-w-md w-full mx-auto flex items-center justify-between">
         <div className="flex items-center gap-2.5">
           <Logo size={36} />
           <span className="font-display text-lg leading-none">myClass</span>
@@ -1774,7 +1782,7 @@ function LoginScreen({
         </div>
       </div>
 
-      <div className="flex-1 flex items-center">
+      <div className="relative flex-1 flex items-center">
         <div className="max-w-md w-full mx-auto my-8 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 sm:p-8">
           <h1 className="text-xl font-semibold tracking-tight">{tr("loginTitle")}</h1>
           <p className="text-sm text-[var(--muted)] mt-1">{tr("loginSubtitle")}</p>
@@ -2025,7 +2033,7 @@ function HomeView({
           )}
         </button>
         <button type="button" onClick={onOpenAssistant} className={chip}>
-          <Bot className="w-4 h-4 text-[var(--muted)]" aria-hidden />
+          <AiBot className="w-4 h-4 text-[var(--muted)]" />
           {el ? "Ρώτα τον βοηθό" : "Ask the assistant"}
         </button>
         {lastPollAt && (
@@ -4056,6 +4064,7 @@ function feedIcon(kind: NotificationItem["kind"] | "ann") {
 function InboxView({
   lang,
   messages,
+  setMessages,
   announcements,
   triage,
   notifications,
@@ -4065,6 +4074,7 @@ function InboxView({
 }: {
   lang: Lang;
   messages: Message[];
+  setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   announcements: Announcement[];
   triage: Record<string, AnnouncementTriage>;
   notifications: NotificationItem[];
@@ -4119,12 +4129,20 @@ function InboxView({
   const shownFeed = filteredFeed.slice(0, feedLimit);
 
   const selectMsg = async (m: Message) => {
-    setSelected(m);
+    setSelected({ ...m, read: true });
     setReaderOpen(true);
+    // Read as soon as it is open: the dot, the bold sender and the Inbox badge go now,
+    // and so does the "new message" notification about it
+    if (!m.read) setMessages((prev) => prev.map((x) => (x.id === m.id ? { ...x, read: true } : x)));
+    const legacyTitle = `${m.sender}: ${m.subject}`;
+    setNotifications((prev) =>
+      prev.filter((n) => !(n.kind === "message" && (n.messageId ? n.messageId === m.id : n.title === legacyTitle))),
+    );
     if (!m.bodyHtml) {
       try {
         const res = await api.message(m.id);
         setSelected(res.message);
+        if (res.notifications) setNotifications(res.notifications);
       } catch {
         /* ignore */
       }
@@ -4145,6 +4163,8 @@ function InboxView({
     void dismiss(n.id);
     if (n.kind === "message") {
       setView("messages");
+      const msg = n.messageId ? messages.find((m) => m.id === n.messageId) : undefined;
+      if (msg) void selectMsg(msg);
     } else {
       onOpenNotification(n);
     }
@@ -4397,6 +4417,24 @@ function InboxView({
 /* AI Assistant View (with Tool Badges & Action Confirmation Cards)    */
 /* ================================================================== */
 
+type AssistantStep = {
+  id: number;
+  name: string;
+  status: "running" | "done" | "failed";
+  count?: number;
+  item?: string;
+};
+
+/** "ΑΝΑΛΥΣΗ Ι", "3 results", or "nothing found" after a finished step. */
+function stepDetail(st: AssistantStep, lang: Lang): string {
+  const el = lang === "el";
+  if (st.status === "failed") return el ? "δεν βρέθηκε" : "nothing found";
+  if (st.item) return st.item;
+  if (st.count === undefined) return "";
+  if (st.count === 0) return el ? "τίποτα" : "none";
+  return el ? `${st.count} ${st.count === 1 ? "αποτέλεσμα" : "αποτελέσματα"}` : `${st.count} ${st.count === 1 ? "result" : "results"}`;
+}
+
 function AssistantView({
   lang,
   compact = false,
@@ -4410,7 +4448,8 @@ function AssistantView({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [streamingText, setStreamingText] = useState("");
-  const [activeTool, setActiveTool] = useState<string | null>(null);
+  /** What the assistant is doing right now, one line per tool it runs */
+  const [steps, setSteps] = useState<AssistantStep[]>([]);
   const [busy, setBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -4420,7 +4459,7 @@ function AssistantView({
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth" });
-  }, [messages, streamingText]);
+  }, [messages, streamingText, steps]);
 
   const sendMessage = async (textToSend?: string) => {
     const prompt = (textToSend ?? input).trim();
@@ -4428,6 +4467,9 @@ function AssistantView({
     setInput("");
     setBusy(true);
     setStreamingText("");
+    setSteps([]);
+    setAiMood("thinking");
+    let answered = false;
 
     const optimisticUser: ChatMessage = {
       id: `local-${Date.now()}`,
@@ -4439,11 +4481,21 @@ function AssistantView({
 
     try {
       await api.streamChat(prompt, (ev) => {
-        if (ev.type === "tool") setActiveTool(ev.name);
+        if (ev.type === "tool") setSteps((prev) => [...prev, { id: prev.length, name: ev.name, status: "running" }]);
+        if (ev.type === "tool_done")
+          setSteps((prev) => {
+            // The newest running line of that tool is the one that finished
+            const i = prev.map((x) => x.status === "running" && x.name === ev.name).lastIndexOf(true);
+            if (i < 0) return prev;
+            const next = [...prev];
+            next[i] = { ...next[i], status: ev.ok ? "done" : "failed", count: ev.count, item: ev.item };
+            return next;
+          });
         if (ev.type === "text") setStreamingText(ev.delta);
         if (ev.type === "done") {
+          answered = true;
           setStreamingText("");
-          setActiveTool(null);
+          setSteps([]);
           setMessages((prev) => [...prev, ev.message]);
         }
       });
@@ -4459,7 +4511,8 @@ function AssistantView({
       ]);
     } finally {
       setBusy(false);
-      setActiveTool(null);
+      setSteps([]);
+      setAiMood(answered ? "happy" : "idle");
     }
   };
 
@@ -4479,6 +4532,9 @@ function AssistantView({
       read_message: "Διαβάζω το μήνυμα",
       get_deadlines: "Κοιτάζω τις προθεσμίες",
       get_assignment_details: "Διαβάζω την εργασία",
+      enroll_course: "Βρίσκω το μάθημα",
+      unenroll_course: "Βρίσκω το μάθημα",
+      archive_semester: "Ετοιμάζω την αρχειοθέτηση",
     };
     const en: Record<string, string> = {
       list_courses: "Checking your courses",
@@ -4490,6 +4546,9 @@ function AssistantView({
       read_message: "Reading the message",
       get_deadlines: "Checking deadlines",
       get_assignment_details: "Reading the assignment",
+      enroll_course: "Finding the course",
+      unenroll_course: "Finding the course",
+      archive_semester: "Preparing the archive",
     };
     const fallback = lang === "el" ? "Σκέφτομαι" : "Thinking";
     return (name && (lang === "el" ? el : en)[name]) || fallback;
@@ -4507,8 +4566,8 @@ function AssistantView({
       <div className="flex-1 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-3 sm:p-4 space-y-3 sm:space-y-4">
         {messages.length === 0 && (
           <div className="py-3 sm:py-6 text-center space-y-3 sm:space-y-4">
-            <div className="w-9 h-9 sm:w-11 sm:h-11 rounded-xl bg-[var(--surface-2)] text-[var(--muted)] flex items-center justify-center mx-auto">
-              <Bot className="w-4 h-4 sm:w-5 sm:h-5" />
+            <div className="w-11 h-11 sm:w-14 sm:h-14 rounded-2xl bg-[var(--accent-soft)] text-[var(--accent-text)] flex items-center justify-center mx-auto">
+              <AiBot className="w-5 h-5 sm:w-6 sm:h-6" />
             </div>
             <div className="max-w-md mx-auto space-y-1">
               <div className="text-base font-semibold">{tr("assistantTitle")}</div>
@@ -4587,7 +4646,7 @@ function AssistantView({
                       }`}
                     >
                       {m.action.status === "done" ? (
-                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        <DrawCheck className="w-4 h-4 shrink-0" />
                       ) : (
                         <X className="w-3.5 h-3.5 shrink-0" />
                       )}
@@ -4601,9 +4660,37 @@ function AssistantView({
         ))}
 
         {busy && (
-          <div className="flex items-center gap-2 text-sm text-[var(--muted)]">
-            <RefreshCw className="w-3.5 h-3.5 animate-spin text-[var(--accent)]" />
-            <span>{toolLabel(activeTool)}…</span>
+          <div className="flex items-start gap-2.5">
+            <span className="enter shrink-0 w-8 h-8 rounded-xl bg-[var(--accent-soft)] text-[var(--accent-text)] flex items-center justify-center">
+              <AiBot className="w-5 h-5" />
+            </span>
+            <ol aria-live="polite" className="pt-1.5 space-y-1.5 text-sm text-[var(--muted)] min-w-0">
+              {steps.map((st) => (
+                <li key={st.id} className="step-in flex items-center gap-2 min-w-0">
+                  {st.status === "running" ? (
+                    <RefreshCw className="w-3.5 h-3.5 shrink-0 animate-spin text-[var(--accent)]" />
+                  ) : st.status === "done" ? (
+                    <DrawCheck className="w-3.5 h-3.5 shrink-0 text-[var(--ok)]" />
+                  ) : (
+                    <X className="w-3.5 h-3.5 shrink-0 text-[var(--muted)]" />
+                  )}
+                  <span className="truncate">
+                    {toolLabel(st.name)}
+                    {st.status === "running" ? "…" : ""}
+                    {st.status !== "running" && stepDetail(st, lang) && (
+                      <span className="step-in text-[var(--text)]"> → {stepDetail(st, lang)}</span>
+                    )}
+                  </span>
+                </li>
+              ))}
+              {/* Between tools (and before the first) the model is writing or deciding */}
+              {!steps.some((st) => st.status === "running") && (
+                <li className="step-in flex items-center gap-2">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-[var(--accent)]" />
+                  <span>{steps.length ? (lang === "el" ? "Γράφω την απάντηση" : "Writing the answer") : toolLabel(null)}…</span>
+                </li>
+              )}
+            </ol>
           </div>
         )}
         <div ref={bottomRef} />
@@ -4634,7 +4721,13 @@ function AssistantView({
         <input
           type="text"
           value={input}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={(e) => {
+            setInput(e.target.value);
+            if (!busy) setAiMood(e.target.value.trim() ? "listening" : "idle");
+          }}
+          onBlur={() => {
+            if (!busy) setAiMood("idle");
+          }}
           placeholder={tr("chatPlaceholder")}
           className="flex-1 min-w-0 px-4 py-2.5 rounded-xl text-sm border border-[var(--border)] bg-[var(--surface)] focus:outline-none focus:border-[var(--accent)]"
         />
@@ -4806,8 +4899,8 @@ function SettingsView({
           label={lang === "el" ? "Λιγότερη κίνηση" : "Reduce motion"}
           hint={
             lang === "el"
-              ? "Χωρίς κινήσεις και μεταβάσεις. «Συσκευή» ακολουθεί τη ρύθμιση του κινητού/υπολογιστή."
-              : "No movement or transitions. “Device” follows your phone or computer setting."
+              ? "Χωρίς κινήσεις και μεταβάσεις."
+              : "No movement or transitions."
           }
           stack
         >
@@ -4817,7 +4910,6 @@ function SettingsView({
             disabled={busy}
             onChange={(v) => patch({ accessibility: { reduceMotion: v } })}
             options={[
-              { value: "system", label: lang === "el" ? "Συσκευή" : "Device" },
               { value: "on", label: lang === "el" ? "Ναι" : "On" },
               { value: "off", label: lang === "el" ? "Όχι" : "Off" },
             ]}
@@ -5322,12 +5414,15 @@ function NavButton({
   label,
   badge,
   active,
+  anim,
   onClick,
 }: {
   icon: React.ReactNode;
   label: string;
   badge?: number;
   active: boolean;
+  /** Which small move the icon makes when the tab is opened */
+  anim?: NavAnim;
   onClick: () => void;
 }) {
   return (
@@ -5340,13 +5435,13 @@ function NavButton({
       }`}
     >
       <span className="flex items-center gap-2.5">
-        {icon}
+        <NavIcon anim={anim} active={active} ping={anim === "inbox" ? badge : undefined}>
+          {icon}
+        </NavIcon>
         <span>{label}</span>
       </span>
       {badge !== undefined && badge > 0 && (
-        <span className="text-xs px-1.5 rounded-full bg-[var(--surface-2)] text-[var(--muted)]">
-          {badge}
-        </span>
+        <BumpBadge value={badge} className="inline-block text-xs px-1.5 rounded-full bg-[var(--surface-2)] text-[var(--muted)]" />
       )}
     </button>
   );
@@ -5357,12 +5452,15 @@ function MobileTab({
   label,
   badge,
   active,
+  anim,
   onClick,
 }: {
   icon: React.ReactNode;
   label: string;
   badge?: number;
   active: boolean;
+  /** Which small move the icon makes when the tab is opened */
+  anim?: NavAnim;
   onClick: () => void;
 }) {
   return (
@@ -5379,11 +5477,14 @@ function MobileTab({
           active ? "bg-[var(--accent-soft)]" : ""
         }`}
       >
-        {icon}
+        <NavIcon anim={anim} active={active} ping={anim === "inbox" ? badge : undefined}>
+          {icon}
+        </NavIcon>
         {badge !== undefined && badge > 0 && (
-          <span className="-top-1 right-2 absolute min-w-[15px] h-[15px] px-1 rounded-full bg-[var(--accent)] text-[var(--on-accent)] text-[0.6875rem] font-semibold tabular-nums flex items-center justify-center">
-            {badge}
-          </span>
+          <BumpBadge
+            value={badge}
+            className="-top-1 right-2 absolute min-w-[15px] h-[15px] px-1 rounded-full bg-[var(--accent)] text-[var(--on-accent)] text-[0.6875rem] font-semibold tabular-nums flex items-center justify-center"
+          />
         )}
       </div>
       <span className="truncate max-w-full px-0.5">{label}</span>
@@ -5407,8 +5508,9 @@ function TriageTag({ lang, triage }: { lang: Lang; triage?: AnnouncementTriage }
 
 function EmptyCard({ text }: { text: string }) {
   return (
-    <div className="p-6 rounded-2xl border border-dashed border-[var(--border)] text-center text-xs text-[var(--muted)]">
-      {text}
+    <div className="relative isolate overflow-hidden p-6 rounded-2xl border border-dashed border-[var(--border)] text-center text-xs text-[var(--muted)]">
+      <FloatingIcons variant="small" />
+      <span className="relative">{text}</span>
     </div>
   );
 }

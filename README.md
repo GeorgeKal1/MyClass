@@ -44,6 +44,7 @@ It puts course files, announcements, deadlines, messages, `.zip` downloads, push
 - **Knows your courses**: Answers questions about your current assignments/projects, announcements, professors, uploaded files, and semester subjects.
 - **Asks before acting**: Can subscribe you to a course, unenroll you when a semester ends, or archive completed semesters. It always shows a confirmation card (`[Confirm] [Cancel]`) before changing anything on eClass.
 - **Joins the course you mean**: Say it the way you would ("γράψε με στην Ανάλυση 1", "ανάλυση ένα", "Analysis I", `ΤΜΑ117` typed on a Greek keyboard). The server looks the course up in the catalog before any card is shown, ignoring accents and reading `1` / `ένα` / `Ι` as the same numeral; a course code is also looked up in the department it belongs to. If several courses fit, the assistant lists them and asks; if a course is already joined, closed, or needs the teacher's registration code, it says so instead of showing a card that would fail.
+- **Shows its work**: While it answers, the assistant lists each step as it goes ("Searching the catalog → 3 results", "Finding the course → ΑΝΑΛΥΣΗ Ι"), and its face reacts: it listens while you type, thinks while it works and smiles when it answers.
 - **Works without setup**: Uses the server's shared Gemini key (`GEMINI_API_KEY`, cheapest available Flash / Flash-Lite model picked automatically), limited to 15 requests per student per hour (`AI_HOURLY_LIMIT`). Students who add their own **Google AI Studio API key** (encrypted at rest) have no limit.
 - **Summaries and study material**: Summarizes a lecture file, or turns it into flashcards, a quiz or exam-style questions with model answers. Password-locked PDFs get a clear message instead of an error.
 - **Announcement triage**: Sorts announcements into *Action needed* and *FYI*.
@@ -53,12 +54,14 @@ It puts course files, announcements, deadlines, messages, `.zip` downloads, push
 - **Installable (PWA)**: Add `myClass` to your phone's home screen on **Android** or **iOS (Safari 16.4+)** to run it full screen.
 - **Live updates and Web Push (VAPID)**: Background polling picks up new announcements, messages and deadlines and sends them through **Server-Sent Events (SSE)** and **Web Push** (`/sw.js`). Deadline reminders go out 24 hours and 1 hour before each deadline.
 - **One inbox**: Notifications and course announcements share one list, with *Announcements* and *Action needed* filters.
+- **Read means read**: Opening a message marks it read straight away, clears its notification, and keeps it read even when eClass still lists it as new.
 - **Calendar feed and widget**: Subscribe to your deadlines as a calendar feed (Google Calendar, Apple Calendar), or add the deadlines widget on Windows 11.
 
 ### 7. Languages, themes and accessibility
 - **Bilingual**: Instant switch between **Greek (`ΕΛ`)** and **English (`EN`)**.
 - **Light and dark themes**: Follows the device, or pick one in Settings.
-- **Accessibility**: Four text sizes and a reduced-motion option (follows the device by default).
+- **Motion**: Course icons drift behind the sign-in screen and empty lists, nav icons make a small move when their tab opens, and the Inbox bell rings when something new arrives.
+- **Accessibility**: Four text sizes and a Reduce motion switch (off by default) that stops every animation.
 
 ---
 
@@ -88,6 +91,7 @@ myClass/
 │   │       ├── ai.ts                     # Gemini AI assistant & tool calling
 │   │       ├── crypto.ts                 # AES-256-GCM encryption utilities
 │   │       ├── poller.ts                 # Background notification poller & Web Push (VAPID)
+│   │       ├── read-state.ts             # Messages opened in myClass stay read
 │   │       ├── store.ts                  # Encrypted local persistence layer
 │   │       └── index.ts                  # HTTP/SSE API routes
 │   └── web/                    # React 19 + Vite + Tailwind CSS v4 frontend (port 5173)
@@ -102,6 +106,7 @@ myClass/
 │           ├── App.tsx                   # Desktop & mobile swipe UI views
 │           ├── api.ts                    # Typed API client & Web Push registration
 │           ├── i18n.ts                   # Greek (el) & English (en) dictionary
+│           ├── motion.tsx                # Drifting icons, nav icon moves, the assistant's face
 │           └── index.css                 # Light/dark theme tokens & animations
 └── packages/
     └── shared/                 # Shared TypeScript types & Zod schemas (@myclass/shared)
