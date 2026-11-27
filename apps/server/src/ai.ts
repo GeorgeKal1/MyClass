@@ -1,6 +1,7 @@
 import type {
   Announcement,
   AnnouncementTriage,
+  CatalogCourse,
   ChatMessage,
   ChatStreamEvent,
   ExamQuestion,
@@ -13,7 +14,8 @@ import type {
 import crypto from "node:crypto";
 import { decrypt, randomId, sha256 } from "./crypto.js";
 import { withKnownSubmission } from "./deadlines.js";
-import { getConnectorForUser, userDepartmentId } from "./eclass/connector.js";
+import { getConnectorForUser, userDepartmentId, type EclassConnector } from "./eclass/connector.js";
+import { resolveCourse } from "./eclass/course-match.js";
 import { withOrigin } from "./eclass/request-origin.js";
 import { getCurrentAcademicYearBounds, UNIPI_DEPARTMENTS } from "./eclass/unipi-curriculum.js";
 import { prepareDocumentForAi } from "./doctext.js";
@@ -65,7 +67,7 @@ const TOOLS = [
     parameters: {
       type: "object",
       properties: {
-        courseCode: { type: "string", description: "Course code (e.g. TMC106, TMA117, ODE180)" },
+        courseCode: { type: "string", description: "Course code from the enrolled list or search_catalog" },
         dir: { type: "string", description: "Optional directory path, defaults to '/'" },
       },
       required: ["courseCode"],
@@ -145,11 +147,19 @@ const TOOLS = [
     type: "function",
     name: "enroll_course",
     description:
-      "Registers/joins a new course on eClass. Requires student confirmation before executing.",
+      "Joins a course on eClass. The course is looked up in the catalog first: if the name matches several courses or none, you get the candidates back instead (then ask the student, or use search_catalog). When it resolves, the student gets a confirmation card.",
     parameters: {
       type: "object",
       properties: {
-        course: { type: "string", description: "Course code, numeric ID, or title to join" },
+        course: {
+          type: "string",
+          description:
+            "The course title as the student said it (e.g. 'Ανάλυση 1', 'βάσεις δεδομένων'), or an exact code taken from search_catalog. Never a guessed code.",
+        },
+        departmentId: {
+          type: "string",
+          description: "Only for a course of another department: its department id (as in search_catalog). Defaults to the student's department.",
+        },
       },
       required: ["course"],
     },
@@ -188,16 +198,21 @@ const TOOLS = [
 
 const MUTATING_TOOLS = new Set(["enroll_course", "unenroll_course", "archive_semester"]);
 
+/** "Ανάλυση Ι (TMA117)" once the course is resolved, else what the assistant passed. */
+function courseLabel(args: Record<string, unknown>): string {
+  const title = typeof args.title === "string" ? args.title : "";
+  const code = typeof args.code === "string" ? args.code : "";
+  return title ? `${title}${code ? ` (${code})` : ""}` : String(args.course ?? "");
+}
+
 function describePendingAction(tool: string, args: Record<string, unknown>, lang: "el" | "en"): string {
   if (tool === "enroll_course") {
-    return lang === "el"
-      ? `Εγγραφή στο μάθημα «${String(args.course ?? "")}» στο eClass`
-      : `Join course "${String(args.course ?? "")}" on eClass`;
+    return lang === "el" ? `Εγγραφή στο μάθημα «${courseLabel(args)}» στο eClass` : `Join "${courseLabel(args)}" on eClass`;
   }
   if (tool === "unenroll_course") {
     return lang === "el"
-      ? `Απεγγραφή από το μάθημα «${String(args.course ?? "")}» στο eClass`
-      : `Remove course "${String(args.course ?? "")}" from eClass`;
+      ? `Απεγγραφή από το μάθημα «${courseLabel(args)}» στο eClass`
+      : `Remove "${courseLabel(args)}" from eClass`;
   }
   if (tool === "archive_semester") {
     const sem = String(args.semester ?? "");
@@ -207,6 +222,96 @@ function describePendingAction(tool: string, args: Record<string, unknown>, lang
       : `${unreg ? "Unenroll on eClass" : "Archive"} courses from semester "${sem}"`;
   }
   return `${tool}(${JSON.stringify(args)})`;
+}
+
+type CourseLookup = Pick<EclassConnector, "findCatalogCourse" | "listCourses">;
+
+/**
+ * What to do with a joining/leaving request before the student sees a confirmation card. The
+ * course is looked up first, so a card only ever names one real course the student can join:
+ * - `{ args }`: show the card; `args` carry the resolved code, department and title.
+ * - `{ reply }`: no card; this goes back to the assistant as the tool's answer (several matches,
+ *   no match, already enrolled, registration closed or needing the teacher's code), so it can ask
+ *   the student or search instead of preparing an action that can only fail.
+ */
+export async function prepareMutatingAction(
+  connector: CourseLookup,
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<{ args: Record<string, unknown> } | { reply: Record<string, unknown> }> {
+  const brief = (c: CatalogCourse) => ({
+    code: c.code,
+    ...(c.publicCode && c.publicCode !== c.code ? { publicCode: c.publicCode } : {}),
+    title: c.title,
+    ...(c.professor ? { professor: c.professor } : {}),
+    ...(c.semester ? { semester: c.semester } : {}),
+    ...(c.departmentId ? { departmentId: c.departmentId } : {}),
+    enrolled: c.enrolled,
+  });
+
+  if (tool === "enroll_course") {
+    const query = String(args.course ?? "").trim();
+    if (!query) return { reply: { error: "No course given. Ask the student which course to join." } };
+    const departmentId = typeof args.departmentId === "string" && args.departmentId ? args.departmentId : undefined;
+    const found = await connector.findCatalogCourse(query, departmentId);
+    if (found.status === "ambiguous") {
+      return {
+        reply: {
+          error: `Several catalog courses match "${query}". Ask the student which one they mean (list them), then call enroll_course with that course's code.`,
+          candidates: found.candidates.map(brief),
+        },
+      };
+    }
+    if (found.status === "not_found") {
+      return {
+        reply: {
+          error: `No catalog course matches "${query}". Call search_catalog with a shorter keyword (or with departmentId for another department), or ask the student for the course's exact title. Do not guess course codes.`,
+          ...(found.suggestions.length ? { similar: found.suggestions.map(brief) } : {}),
+        },
+      };
+    }
+    const c = found.course;
+    const label = `${c.title} (${c.publicCode ?? c.code})`;
+    if (c.enrolled) return { reply: { result: `The student is already enrolled in ${label}. Nothing to do.` } };
+    if (c.locked) return { reply: { error: `Registration for ${label} is closed on eClass, so it can't be joined.` } };
+    if (c.needsPassword) {
+      return {
+        reply: {
+          error: `${label} asks for a registration code from the teacher, which only the student can type. Tell them to join it in myClass under Courses → All, where the app asks for the code.`,
+        },
+      };
+    }
+    if (!c.numericId) return { reply: { error: `eClass offers no way to join ${label} (no registration option in its catalog entry).` } };
+    return {
+      args: { course: c.code, departmentId: c.departmentId, title: c.title, code: c.publicCode ?? c.code },
+    };
+  }
+
+  if (tool === "unenroll_course") {
+    const query = String(args.course ?? "").trim();
+    if (!query) return { reply: { error: "No course given. Ask the student which course to leave." } };
+    const mine = await connector.listCourses();
+    const found = resolveCourse(mine, query);
+    if (found.status === "ambiguous") {
+      return {
+        reply: {
+          error: `Several of the student's courses match "${query}". Ask which one they mean.`,
+          candidates: found.candidates.map((c) => ({ code: c.code, title: c.title })),
+        },
+      };
+    }
+    if (found.status === "not_found") {
+      return {
+        reply: {
+          error: `The student is not enrolled in a course matching "${query}". Check the enrolled list and ask if unsure.`,
+        },
+      };
+    }
+    const c = found.course;
+    return { args: { course: c.code, title: c.title, code: c.publicCode ?? c.code } };
+  }
+
+  return { args };
 }
 
 /**
@@ -350,7 +455,8 @@ export async function executeConfirmedAction(
   const lang = user.settings.language;
 
   if (action.tool === "enroll_course") {
-    const course = await connector.enrollCourse(String(action.args.course ?? ""));
+    const departmentId = typeof action.args.departmentId === "string" ? action.args.departmentId : undefined;
+    const course = await connector.enrollCourse(String(action.args.course ?? ""), undefined, departmentId);
     return lang === "el"
       ? `Έγινε εγγραφή στο μάθημα **${course.title}** (${course.publicCode ?? course.code}).`
       : `Successfully enrolled in **${course.title}** (${course.publicCode ?? course.code}).`;
@@ -1249,7 +1355,8 @@ async function buildSystemInstruction(user: UserRecord): Promise<string> {
     "- Questions about what a file, lecture, exercise sheet or project brief says: call list_documents for the course (open sub-folders if needed), pick the best-matching file, then call read_document with the student's question. Answer from that content and name the file you used.",
     "- Assignment questions ('what does project 2 ask', 'can I still submit'): get_deadlines, then get_assignment_details.",
     "- You never open course pages yourself: eClass would count each one as the student's visit. list_documents, read_document and get_assignment_details only see what the student opened in myClass in the last few hours (a course's Documents, a file's AI summary or download, an assignment). When a tool says something was not opened yet, tell the student exactly what to open in myClass (Courses → course → Documents / the file / the assignment) and to ask again; get_deadlines, get_announcements and get_messages always work.",
-    "- Joining/leaving a course or archiving a semester: call enroll_course / unenroll_course / archive_semester directly; the app shows the student a confirmation card, so don't ask 'are you sure?' yourself.",
+    "- Never guess a course code: use only codes from the enrolled list above or from a tool result.",
+    "- Joining a course: call enroll_course with the course's title as the student said it (or a code from search_catalog); the server finds it in the catalog. If it answers with candidates, ask the student which one (list them); if nothing matches, try search_catalog with a shorter keyword or another departmentId before giving up. Leaving a course or archiving a semester: call unenroll_course / archive_semester. The app shows the student a confirmation card, so don't ask 'are you sure?' yourself.",
     "- Uploading/submitting work is done in the app (Courses → course → Assignments → Submit); you cannot attach files yourself, but you can check requirements and status.",
     "- If a request is ambiguous (e.g. two courses or files match), ask ONE short question that lists the options. If it's clear, act without asking.",
     "- Only use items from the current academic year unless the student explicitly asks about older ones.",
@@ -1345,11 +1452,28 @@ async function runAssistantTurnNow(
         emit({ type: "tool", name: fc.name });
 
         if (MUTATING_TOOLS.has(fc.name)) {
+          let prepared: Awaited<ReturnType<typeof prepareMutatingAction>>;
+          try {
+            prepared = await prepareMutatingAction(getConnectorForUser(user), fc.name, args);
+          } catch (prepErr) {
+            prepared = { reply: { error: `Could not check the course on eClass: ${(prepErr as Error).message}` } };
+          }
+          if ("reply" in prepared) {
+            // No card for a course that can't be joined/left: the assistant gets the reason instead
+            results.push({
+              functionResponse: {
+                ...(fc.id ? { id: fc.id } : {}),
+                name: fc.name,
+                response: { content: truncateJson(prepared.reply) },
+              },
+            });
+            continue;
+          }
           const action: PendingAction = {
             id: randomId(8),
             tool: fc.name,
-            args,
-            summary: describePendingAction(fc.name, args, lang),
+            args: prepared.args,
+            summary: describePendingAction(fc.name, prepared.args, lang),
             status: "pending",
           };
           pendingAction = action;

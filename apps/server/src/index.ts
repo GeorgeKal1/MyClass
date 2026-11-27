@@ -419,9 +419,13 @@ app.get("/api/catalog", async (c) => {
 
 app.post("/api/courses/enroll", async (c) => {
   const u = requireUser(c);
-  const { course, password } = (await c.req.json()) as { course: string; password?: string };
+  const { course, password, department } = (await c.req.json()) as { course: string; password?: string; department?: string };
   const connector = getConnectorForUser(u);
-  const enrolled = await connector.enrollCourse(course, typeof password === "string" ? password.slice(0, 200) : undefined);
+  const enrolled = await connector.enrollCourse(
+    course,
+    typeof password === "string" ? password.slice(0, 200) : undefined,
+    typeof department === "string" && department ? department.slice(0, 20) : undefined,
+  );
   return c.json({ course: enrolled });
 });
 

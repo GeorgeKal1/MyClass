@@ -178,11 +178,18 @@ export const api = {
       activeDepartment?: string;
     }>(`/api/catalog${qs ? `?${qs}` : ""}`);
   },
-  /** `password`: the course's registration code, for courses that ask for one. */
-  enroll: (course: string, password?: string) =>
+  /**
+   * `password`: the course's registration code, for courses that ask for one. `department`: the
+   * catalog the course was picked from, when it is not the student's own department.
+   */
+  enroll: (course: string, password?: string, department?: string) =>
     req<{ course: Course }>("/api/courses/enroll", {
       method: "POST",
-      body: JSON.stringify(password !== undefined ? { course, password } : { course }),
+      body: JSON.stringify({
+        course,
+        ...(password !== undefined ? { password } : {}),
+        ...(department ? { department } : {}),
+      }),
     }),
   unenroll: (code: string) =>
     req<{ course: Course }>(`/api/courses/${encodeURIComponent(code)}/unenroll`, {

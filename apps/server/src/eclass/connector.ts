@@ -62,6 +62,7 @@ import {
   UNIPI_DEPARTMENTS,
 } from "./unipi-curriculum.js";
 import { curriculumSemester, isPostgraduatePath, POSTGRAD_INDEX } from "./unipi-curricula.js";
+import { codeKey, isCodeMatch, resolveCourse, textMatchesQuery, type CourseResolution } from "./course-match.js";
 import { currentOrigin, ECLASS_MODULES, eclassHitFor, withOrigin } from "./request-origin.js";
 import { getUniversity } from "./universities.js";
 
@@ -109,10 +110,19 @@ export interface EclassConnector {
   listDepartments(): Promise<DepartmentInfo[]>;
   defaultDepartmentId(): string;
   listCatalog(query?: string, departmentId?: string): Promise<CatalogCourse[]>;
+  /**
+   * The catalog course a code, eClass id or title names (accents, numerals and Greek/Latin
+   * look-alike letters don't matter). Looks in `departmentId` (default: the student's own), then in
+   * the department a course code belongs to.
+   */
+  findCatalogCourse(query: string, departmentId?: string): Promise<CourseResolution<CatalogCourse>>;
   /** The student's own usage statistics, merged across every portal they use. */
   getMyStats(): Promise<MyStats>;
-  /** `password`: the course's registration code, for courses that ask for one. */
-  enrollCourse(codeOrId: string, password?: string): Promise<Course>;
+  /**
+   * `password`: the course's registration code, for courses that ask for one. `departmentId`: the
+   * catalog the course was picked from, when it is not the student's own department.
+   */
+  enrollCourse(codeOrId: string, password?: string, departmentId?: string): Promise<Course>;
   unenrollCourse(codeOrId: string): Promise<Course>;
   /**
    * One course file (a visit to the course on eClass). `reuseOpened`: a copy the student fetched in
@@ -950,7 +960,9 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
       items = [...byCode.values()].sort(
         (a, b) => (a.semesterIndex ?? 99) - (b.semesterIndex ?? 99) || a.title.localeCompare(b.title, "el"),
       );
-      catalogCache.set(cacheKey, { expiresAt: now + CATALOG_TTL_MS, items });
+      // An empty catalog is a failed crawl (sign-in lapsed, portal down), not a department without
+      // courses: caching it would answer "not found" for the next ten minutes
+      if (items.length) catalogCache.set(cacheKey, { expiresAt: now + CATALOG_TTL_MS, items });
     }
 
     const q = query?.trim().toLowerCase();
@@ -962,9 +974,40 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
         (c.publicCode?.toLowerCase().includes(q) ?? false) ||
         (c.professor?.toLowerCase().includes(q) ?? false) ||
         (c.semester?.toLowerCase().includes(q) ?? false) ||
-        (c.semesterFolder?.toLowerCase().includes(q) ?? false),
+        (c.semesterFolder?.toLowerCase().includes(q) ?? false) ||
+        // "αναλυση 1" finds "ΑΝΑΛΥΣΗ Ι", "τμα117" finds TMA117
+        isCodeMatch(c, query!) ||
+        textMatchesQuery(`${c.title} ${c.professor ?? ""}`, query!),
     );
   };
+
+  /** The department whose catalog holds a course code, from the portal the code lives on. */
+  const departmentForCode = (query: string): string | undefined => {
+    const key = codeKey(query.trim());
+    if (!/^[A-Z][A-Z-]*\d/.test(key)) return undefined;
+    const portal = resolveUniPiPortalForCourse(key);
+    return portal === "thales" ? "cs-ug" : portal === "aristarchus" ? "ds" : portal === "lefkippos" ? "ds-pg" : undefined;
+  };
+
+  const findCatalogCourse = async (query: string, departmentId?: string): Promise<CourseResolution<CatalogCourse>> => {
+    const own = defaultDepartmentId();
+    const asked = departmentId && UNIPI_DEPARTMENTS.some((d) => d.id === departmentId) ? departmentId : undefined;
+    const depts = [asked ?? own];
+    const byCode = departmentForCode(query);
+    if (byCode && !depts.includes(byCode)) depts.push(byCode);
+    if (asked && !depts.includes(own)) depts.push(own);
+
+    let firstMiss: CourseResolution<CatalogCourse> | undefined;
+    for (const d of depts) {
+      const res = resolveCourse(await listCatalog(undefined, d), query);
+      if (res.status !== "not_found") return res;
+      firstMiss ??= res;
+    }
+    return firstMiss ?? { status: "not_found", suggestions: [] };
+  };
+
+  const describeCandidates = (list: Array<{ title: string; code: string; publicCode?: string }>) =>
+    list.map((c) => `${c.title} (${c.publicCode ?? c.code})`).join(", ");
 
   /* --------------------- Enrollment helpers ------------------------ */
 
@@ -1412,16 +1455,21 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     },
     defaultDepartmentId,
     listCatalog,
-    async enrollCourse(codeOrId: string, password?: string): Promise<Course> {
-      const catalog = await listCatalog();
-      const q = codeOrId.trim().toLowerCase();
-      const match =
-        catalog.find(
-          (c) => c.code.toLowerCase() === q || c.publicCode?.toLowerCase() === q || String(c.numericId) === q,
-        ) ?? catalog.find((c) => c.title.toLowerCase().includes(q));
-
-      if (!match || !match.numericId) {
-        throw new Error(`Course "${codeOrId}" was not found in the university catalog`);
+    findCatalogCourse,
+    async enrollCourse(codeOrId: string, password?: string, departmentId?: string): Promise<Course> {
+      const found = await findCatalogCourse(codeOrId, departmentId);
+      if (found.status === "ambiguous") {
+        throw new Error(`"${codeOrId}" matches several courses: ${describeCandidates(found.candidates)}`);
+      }
+      if (found.status === "not_found") {
+        throw new Error(
+          `Course "${codeOrId}" was not found in the university catalog` +
+            (found.suggestions.length ? `. Similar: ${describeCandidates(found.suggestions)}` : ""),
+        );
+      }
+      const match = found.course;
+      if (!match.numericId) {
+        throw new Error(`eClass gives no way to join "${match.title}" (its catalog entry has no registration option)`);
       }
       if (match.locked) {
         throw new Error(`Registration for "${match.title}" is closed on eClass`);
@@ -1456,19 +1504,16 @@ function createLiveConnector(user: UserRecord, uni: University, passwordOverride
     },
     async unenrollCourse(codeOrId: string): Promise<Course> {
       const allCourses = await listCourses();
-      const q = codeOrId.trim().toLowerCase();
-      let target =
-        allCourses.find(
-          (c) => c.code.toLowerCase() === q || c.publicCode?.toLowerCase() === q || String(c.numericId) === q,
-        ) ?? allCourses.find((c) => c.title.toLowerCase().includes(q));
+      const mine = resolveCourse(allCourses, codeOrId);
+      if (mine.status === "ambiguous") {
+        throw new Error(`"${codeOrId}" matches several of your courses: ${describeCandidates(mine.candidates)}`);
+      }
+      // A copy: the numeric id filled in below must not leak into the cached course list
+      let target: Course | undefined = mine.status === "found" ? { ...mine.course } : undefined;
 
       if (!target) {
-        const catalog = await listCatalog();
-        const catMatch =
-          catalog.find(
-            (c) => c.code.toLowerCase() === q || c.publicCode?.toLowerCase() === q || String(c.numericId) === q,
-          ) ?? catalog.find((c) => c.title.toLowerCase().includes(q));
-        if (catMatch) target = { ...catMatch, enrolled: false };
+        const cat = resolveCourse(await listCatalog(), codeOrId);
+        if (cat.status === "found") target = { ...cat.course, enrolled: false };
       }
       if (!target) throw new Error(`Course "${codeOrId}" is not in your enrolled courses`);
 

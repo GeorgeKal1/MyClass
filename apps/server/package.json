@@ -1,6 +1,6 @@
 {
   "name": "@myclass/server",
-  "version": "4.1.0",
+  "version": "4.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,7 +13,7 @@
     "migrate:supabase": "tsx scripts/migrate-to-supabase.ts"
   },
   "dependencies": {
-    "@hono/node-server": "^1.13.7",
+    "@hono/node-server": "^2.1.11",
     "@myclass/shared": "*",
     "@supabase/supabase-js": "^2.119.2",
     "@types/archiver": "^6.0.3",
@@ -30,6 +30,6 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
-    "vitest": "^2.1.8"
+    "vitest": "^5.1.2"
   }
 }

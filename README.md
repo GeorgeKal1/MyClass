@@ -29,7 +29,8 @@ It puts course files, announcements, deadlines, messages, `.zip` downloads, push
 ### 2. Your courses and the full curriculum
 - **Your courses first**: Opens on the courses you are subscribed to, with one-click access to the full undergraduate curriculum (`Α' Εξάμηνο` – `Η' Εξάμηνο`) at the bottom of the page.
 - **Semester filter**: Filter or expand and collapse semesters (`Α_εξάμηνο` .. `Η_Εξάμηνο`) on desktop and mobile.
-- **Subscribe and leave**: Subscribe (`Εγγραφή`) or leave (`Απεγγραφή`) live Open eClass courses directly from the app or via the AI Assistant.
+- **Subscribe and leave**: Subscribe (`Εγγραφή`) or leave (`Απεγγραφή`) live Open eClass courses directly from the app or via the AI Assistant, also from another department's catalog in Courses → All.
+- **Forgiving search**: The catalog search ignores accents and matches numerals however they are written (`ανάλυση 1` finds `ΑΝΑΛΥΣΗ Ι`).
 
 ### 3. Academic-year filtering
 - Hides stale assignments, exam slots, announcements, and project files from previous academic years while preserving timeless lecture notes and current-year projects.
@@ -42,6 +43,7 @@ It puts course files, announcements, deadlines, messages, `.zip` downloads, push
 ### 5. Assistant (Google Gemini)
 - **Knows your courses**: Answers questions about your current assignments/projects, announcements, professors, uploaded files, and semester subjects.
 - **Asks before acting**: Can subscribe you to a course, unenroll you when a semester ends, or archive completed semesters. It always shows a confirmation card (`[Confirm] [Cancel]`) before changing anything on eClass.
+- **Joins the course you mean**: Say it the way you would ("γράψε με στην Ανάλυση 1", "ανάλυση ένα", "Analysis I", `ΤΜΑ117` typed on a Greek keyboard). The server looks the course up in the catalog before any card is shown, ignoring accents and reading `1` / `ένα` / `Ι` as the same numeral; a course code is also looked up in the department it belongs to. If several courses fit, the assistant lists them and asks; if a course is already joined, closed, or needs the teacher's registration code, it says so instead of showing a card that would fail.
 - **Works without setup**: Uses the server's shared Gemini key (`GEMINI_API_KEY`, cheapest available Flash / Flash-Lite model picked automatically), limited to 15 requests per student per hour (`AI_HOURLY_LIMIT`). Students who add their own **Google AI Studio API key** (encrypted at rest) have no limit.
 - **Summaries and study material**: Summarizes a lecture file, or turns it into flashcards, a quiz or exam-style questions with model answers. Password-locked PDFs get a clear message instead of an error.
 - **Announcement triage**: Sorts announcements into *Action needed* and *FYI*.
@@ -79,6 +81,7 @@ myClass/
 │   │   └── src/
 │   │       ├── eclass/
 │   │       │   ├── connector.ts          # Live Open eClass & CAS SSO client
+│   │       │   ├── course-match.ts       # Finds the course a typed name or code means
 │   │       │   ├── parsers.ts            # HTML/AJAX/RSS/CSRF parsers for Open eClass
 │   │       │   ├── unipi-curriculum.ts   # Semester mapping (Α'–Η') & academic-year filters
 │   │       │   └── universities.ts       # University of Piraeus portal

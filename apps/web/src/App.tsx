@@ -2259,22 +2259,29 @@ function useJoinCourse({
   showToast: (m: string) => void;
   onJoined: () => Promise<void>;
 }) {
-  const [ask, setAsk] = useState<{ code: string; title: string; wrongAttempt: number } | null>(null);
+  type JoinTarget = { code: string; title: string; departmentId?: string };
+  const [ask, setAsk] = useState<(JoinTarget & { wrongAttempt: number }) | null>(null);
 
-  const join = async (c: { code: string; title: string; needsPassword?: boolean }, password?: string) => {
+  const join = async (c: JoinTarget & { needsPassword?: boolean }, password?: string) => {
     if (c.needsPassword && password === undefined) {
-      setAsk({ code: c.code, title: c.title, wrongAttempt: 0 });
+      setAsk({ code: c.code, title: c.title, departmentId: c.departmentId, wrongAttempt: 0 });
       return;
     }
     try {
-      await api.enroll(c.code, password);
+      // The department of the catalog it was picked from: another department's course is not in the student's own
+      await api.enroll(c.code, password, c.departmentId);
       setAsk(null);
       showToast(lang === "el" ? `Εγγράφηκες στο ${c.title}` : `Joined ${c.title}`);
       await onJoined();
     } catch (err) {
       if (err instanceof ApiError && err.code?.startsWith("password_")) {
         const wrong = err.code === "password_wrong";
-        setAsk((prev) => ({ code: c.code, title: c.title, wrongAttempt: (prev?.wrongAttempt ?? 0) + (wrong ? 1 : 0) }));
+        setAsk((prev) => ({
+          code: c.code,
+          title: c.title,
+          departmentId: c.departmentId,
+          wrongAttempt: (prev?.wrongAttempt ?? 0) + (wrong ? 1 : 0),
+        }));
         return;
       }
       showToast((err as Error).message);
@@ -2287,12 +2294,12 @@ function useJoinCourse({
       lang={lang}
       title={ask.title}
       wrongAttempt={ask.wrongAttempt}
-      onSubmit={(pw) => join({ code: ask.code, title: ask.title }, pw)}
+      onSubmit={(pw) => join({ code: ask.code, title: ask.title, departmentId: ask.departmentId }, pw)}
       onClose={() => setAsk(null)}
     />
   ) : null;
 
-  return { join, dialog, askCode: (c: { code: string; title: string }) => setAsk({ ...c, wrongAttempt: 0 }) };
+  return { join, dialog, askCode: (c: JoinTarget) => setAsk({ ...c, wrongAttempt: 0 }) };
 }
 
 function CourseCodeDialog({
