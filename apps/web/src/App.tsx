@@ -641,17 +641,29 @@ function Workspace({
 
   // "Action needed" / "FYI" for announcements not classified yet (cached server-side per announcement)
   const triageRequested = useRef(new Set<string>());
+  const [triageRetry, setTriageRetry] = useState(0);
   useEffect(() => {
     const missing = announcements.filter((a) => !triageRequested.current.has(a.id));
     if (!missing.length) return;
-    for (const a of missing) triageRequested.current.add(a.id);
-    api
-      .triage(missing)
-      .then((r) => setTriage((prev) => ({ ...prev, ...r.triage })))
-      .catch(() => {
-        for (const a of missing) triageRequested.current.delete(a.id);
-      });
-  }, [announcements]);
+    // The ones Home shows go first, in a request of their own, so their tags never wait on the rest
+    const batches = [missing.slice(0, HOME_ANNOUNCEMENTS), missing.slice(HOME_ANNOUNCEMENTS)].filter((b) => b.length);
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    void (async () => {
+      for (const batch of batches) {
+        for (const a of batch) triageRequested.current.add(a.id);
+        try {
+          const r = await api.triage(batch);
+          setTriage((prev) => ({ ...prev, ...r.triage }));
+        } catch {
+          // Try again in a while instead of leaving them unsorted until the next reload
+          for (const a of batch) triageRequested.current.delete(a.id);
+          retry = setTimeout(() => setTriageRetry((n) => n + 1), 30_000);
+          return;
+        }
+      }
+    })();
+    return () => clearTimeout(retry);
+  }, [announcements, triageRetry]);
 
   // Live SSE notification stream
   useEffect(() => {
@@ -1859,6 +1871,9 @@ function LoginScreen({
 /* Home / Feed View                                                    */
 /* ================================================================== */
 
+/** How many announcements Home lists (and its filters look at). */
+const HOME_ANNOUNCEMENTS = 8;
+
 function HomeView({
   lang,
   courses,
@@ -1906,10 +1921,14 @@ function HomeView({
   const openThisWeek = dueThisWeek.filter((a) => !a.submitted).length;
   const unreadMessages = messages.filter((m) => !m.read);
   const [annFilter, setAnnFilter] = useState<"all" | "action" | "fyi">("all");
-  const actionCount = announcements.filter((a) => triage[a.id]?.label === "action").length;
-  const shownAnnouncements = (
-    annFilter === "all" ? announcements : announcements.filter((a) => triage[a.id]?.label === annFilter)
-  ).slice(0, 8);
+  // The filters work on the 8 newest announcements, the ones Home shows, so "Action needed"
+  // never pulls in old ones from further down the list and its count matches what is on screen
+  const recentAnnouncements = announcements.slice(0, HOME_ANNOUNCEMENTS);
+  const actionCount = recentAnnouncements.filter((a) => triage[a.id]?.label === "action").length;
+  /** Some of the 8 are still being sorted into "Action needed" / "FYI" */
+  const triagePending = recentAnnouncements.some((a) => !triage[a.id]);
+  const shownAnnouncements =
+    annFilter === "all" ? recentAnnouncements : recentAnnouncements.filter((a) => triage[a.id]?.label === annFilter);
 
   // Opened from the "Deadlines" app shortcut: bring the calendar into view
   const calendarRef = useRef<HTMLDivElement>(null);
@@ -2105,7 +2124,11 @@ function HomeView({
           {shownAnnouncements.length === 0 ? (
             <EmptyCard
               text={
-                annFilter === "action"
+                annFilter !== "all" && triagePending
+                  ? el
+                    ? "Ταξινομώ τις ανακοινώσεις…"
+                    : "Sorting the announcements…"
+                  : annFilter === "action"
                   ? el
                     ? "Καμία ανακοίνωση δεν ζητά κάτι από σένα."
                     : "No announcement asks anything of you."
